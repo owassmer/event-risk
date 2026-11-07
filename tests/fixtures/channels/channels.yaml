@@ -1,0 +1,32 @@
+# Ten channels for the tests of the orthogonalization, the betas, and the impact across several channels.
+channels:
+  - name: S&P 500
+    proxy_ticker: SPY
+    order: 1
+  - name: short-term Treasuries
+    proxy_ticker: SHY
+    order: 2
+  - name: long-term Treasuries
+    proxy_ticker: TLT
+    order: 3
+  - name: US dollar
+    proxy_ticker: UUP
+    order: 4
+  - name: crude oil
+    proxy_ticker: USO
+    order: 5
+  - name: developed-market stocks outside the US
+    proxy_ticker: EFA
+    order: 6
+  - name: emerging-market stocks
+    proxy_ticker: EEM
+    order: 7
+  - name: gold
+    proxy_ticker: GLD
+    order: 8
+  - name: high-yield bonds
+    proxy_ticker: HYG
+    order: 9
+  - name: bitcoin
+    proxy_ticker: IBIT
+    order: 10

@@ -1,0 +1,8 @@
+# Fixture initial contents for the loader's tests; the real channels.yaml comes with its step.
+channels:
+  - name: MKT
+    proxy_ticker: SPY
+    order: 1
+  - name: OIL
+    proxy_ticker: USO
+    order: 5

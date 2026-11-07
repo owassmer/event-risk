@@ -1,0 +1,12 @@
+# The channel a new store starts with: the market, the one sensitivity every listed name
+# has. Once loaded it is the analyst's, to change like anything else in the store.
+#
+# No other channel ships, because which forces move a portfolio belongs to the portfolio
+# and its events: the analyst adds a channel for each force an event moves the portfolio
+# through, named in plain words for what its proxy's price measures, with a proxy that has
+# two years of history, and placed by its order, broad to narrow, so that each holds what
+# the earlier ones do not.
+channels:
+  - name: S&P 500
+    proxy_ticker: SPY
+    order: 1

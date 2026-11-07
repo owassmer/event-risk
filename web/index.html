@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Event risk</title>
+<link rel="preload" href="/web/fonts/Geist.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/web/fonts/GeistMono.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/web/fonts/HedvigLettersSerif.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+<div id="app" class="empty">
+  <aside id="left" class="panel" aria-label="Portfolio">
+    <div class="panel-scroll"><div id="portfolio"></div></div>
+  </aside>
+
+  <main id="center">
+    <div id="toggles">
+      <button class="toggle" data-toggle="left" hidden>Portfolio</button>
+      <button class="toggle" data-toggle="right" hidden>Events</button>
+    </div>
+    <div id="menu">
+      <button id="menu-button" aria-haspopup="true" aria-expanded="false" title="Menu">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="4" cy="10" r="1.6"/><circle cx="10" cy="10" r="1.6"/><circle cx="16" cy="10" r="1.6"/></svg>
+      </button>
+      <div id="menu-pop" role="menu" hidden>
+        <button role="menuitem" data-menu="new">New portfolio</button>
+        <button role="menuitem" data-menu="open">Open conversation…</button>
+        <button role="menuitem" data-menu="download">Download ledger</button>
+        <div id="stores" hidden></div>
+      </div>
+    </div>
+
+    <div id="scroll">
+      <div id="welcome">
+        <h1>What could move your portfolio?</h1>
+      </div>
+      <div id="conversation" aria-live="polite"></div>
+      <div id="waiting"></div>
+      <div id="notice"></div>
+    </div>
+
+    <div id="status" role="status" aria-live="polite" hidden></div>
+    <form id="composer" autocomplete="off">
+      <div id="keys"></div>
+      <div id="attachments"></div>
+      <textarea id="input" rows="1" placeholder="Paste holdings, or attach a statement" aria-label="Message"></textarea>
+      <div class="bar">
+        <label class="icon attach" title="Attach a file">
+          <input type="file" id="file" multiple accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.csv,.txt,.tsv,.md,.json" hidden>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M13.5 6.5 7.8 12.2a1.6 1.6 0 0 0 2.3 2.3l6-6a3.2 3.2 0 0 0-4.6-4.6l-6 6a4.8 4.8 0 0 0 6.8 6.8l5.2-5.2"/></svg>
+        </label>
+        <span class="spacer"></span>
+        <button type="button" id="stop" class="icon round" title="Stop" hidden>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6" y="6" width="8" height="8" rx="1.5"/></svg>
+        </button>
+        <button type="submit" id="send" class="icon round dark" title="Send" disabled>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15.5v-11M5.5 9 10 4.5 14.5 9"/></svg>
+        </button>
+      </div>
+    </form>
+  </main>
+
+  <aside id="right" class="panel" aria-label="Events and details">
+    <div id="trail" hidden>
+      <button id="back" class="linkish">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12 5 7 10l5 5"/></svg>Back
+      </button>
+      <nav id="crumbs"></nav>
+    </div>
+    <div class="panel-scroll" id="right-scroll">
+      <div id="ledger" tabindex="-1"></div>
+      <div id="detail" tabindex="-1" hidden></div>
+    </div>
+  </aside>
+</div>
+<div id="drop" hidden><div>Drop to attach</div></div>
+<script src="/web/app.js"></script>
+</body>
+</html>

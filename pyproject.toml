@@ -1,0 +1,30 @@
+[project]
+name = "event-risk"
+version = "0.1.0"
+description = "A harness for Opus 5.5: what could move a portfolio, how likely, and how much."
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=2.5.0",
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+    "tzdata>=2024.1",
+]
+
+[project.scripts]
+event-risk = "harness.server:main"
+example = "harness.server:example"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

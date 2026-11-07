@@ -1,0 +1,20 @@
+# secrets
+.env
+.env.*
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# os and editors
+.DS_Store
+.idea/
+.vscode/
+
+# saved conversations stay on the machine that made them
+stores/
