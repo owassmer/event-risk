@@ -179,13 +179,6 @@ def rate_index(payload: dict | None) -> tuple[list[float], list[float], dict[str
     return times, [found[t] for t in times], fixings
 
 
-def rate_from(index: tuple, moment: str) -> float | None:
-    """A pair's price at a moment from its rate_index's hourly prices: the latest struck at or before it."""
-    times, prices = index[0], index[1]
-    i = bisect_right(times, datetime.fromisoformat(moment.replace("Z", "+00:00")).timestamp())
-    return prices[i - 1] if i else None
-
-
 def rate_for(index: tuple, moment: str, day: str | None) -> dict | None:
     """A price's rate in dollars from a rate_index: where the moment is at or after the pair's first hourly price,
     the latest hourly price struck by then; before it, the fixing of `day`, its own session's date, so a close is

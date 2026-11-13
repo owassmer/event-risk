@@ -179,9 +179,6 @@ class Observations:
             out[s] = {"payload": payload, "request": json.loads(r[1]), "retrieved_at": r[0], "range": tuple(covering)}
         return out
 
-    def undated(self, kind: str, subject: str, covering: tuple[str, str], parse: Any = None) -> dict | None:
-        return self.undated_many(kind, [subject], covering, lambda s: parse).get(subject)
-
     def current_many(self, kind: str, subjects: list[str], covering: tuple[str, str]) -> dict[str, dict]:
         """The answer kept about today for exactly this range, while a store holding it would not read it again, by
         subject: those served."""

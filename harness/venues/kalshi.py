@@ -90,7 +90,6 @@ from harness.venues.markets import FAMILIES, NY, family_id, moment, ny_date, num
 
 VENUE = "kalshi"
 BOOKS_PER_CALL = 100
-MARKETS_PER_CALL = 200
 HISTORY_DAYS = 4999  # the most daily candles one request answers is 5,000
 OPEN = ("active",)  # the lifecycle status of a market that trades
 FINAL = ("finalized",)

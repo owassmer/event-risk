@@ -30,7 +30,7 @@ import pycountry
 
 from harness.derive import series
 from harness.derive.assets import isin_of
-from harness.derive.engine import Derivation, Inputs, Unavailable
+from harness.derive.engine import Derivation, Inputs
 from harness.derive.portfolio import asof_of
 from harness.venues.yahoo import region_of, symbols_for
 
@@ -238,9 +238,6 @@ def _inputs(ctx: Inputs, subject: str) -> dict:
     return {"asof": asof, "lookthrough": ctx.value("lookthrough", "portfolio", ref=True),
             "holdings": ctx.value("holdings", "portfolio", ref=True),
             "listings": listings, "symbols": symbols, "profiles": profiles, "figis": figis}
-
-
-KIND_NAMES = ("cash", "debt", "derivative", "commodity", "currency", "equity", "other")
 
 
 def _kinds_of(owned: dict[str, dict], funds: dict) -> dict[str, float]:
