@@ -1,191 +1,37 @@
 # Data: how to search
 
-How to search the web, a company's record, and then each venue: the web search tool's parameters;
-each kind of a company's record and its parameters; and for each venue, its endpoints and their
-parameters, how a market is named, what its terms are, and how it settles.
-
-## The web
-
-`search_web(text, params, proposition_id)` is one web search for `text`, which may run several
-queries. `params` are the search tool's own:
-
-- `max_uses`: how many queries it may run, 3 when not given;
-- `allowed_domains` or `blocked_domains`, not both: bare domains with an optional path, without a
-  scheme, such as `example.com` or `example.com/blog`;
-- `user_location`: `{"type": "approximate", "city", "region", "country", "timezone"}`, at least one
-  of the last four, `country` as a two-letter code and `timezone` as an IANA zone.
-
-Forecasting platforms, futures prices, and surveys publish probabilities of their own, which you
-find with `search_web`, read with `fetch_source`, and cite as evidence.
+Three searches bring the world in: a company's own record, the web, and the venues' markets. Each returns what its source holds, in the source's own words, and is recorded with what it returned.
 
 ## A company's record
 
-`search_company(ticker, kind, params)` reads one kind of a company's record, newest first, with
-`params` the kind's own. With no dates, a kind returns the company's whole history, so give the
-dates your question needs.
+`search_company(ticker, kind, params)` reads one kind of a company's own record, the newest first. `ticker` is one of the company's US tickers, or its name's id, which is how a company listed only abroad is named. A kind reads from the company's listing to the as-of, up to its `limit`. `more` says there are more, and dates narrow it to what your question needs. Each document in a list is held as a page: `get(id)` reads it whole, `get(id, text)` reads the passages that contain `text`, and citing it keeps it as a `Source`.
 
-- `news`: articles about the company, with the full text of those that have it. `published.gte`
-  and `published.lte`, a date or a UTC time; `channels` and `tags`, the publisher's topics; `limit`,
-  100 when not given.
-- `current_reports`: the items of its 8-Ks. `form_type`, `8-K` or `8-K/A`; `filing_date.gte` and
-  `filing_date.lte`; `limit`, 10 when not given, 100 at most.
-- `risk_factors`: each risk factor in its annual reports, under three levels of category, with its
-  text. `filing_date.gte` and `filing_date.lte`; `limit`, 100 when not given.
-- `annual_report`: its 10-Ks, section by section, each whole: `business`, `risk_factors`, and
-  `mda`, the management's discussion and analysis; a filing can lack one. `section` names one;
-  `filing_date.gte` and `filing_date.lte`; `limit`, 10 when not given, 100 at most.
-- `earnings`: each result reported or scheduled, with the consensus estimates and the surprise.
-  `date.gte` and `date.lte`; `date_status`, `projected` or `confirmed`; `fiscal_year` and
-  `fiscal_period`; `limit`, 100 when not given.
-- `guidance`: each range the company gave for a period, with its earlier range and the consensus
-  then. `date.gte`, `date.lte`, `limit`.
-- `ratings`: the analysts' consensus, one row: the rating, the count of each rating, and the
-  consensus, high, and low price targets, over the ratings given between its dates. `date.gte` and
-  `date.lte`.
+- `news`: articles about the company, each with its full text where it has one. `published.gte` and `published.lte`, a date or a UTC time; `channels` and `tags`, the publisher's topics; `limit`, 100 when not given.
+- `current_reports`: what the company reports between its annual reports, as it happens: the items of its 8-Ks, or a foreign issuer's 6-Ks. `filing_date.gte` and `filing_date.lte`; `limit`, 10 when not given.
+- `annual_report`: its annual report. A 10-K comes section by section, each whole: `business`, `risk_factors`, and `mda`, the management's discussion and analysis. `section` names one, a filing can lack a section, and `mda` is held for recent filings. A foreign issuer's 20-F or 40-F comes whole, the latest when no limit is given. `filing_date.gte` and `filing_date.lte`; `limit`, 10 sections when not given.
+- `risk_factors`: each risk factor in its 10-Ks, with its category and its text. `filing_date.gte` and `filing_date.lte`; `limit`, 100 when not given. A foreign issuer's risk factors are in its annual report.
+- `earnings`: each result reported or scheduled, with the consensus estimates and the surprise. The reports scheduled next come first. `date.gte` and `date.lte`; `date_status`, `projected` or `confirmed`; `fiscal_year` and `fiscal_period`; `limit`, 100 when not given.
+- `guidance`: each range the company gave for a period, with its earlier range and the consensus then. `date.gte` and `date.lte`; `fiscal_year` and `fiscal_period`; `limit`, 100 when not given.
+- `ratings`: the analysts' consensus over the ratings given between its dates: how many gave each rating, and the consensus, high and low price targets. With no `date.gte` it runs from the company's listing, so give the window the consensus is over.
 
-`current_reports`, `risk_factors`, and `annual_report` come from the SEC filings of a company that
-files 10-Ks and 8-Ks; a foreign issuer, which files a 20-F, has none of them.
+A company listed only abroad has two kinds, `earnings` and `ratings`, read from its own market: its results reported by the as-of, each quarter once, and its ratings as they stand on the day they are read. `params` does not apply to them.
 
-## The venues
+## The web
 
-`search_markets(venue, endpoint, params, proposition_id)` passes `params` unchanged to one of a
-venue's endpoints below and returns what the venue returned. Every filter is a parameter you pass;
-the store adds none and hides nothing. A list repeats its key (`tickers=A&tickers=B`); a boolean is
-sent as `true` or `false`.
+`search_web(text, params, proposition_id)` is one web search for `text`. It returns each page's address, title and date, with the passages quoted from it. Given a proposition, the search is recorded on it. `params` are the search's own:
 
-## Polymarket
+- `max_uses`: how many queries it may run, 3 when not given;
+- `allowed_domains` or `blocked_domains`, one of the two: domains without a scheme, with a path where one narrows it, as `example.com/blog` does;
+- `user_location`: `{"type": "approximate", "city", "region", "country", "timezone"}`, with `country` a two-letter code and `timezone` an IANA zone.
 
-Polymarket groups markets under events, and each event has tags. A market is one question with the
-outcomes `Yes` and `No`; a market whose outcomes are named otherwise has no YES side here, and no
-price.
+`fetch_source(url, text)` reads a page whole and returns its id, its title, the date it speaks as of, its length and an excerpt, and, given `text`, the passages that contain it. A passage you quote is the page's own words, so quote from what it returns; `get(id, text)` reads the passages that contain other words.
 
-### `/public-search`
+## The venues' markets
 
-Free-text search over events and their markets.
+`search_markets(text, proposition_id)` searches the venues for markets that bear on a proposition, passing your words to each venue's own search. Each venue ranks what it lists, and the search returns each venue's ten most relevant families that have a market open at the as-of, the venues taking turns. A family of up to twelve open markets lists them, each with its id, question, close date, bid, ask, price and depth. A larger family comes as how many it holds, each market's question in its venue's words, and the span of their closes; a ladder of strikes comes as its first and last question and its strikes. `get` reads the family whole, with each book.
 
-- `q`: the text, required.
-- `events_status`: `active` returns live events. Without it the answer includes closed events and
-  markets. No parameter leaves out closed markets: a live event brings its closed markets with it,
-  and each market says whether it is open.
-- `limit_per_type`: how many events a page holds; each event brings all its markets. `page` turns
-  the page, and the answer's `pagination` says `hasMore` and `totalResults`.
-- `events_tag`: tag slugs to search within; `exclude_tag_id`: tag ids to leave out.
-- `sort`, `ascending`, `keep_closed_markets` (an integer), `search_tags`, `search_profiles`,
-  `recurrence`, `optimized`, and `cache` are further options the venue names without saying what
-  each does.
-
-### `/markets`
-
-Lists markets.
-
-- `closed`: `false` or omitted for open markets, `true` for closed ones.
-- Identifiers: `id`, `slug`, `clob_token_ids`, `condition_ids`, `question_ids`.
-- `tag_id`, with `related_tags`; `include_tag`.
-- Ranges: `liquidity_num_min` and `_max`, `volume_num_min` and `_max`, `start_date_min` and `_max`,
-  `end_date_min` and `_max`.
-- `order` (comma-separated fields) and `ascending`; `limit` and `offset`. A deep offset is refused:
-  page deeply with `/markets/keyset`.
-
-### `/markets/keyset`
-
-Pages through markets without a limit on depth. `limit` is at most 100, and `after_cursor` takes the
-`next_cursor` of the page before, which is present only when a page is full. `closed` omitted or
-`false` gives open markets.
-
-### `/events` and `/events/keyset`
-
-Lists events, each with its markets.
-
-- `closed`: omitted for open and closed events, `false` for open ones.
-- `active`, `archived`, `featured`.
-- `tag_id`, `tag_slug`, `exclude_tag_id`, `related_tags`.
-- Ranges: `liquidity_min` and `_max`, `volume_min` and `_max`, `start_date_min` and `_max`,
-  `end_date_min` and `_max`.
-- `recurrence`, `limit`, `offset`, `order`, `ascending`.
-
-`/events/keyset` pages events the way `/markets/keyset` pages markets.
-
-### A Polymarket market
-
-- **Named** `market:polymarket:{id}`, with the market's `id` as the venue gives it.
-- **Terms:** its `question` and its rules, the market's description, which name the resolution
-  source when its `resolution_source` is empty.
-- **Settles** by its rules. `close_time` is the market's end date, or its event's where the market
-  states none, as a New York date.
-
-## Kalshi
-
-Kalshi has no free-text search. A series is a family of recurring events that follow the same
-format and rules; an event is one occurrence, and its markets are the outcomes or strikes it lists.
-Markets are found through series, by their categories and tags, then their events and markets.
-
-### `/series`
-
-Finds series.
-
-- `category`: exact and case-sensitive; it matches any of a series' categories.
-- `tags`, `include_product_metadata`, `include_volume`, `min_updated_ts`.
-- Every series matching comes back, with no paging, each with its `ticker`, `title`, `category`,
-  `tags`, and `frequency`. A series' `ticker` is the `series_ticker` that `/events` and `/markets`
-  take.
-
-### `/events`
-
-Lists events.
-
-- `series_ticker`; `tickers`, event tickers, comma-separated.
-- `status`: `unopened`, `open`, `closed`, or `settled`.
-- `with_nested_markets=true` brings each event's markets; without it, an event brings none.
-- `with_milestones`, `min_close_ts` (Unix seconds), `min_updated_ts`.
-- `limit` is at most 200; the answer's `cursor` is passed as `cursor` for the next page.
-- It leaves out multivariate events.
-
-### `/markets`
-
-Lists markets.
-
-- `event_ticker` (one), `series_ticker`, `tickers` (market tickers, comma-separated).
-- `status`: `unopened`, `open`, `paused`, `closed`, or `settled`, one at a time. A market's own
-  status reads `active` while it trades.
-- Timestamps in Unix seconds: `min_created_ts` and `max_created_ts`, with `unopened` or `open`;
-  `min_close_ts` and `max_close_ts`, with `closed`; `min_settled_ts` and `max_settled_ts`, with
-  `settled`; `min_updated_ts` and `max_updated_ts`, alone.
-- `mve_filter`: `only` or `exclude`, for multivariate combinations.
-- `limit` is at most 1000; the answer's `cursor` is passed as `cursor` for the next page.
-
-### A Kalshi market
-
-- **Named** `market:kalshi:{ticker}`, with the market's ticker.
-- **Terms:** its title and its rules, `rules_primary` and `rules_secondary`. Its series names the
-  settlement sources, which are its `resolution_source`, with its category and tags.
-- **Settles** by its rules. A strike market states its strike: `strike_type` is `greater`,
-  `greater_or_equal`, `less`, `less_or_equal`, or `between`, with `floor_strike`, `cap_strike`, or
-  both, in the unit its title writes; `functional`, `custom`, and `structured` strikes state theirs
-  in the rules. `close_time` is the market's close time, as a New York date.
-
-## Hyperliquid
-
-Hyperliquid's outcome markets are binary markets, each settling to 0 or 1: the venue's own recurring
-outcomes on its perpetual contracts' prices, and outcomes that deployers define by templates, each
-stating its terms in its parameters.
-
-### `outcomeMeta`
-
-The listing: every live outcome market, in one answer, whatever its topic. It takes no search
-parameters, so one read puts the whole listing in your context.
-
-- **An outcome** has a `name`, its template (`Recurring` for the venue's own, `template:{name}` for
-  a deployer's), and a `description`, the template's parameters as `key:value` joined by `|`.
-- **A question** groups named outcomes, exactly one of which settles YES. In `search_markets` it is
-  the event; an outcome no question holds stands alone.
-
-### A Hyperliquid market
-
-- **Named** `market:hyperliquid:{outcome}`, with the outcome's number.
-- **Terms:** its template and parameters, with its question's.
-- **Settles:** a recurring price binary (`class:priceBinary`, with `underlying`, `expiry`, and
-  `targetPrice`) settles YES if and only if the settlement mark price at `expiry` is at least
-  `targetPrice`. A deployer's template settles by its own parameters, its dates among them (`time`,
-  `resolutionDeadline`, and the like).
-- **`close_time`** is a recurring binary's `expiry` (`YYYYMMDD-HHMM`, UTC), as a New York date. A
-  deployer's template names its own dates among its parameters, and its `close_time` is null.
+- A venue's search matches a market's own words. Search in the words a market's question would use, with the date where the event has one.
+- A search has one page. A narrower text reaches what a broader one did not return.
+- `get(family id)` reads a family whole, with every market in it that is open at the as-of. A family names the family that holds it (`within`), where a venue files each date of one question as a family of its own, and `get` of that id reads the families in it.
+- `get(market id)` reads one market: its terms, its book, the range its price allows, its last trade and its history (3.3).
+- The search is recorded on the proposition it is for, and the event shows how many searches stand behind its markets.

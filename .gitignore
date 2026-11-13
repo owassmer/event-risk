@@ -7,14 +7,17 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 *.egg-info/
 dist/
 build/
 
-# os and editors
+# os / editors
 .DS_Store
 .idea/
 .vscode/
 
-# saved conversations stay on the machine that made them
+# saved conversations stay on the machine that made them, and so do the observations they share
 stores/
+observations/

@@ -8,12 +8,20 @@ of a secret configured in the environment.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any
 
-# The environment variables whose values are secrets.
-SECRET_ENV = ("MASSIVE_API_KEY", "ANTHROPIC_API_KEY", "BASETEN_API_KEY")
+# The environment variables whose values are secrets: every key a client reads, OpenFIGI's among them, and the keys
+# a member who trades on Kalshi holds, a key's identifier with the key.
+SECRET_ENV = ("MASSIVE_API_KEY", "ANTHROPIC_API_KEY", "BASETEN_API_KEY", "OPENFIGI_API_KEY", "KALSHI_API_KEY_ID",
+              "KALSHI_PRIVATE_KEY")
+# The environment variables that name a file whose body is a secret, as a private key kept as a PEM is: the body is
+# sought whole, and so is each line of it, since a key can be quoted a line at a time; a PEM's armour lines
+# (`-----BEGIN ...-----`) name the kind of key and are no secret.
+SECRET_FILES = ("KALSHI_PRIVATE_KEY_PATH",)
+_read: dict[tuple[str, float], list[str]] = {}
 
 # Field names that hold credentials.
 NAMES = frozenset({"apikey", "api_key", "api-key", "x-api-key", "x_api_key", "authorization", "access_token",
@@ -27,9 +35,27 @@ _NAMED = re.compile(r"(?i)(?:^|[?&;#\s\"'{,])(apikey|api_key|api-key|x-api-key|x
 _SCHEME = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
 
 
+def _file_secrets(path: str) -> list[str]:
+    """A secret file's body and each of its lines, read once for each version of the file."""
+    try:
+        stamp = os.stat(path).st_mtime
+    except OSError:  # no such file: nothing configured to seek
+        return []
+    if (path, stamp) not in _read:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            body = f.read().strip()
+        lines = [s for line in body.splitlines() if len(s := line.strip()) >= 8 and not s.startswith("-----")]
+        _read[(path, stamp)] = ([body] if len(body) >= 8 else []) + lines
+    return _read[(path, stamp)]
+
+
 def secrets() -> list[str]:
-    """The secrets configured in the environment."""
-    return [v for k in SECRET_ENV if len(v := os.environ.get(k, "").strip()) >= 8]
+    """The secrets configured in the environment: each secret variable's value, and each secret file's body."""
+    found = [v for k in SECRET_ENV if len(v := os.environ.get(k, "").strip()) >= 8]
+    for k in SECRET_FILES:
+        if path := os.environ.get(k, "").strip():
+            found += _file_secrets(os.path.expanduser(path))
+    return found
 
 
 def find(obj: Any, *, names: bool = True) -> str | None:
@@ -61,3 +87,11 @@ def find(obj: Any, *, names: bool = True) -> str | None:
         return None
 
     return walk(obj, "")
+
+
+def in_text(text: str) -> bool:
+    """Whether a configured secret's text sits in `text`, a value's canonical JSON (harness.derive.engine.canonical):
+    each secret sought as a JSON string would hold it, escaped as canonical escapes it. A secret in any string of the
+    value is in its text so; the search is one pass of the text where find walks every node. A secret all of digits
+    could be found in a number too, which find would not: the value is refused then, the safe side."""
+    return any(json.dumps(k, ensure_ascii=False)[1:-1] in text for k in secrets())

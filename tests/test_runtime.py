@@ -9,7 +9,7 @@ import json
 import numpy as np
 import pytest
 
-from conftest import fixture_judge
+from conftest import fixture_judge, masked, paid
 from harness import claude
 from harness.analyst import (NOT_RUN, Analyst, FileRefused, history,
                              keep_file, live)
@@ -17,21 +17,31 @@ from harness.derive import default_registry
 from harness.ledger import check, ledger
 from harness.store import Store, StoreError
 from harness.trace import Trace
-from harness.venues import Venues, hyperliquid, kalshi, polymarket
+from harness.venues import Venues
 from harness.web import Web
 from harness.world import World
 from massive_data import ASOF, KNOWLEDGE, closes_from, put_bars, put_market, put_reference, random_returns
+from harness.analyst import MODEL, system_prompt
 from test_analyst import TURN_1, Data, Script, page_id, say, use, web_route
-from test_markets import Opener, http, hyperliquid_route, kalshi_route, polymarket_route
+from test_markets import Opener, adapter, kalshi_route, polymarket_route
 
 FIRST = "I hold NVDA $60,000 and $40,000 in cash. What could hit it?"
+# Today's date, as it leads each message the person sends: the world's clock at the fixture's as-of
+DATE = {"type": "text", "text": "Today is Wednesday, 2026-11-04, in New York."}
+
+
+def spoken(message: dict) -> str | None:
+    """The person's words in a message they sent, which begins with today's date; None for a message of results."""
+    content = message["content"]
+    return content[-1]["text"] if isinstance(content, list) and content and content[0] == DATE else None
 
 
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     """A store and its world over synthetic Massive data, stub venues, and the fixture judge; `start(replies)`
     gives an analyst answering from the script."""
-    for key in ("ANTHROPIC_API_KEY", "BASETEN_API_KEY", "MASSIVE_API_KEY"):
+    from harness.credentials import SECRET_ENV
+    for key in SECRET_ENV:
         monkeypatch.delenv(key, raising=False)
     import anthropic
     import httpx2
@@ -45,19 +55,18 @@ def world(tmp_path, monkeypatch):
     judge = fixture_judge()
     store = Store.create(tmp_path / "scratch-runtime", initial=KNOWLEDGE, registry=default_registry(), judge=judge,
                          fetchers=data.fetchers())
-    (pm, pm_seen), (ks, _), (hl, _) = http(polymarket_route), http(kalshi_route), http(hyperliquid_route)
+    (pm, pm_seen), (ks, _) = adapter("polymarket", polymarket_route), adapter("kalshi", kalshi_route)
     web = Opener(web_route)
-    w = World(store, Venues({"polymarket": polymarket.Polymarket(pm), "kalshi": kalshi.Kalshi(ks),
-                             "hyperliquid": hyperliquid.Hyperliquid(hl)}), Web(key="test", opener=web),
-              today=lambda: ASOF)
+    w = World(store, Venues({"polymarket": pm, "kalshi": ks}, paid()), Web(key="test", opener=web), today=lambda: ASOF)
     out = {"store": store, "world": w, "judge": judge, "data": data, "venue": pm_seen, "web": web}
 
-    def start(replies, **kw):
+    def start(replies, credential=None, **kw):
         script = Script(store, replies)
         transport = httpx2.Client(transport=httpx2.MockTransport(script))
-        client = anthropic.Anthropic(api_key="sk-test", http_client=transport)
+        client = claude.client(credential, http_client=transport) if credential else \
+            anthropic.Anthropic(api_key="sk-test", http_client=transport)
         out["script"] = script
-        return Analyst(w, client=client, **kw)
+        return Analyst(w, client=client, credential=credential, **kw)
 
     out["start"] = start
     yield out
@@ -84,7 +93,7 @@ def state(store: Store) -> dict:
 
 
 def quoted(s):
-    return s.links_of("prop:1", "quoted_by")[0]["id"]
+    return s.links_of("prop:1", "asks")[0]["id"]
 
 
 def evidence(s):
@@ -92,7 +101,7 @@ def evidence(s):
 
 
 U = {"title": "U", "text": "NVDA closes at or below $80 on March 31, 2027", "metric": "metric:price:NVDA",
-     "relation": "<=", "value": 80.0, "window_end": "2027-03-31", "kind": "level_at_date"}
+     "comparison": "<=", "value": 80.0, "window_end": "2027-03-31", "kind": "level_at_date"}
 
 # The second turn changes every kind of thing the analyst writes: a market released, an evidence link removed, a
 # proposition's stated field and a metric's sourced level edited, a proposition added and watched, a note removed and
@@ -100,14 +109,14 @@ U = {"title": "U", "text": "NVDA closes at or below $80 on March 31, 2027", "met
 CHANGES = [
     lambda s: [use("remove", id=quoted(s)), use("remove", id=evidence(s)),
                use("edit", id="prop:1", field="value", value=30.0),
-               use("edit", id="metric:us_effective_tariff_rate_pct", field="current_value", value=23.0,
+               use("edit", id="metric:us_effective_tariff_rate_pct", field="level", value=23.0,
                    source_id=page_id(s)),
                use("add", type="Proposition", fields=U), use("remove", id="note:1")],
     lambda s: [use("link", from_id="portfolio", relation="watches", to_id="prop:3"),
-               use("link", from_id="prop:3", relation="consequence", to_id="metric:price:NVDA",
-                   fields={"value": -30.0, "meaning": "gap"}),
+               use("link", from_id="prop:3", relation="consequence", to_id="name:NVDA",
+                   fields={"value": -30.0}),
                use("note", text="A deeper fall in NVDA.", about_ids=["prop:3"]),
-               use("search_markets", venue="polymarket", endpoint="/public-search", params={"q": "nvidia"},
+               use("search_markets", text="nvidia",
                    proposition_id="prop:3"),
                use("ledger")],
     lambda s: [say("I changed the tariff event and added a deeper NVDA fall.")],
@@ -126,7 +135,8 @@ def test_a_rewind_restores_what_the_analyst_wrote_and_reads_every_value_again_wi
     assert store.db.execute("SELECT count(*) FROM data WHERE subject = 'market:polymarket:516710'").fetchone()[0] > 0
     seen = reached(world)
     analyst.rewind(2, "edit")
-    assert state(store) == before  # every row, and every derived value, exactly as before the message
+    # every row as before the message, and every derived value, computed again where the cache no longer held it
+    assert masked(state(store)) == masked(before)
     assert reached(world) == seen  # read again from the store's data and cache: no fetch, no judge, no venue
     # the conversation rewound with the store: turn 2's message and everything after it are gone from what the model
     # sees, and the trace keeps the replaced turn beside the rewind
@@ -144,26 +154,30 @@ def test_a_rewind_restores_a_citation_moved_between_pages_a_released_page_and_a_
     store = make_store()
     one = store.put_page("https://example.org/one", "The rate is 22 percent.", retrieved_at="2026-11-04T15:00:00+00:00")
     two = store.put_page("https://example.org/two", "The rate is 23 percent.", retrieved_at="2026-11-04T16:00:00+00:00")
-    store.add("Metric", {"id": "rate_pct", "name": "the rate", "unit": "percent", "traded": False,
-                         "current_value": {"value": 22.0, "source_id": one}})
+    store.add("Metric", {"id": "rate_pct", "name": "the rate", "unit": "percent", "kind": "level",
+                         "level": {"value": 22.0, "source_id": one}})
     store.edit(one, "dated", "2026-10-30", one)
     store.checkpoint("s:1")
     before = snapshot(store)["tables"]
-    store.edit("metric:rate_pct", "current_value", 23.0, two)  # the citation moves to page two; page one goes
-    store.edit("metric:rate_pct", "current_value", 24.0, two)  # and the same row changes again
+    store.edit("metric:rate_pct", "level", 23.0, two)  # the citation moves to page two; page one goes
+    store.edit("metric:rate_pct", "level", 24.0, two)  # and the same row changes again
     store.edit(two, "dated", "2026-11-01", two)
     note = store.note("a note added and taken back in one turn", ["metric:rate_pct"])
     store.remove(note["id"])
-    assert store.get(one)["kept"] is False and store.get("metric:rate_pct")["citations"] == {"current_value": two}
+    assert store.get(one)["kept"] is False and store.get("metric:rate_pct")["citations"] == {"level": two}
     store.rewind("s:1")
     after = snapshot(store)["tables"]
-    for t in WRITTEN + ("meta",):
+    for t in WRITTEN:
         assert after[t] == before[t], t
+    # the as-of and the store's settings as they were; its count of versions goes on, the rewind a version of its own
+    settings = lambda rows: [r for r in rows if r[0] != "version"]  # noqa: E731
+    assert settings(after["meta"]) == settings(before["meta"])
+    assert int(store.meta("version")) == store.version > int(dict(before["meta"])["version"])
     assert store.get(one)["text"] == "The rate is 22 percent." and store.get(one)["dated"] == "2026-10-30"
     assert store.get(one)["kept"] is True and one not in store._pending  # kept again, so not held
-    assert store.get("metric:rate_pct")["citations"] == {"current_value": one}
+    assert store.get("metric:rate_pct")["citations"] == {"level": one}
     assert store.get(two)["kept"] is False  # a fetched page is never rewound: the one the checkpoint did not keep is held
-    store.edit("metric:rate_pct", "current_value", 23.0, two)  # and citable under its id
+    store.edit("metric:rate_pct", "level", 23.0, two)  # and citable under its id
     assert store.get(two)["kept"] is True
 
 
@@ -193,15 +207,13 @@ def test_an_edit_rewinds_and_sends_the_new_message_and_a_retry_sends_the_same_on
     assert store.checkpoints() == [analyst.checkpoint_key(t) for t in (1, 2, 3)]
     out = analyst.edit(2, "Tell me about the tariff event.")
     assert store.checkpoints() == [analyst.checkpoint_key(t) for t in (1, 2)]  # turn 3's went with its turn
-    assert out["text"] == "Once more." and state(store) == before  # the edited turn wrote nothing
+    assert out["text"] == "Once more." and masked(state(store)) == masked(before)  # the edited turn wrote nothing
     sent = world["script"].requests[-1]["messages"]
-    assert sent[-1]["role"] == "assistant" or sent[-1]["content"] == "Tell me about the tariff event."
-    assert [m["content"] for m in sent if m["role"] == "user" and isinstance(m["content"], str)] == \
-        [FIRST, "Tell me about the tariff event."]
+    assert sent[-1]["role"] == "assistant" or spoken(sent[-1]) == "Tell me about the tariff event."
+    assert [spoken(m) for m in sent if m["role"] == "user" and spoken(m)] == [FIRST, "Tell me about the tariff event."]
     analyst.retry(2)
     sent = world["script"].requests[-1]["messages"]
-    assert [m["content"] for m in sent if m["role"] == "user" and isinstance(m["content"], str)] == \
-        [FIRST, "Tell me about the tariff event."]
+    assert [spoken(m) for m in sent if m["role"] == "user" and spoken(m)] == [FIRST, "Tell me about the tariff event."]
     entries = Trace(store.trace_path).entries()
     assert [(e["type"], e.get("reason")) for e in entries if e["type"] == "rewind"] == [("rewind", "edit"),
                                                                                      ("rewind", "retry")]
@@ -259,7 +271,7 @@ def test_stop_ends_a_reply_that_has_gone_quiet_while_the_model_thinks(world):
     assert [e["type"] for e in Trace(world["store"].trace_path).entries()][-1] == "stop"
 
 
-V = {"title": "V", "text": "A ruling by March 31, 2027", "relation": "occurs", "window_start": ASOF,
+V = {"title": "V", "text": "A ruling by March 31, 2027", "comparison": "occurs", "window_start": ASOF,
      "window_end": "2027-03-31", "kind": "hitting"}
 
 
@@ -289,8 +301,8 @@ def test_stop_ends_the_turn_at_its_current_call_and_the_next_message_joins_the_c
     out = analyst.say("Go on.")
     assert out["text"] == "Going on from the proposition." and not out["stopped"]
     last = world["script"].requests[-1]["messages"][-1]  # the person's side: the results, then their message
-    assert [b["type"] for b in last["content"]] == ["tool_result"] * 3 + ["text"]
-    assert last["content"][-1]["text"] == "Go on."
+    assert [b["type"] for b in last["content"]] == ["tool_result"] * 3 + ["text", "text"]
+    assert last["content"][-2:] == [DATE, {"type": "text", "text": "Go on."}]
     continued = Analyst(analyst.world, client=analyst.client, session=analyst.session)
     assert continued.messages == analyst.messages
 
@@ -310,15 +322,15 @@ def test_stop_while_a_reply_streams_keeps_nothing_of_it_but_the_trace_shows_what
     entries = Trace(store.trace_path).entries()
     assert entries[-1]["type"] == "stop" and entries[-1]["partial"] == "The larges"
     assert not any(e["type"] == "assistant" for e in entries)
-    assert analyst.messages == [{"role": "user", "content": "What matters most?"}]
+    assert analyst.messages == [{"role": "user", "content": [DATE, {"type": "text", "text": "What matters most?"}]}]
     analyst.on_event = lambda e: None
     out = analyst.say("Go on.")
     assert out["text"] == "Here it is again."
     assert world["script"].requests[-1]["messages"][0]["content"] == [
-        {"type": "text", "text": "What matters most?"}, {"type": "text", "text": "Go on."}]
+        DATE, {"type": "text", "text": "What matters most?"}, DATE, {"type": "text", "text": "Go on."}]
     # an edit of the stopped turn takes its message back out of the one it joined
     analyst.rewind(2, "edit")
-    assert analyst.messages == [{"role": "user", "content": [{"type": "text", "text": "What matters most?"}]}]
+    assert analyst.messages == [{"role": "user", "content": [DATE, {"type": "text", "text": "What matters most?"}]}]
 
 
 # ---------------------------------------------------------------- files
@@ -337,7 +349,8 @@ def test_a_dropped_file_is_kept_beside_the_store_and_reaches_the_analyst_as_a_do
     assert [f["path"] for f in files] == ["files/1-my-holdings.csv", "files/2-Statement-Oct.pdf", "files/3-screen.png"]
     assert (store.dir / files[1]["path"]).read_bytes() == PDF and files[2]["media_type"] == "image/png"
     analyst.say("What could hit this?", files)
-    content = world["script"].requests[0]["messages"][0]["content"]
+    date, *content = world["script"].requests[0]["messages"][0]["content"]  # today's date first, then the files
+    assert date == DATE
     assert content[0] == {"type": "document", "title": "my holdings.csv",
                           "source": {"type": "text", "media_type": "text/plain", "data": CSV.decode()}}
     assert content[1]["type"] == "document" and content[1]["source"]["media_type"] == "application/pdf"
@@ -361,7 +374,7 @@ def test_an_edited_message_keeps_the_files_it_was_sent_with_that_the_edit_keeps(
     from harness import server
     store = world["store"]
     analyst = world["start"]([lambda s: [say("Read.")]] * 3)
-    monkeypatch.setattr(claude, "api_key", lambda: "sk-test")
+    monkeypatch.setattr(claude, "credential", lambda: claude.Credential(claude.KEY, "sk-test"))
     page = server.Page(root=store.dir.parent)
     page.store, page.analyst, page.session = store, analyst, analyst.session
 
@@ -379,14 +392,15 @@ def test_an_edited_message_keeps_the_files_it_was_sent_with_that_the_edit_keeps(
     page.send("What could hit this?", [{"name": "holdings.csv", "data": base64.b64encode(CSV).decode()}])
     done()
     [kept] = analyst.message(1)["files"]
-    assert sent() == [("document", "holdings.csv"), ("text", "What could hit this?")]
+    assert sent() == [("text", DATE["text"]), ("document", "holdings.csv"), ("text", "What could hit this?")]
     page.edit(1, "These are my holdings. What could hit this?", [kept["path"]])
     done()
-    assert sent() == [("document", "holdings.csv"), ("text", "These are my holdings. What could hit this?")]
+    assert sent() == [("text", DATE["text"]), ("document", "holdings.csv"),
+                      ("text", "These are my holdings. What could hit this?")]
     assert analyst.message(1)["files"] == [kept]  # the trace's edited message names the same kept file
     page.edit(1, "Never mind the file.", [])
     done()
-    assert sent() == "Never mind the file." and analyst.message(1)["files"] == []
+    assert sent() == [("text", DATE["text"]), ("text", "Never mind the file.")] and analyst.message(1)["files"] == []
     with pytest.raises(StoreError):
         page.edit(1, " ", [])  # an edit with neither words nor a file is no message
 
@@ -402,13 +416,109 @@ def test_a_file_the_analyst_cannot_read_is_refused_and_not_kept(tmp_path, name, 
     assert not (tmp_path / "files").exists() or not any((tmp_path / "files").iterdir())
 
 
-def test_every_request_runs_at_xhigh_effort(world):
-    """A request that omits effort runs at Opus 5.5's default, medium."""
+def test_every_request_runs_on_fable_5_2_at_xhigh_effort(world):
+    """Every analyst request selects Fable 5.2 and explicitly requests xhigh effort."""
     analyst = world["start"](TURN_1)
     analyst.say(FIRST)
     script = world["script"]
     assert len(script.requests) == 6
+    assert all(body["model"] == "claude-fable-5-2" for body in script.requests)
     assert all(body["output_config"] == {"effort": "xhigh"} for body in script.requests)
+
+
+# ---------------------------------------------------------------- a response that ends short of its answer
+
+
+OCCURS = {"id": "ceasefire", "name": "a ceasefire is announced", "kind": "occurrence",
+          "resolution_source": "the parties' statements"}
+REFUSED = {"type": "refusal", "category": "reasoning_extraction", "explanation": "The request asks for the model's reasoning."}
+
+
+def cut(*content):
+    """A response cut off at max_tokens: its last call's input unfinished, whatever the stream gave of it."""
+    return lambda s: {"content": list(content), "stop_reason": "max_tokens"}
+
+
+def declined(*content):
+    return lambda s: {"content": list(content), "stop_reason": "refusal", "stop_details": REFUSED}
+
+
+def metrics(store) -> list:
+    """The metrics the analyst added: a price's is the store's own."""
+    return [m for m in store.ids_of("Metric") if not m.startswith("metric:price:")]
+
+
+def test_a_response_cut_off_runs_none_of_its_calls_and_is_made_again_as_the_same_request(world):
+    """A call in a response cut off at its limit is not run, so nothing it would write reaches the store; the same
+    request goes again, and the turn answers from it. The trace keeps the cut response and the conversation leaves it,
+    so the next turn, and a conversation continued from the trace, send what the analyst saw."""
+    events = []
+    analyst = world["start"]([
+        lambda s: [say("I'll note the metric."), use("add", type="Metric", fields=OCCURS)],
+        cut(say("Now the second."), use("add", type="Metric", fields={**OCCURS, "id": "second"})),
+        lambda s: [use("add", type="Metric", fields={**OCCURS, "id": "third"})],
+        lambda s: [say("Both are in.")],
+        lambda s: [say("Nothing more.")],
+    ], on_event=events.append)
+    out = analyst.say(FIRST)
+    store, script = world["store"], world["script"]
+    assert out["text"] == "Both are in." and not out["stopped"]
+    assert metrics(store) == ["metric:ceasefire", "metric:third"]  # the cut call wrote nothing
+    assert script.requests[2]["messages"] == script.requests[1]["messages"]  # the same request, again
+    entries = analyst.tools.trace.entries()
+    replies = [e for e in entries if e["type"] == "assistant"]
+    assert [e["stop_reason"] for e in replies] == ["tool_use", "max_tokens", "tool_use", "end_turn"]
+    assert all(e["model"] == MODEL for e in replies)
+    assert [e["reason"] for e in entries if e["type"] == "dropped"] == ["max_tokens"]
+    assert [e for e in events if e["type"] == "dropped"][0]["reason"] == "max_tokens"
+    shown = [e for e in live(entries, analyst.session) if e["type"] == "assistant"]
+    assert [e["stop_reason"] for e in shown] == ["tool_use", "tool_use", "end_turn"]
+    analyst.say("And now?")
+    sent = json.dumps(script.requests[4]["messages"])
+    assert "Now the second." not in sent and "Both are in." in sent
+    continued = Analyst(analyst.world, client=analyst.client, session=analyst.session)
+    assert continued.messages == analyst.messages
+
+
+def test_a_refusal_is_made_again_once_and_where_it_stands_the_turn_ends_with_the_persons_side(world):
+    """A declined response is made again as the same request, once. Declined again, it stands: its partial output
+    leaves the conversation, which ends with the person's side as a stopped turn's does, and the trace keeps both
+    attempts with why each was declined. The next message joins the person's side and is answered."""
+    analyst = world["start"]([
+        lambda s: [use("add", type="Metric", fields=OCCURS)],
+        declined({"type": "thinking", "thinking": "Looking back over what", "signature": "c2ln"}),
+        declined(),
+        lambda s: [say("Here is what the store holds.")],
+    ])
+    out = analyst.say(FIRST)
+    script = world["script"]
+    assert len(script.requests) == 3 and script.requests[2]["messages"] == script.requests[1]["messages"]
+    assert out["text"] == "" and not out["stopped"]
+    entries = analyst.tools.trace.entries()
+    refused = [e for e in entries if e["type"] == "assistant" and e["stop_reason"] == "refusal"]
+    assert len(refused) == 2 and all(e["stop_details"]["category"] == "reasoning_extraction" for e in refused)
+    assert [e["reason"] for e in entries if e["type"] == "dropped"] == ["refusal", "refusal"]
+    assert analyst.messages[-1]["role"] == "user"  # the call's results: the person's side
+    assert metrics(world["store"]) == ["metric:ceasefire"]  # what the turn wrote stays
+    second = analyst.say("What does the store hold?")
+    assert second["text"] == "Here is what the store holds."
+    last = script.requests[3]["messages"]
+    assert last[-1]["role"] == "user" and last[-1]["content"][-1] == {"type": "text", "text": "What does the store hold?"}
+    assert "Looking back over what" not in json.dumps(last)
+
+
+def test_a_response_cut_off_again_stands_as_the_turns_answer_so_far(world):
+    """Made again and cut off again, a response stands: the same request needs more than the model's most output in
+    one response, and the turn ends with what it wrote. Its calls are not run."""
+    analyst = world["start"]([
+        cut(say("The first part of a long answer")),
+        cut(say("The first part of a longer answer"), use("add", type="Metric", fields=OCCURS)),
+    ])
+    out = analyst.say(FIRST)
+    assert len(world["script"].requests) == 2 and out["text"] == "The first part of a longer answer"
+    assert metrics(world["store"]) == []
+    shown = [e for e in live(analyst.tools.trace.entries(), analyst.session) if e["type"] == "assistant"]
+    assert [e["stop_reason"] for e in shown] == ["max_tokens"]
 
 
 # ---------------------------------------------------------------- the first read's stages
@@ -420,14 +530,16 @@ def test_the_first_read_reports_its_stages_as_they_happen(world):
     store.progress = events.append
     analyst = world["start"](TURN_1[:1] + [lambda s: [say("Priced.")]])
     analyst.say(FIRST)
+    store.get("portfolio")  # read whole, as its panel reads it: its volatility needs the exposures fitted
     stages = [e["stage"] for e in events]
     firsts = [s for i, s in enumerate(stages) if s not in stages[:i]]
-    assert firsts == ["holdings", "funds", "prices", "exposures"]  # pricing, looking through, reading, fitting
+    assert firsts == ["holdings", "funds", "industries", "prices", "exposures"]  # pricing, looking through, classifying, reading, fitting
     done = [e["derivation"] for e in events if e.get("state") == "done"]
     assert done.index("holdings") < done.index("lookthrough") < done.index("betas") < done.index("g")
     prices = [e for e in events if e["stage"] == "prices" and e["kind"] == "bars"]
-    assert prices[0]["done"] == 0 and [e["done"] for e in prices[1:]] == list(range(1, len(prices)))
-    assert all(e["of"] == prices[0]["of"] for e in prices) and prices[-1]["done"] == prices[-1]["of"]
+    if prices:  # the market's calendar reads its proxy's bars while the holdings are priced
+        assert prices[0]["done"] == 0 and [e["done"] for e in prices[1:]] == list(range(1, len(prices)))
+        assert all(e["of"] == prices[0]["of"] for e in prices) and prices[-1]["done"] == prices[-1]["of"]
     for e in events:
         if e.get("state") == "done":
             assert store.computation_output(e["basis"]) is not None  # each part is there to show as it is ready
@@ -439,12 +551,17 @@ def test_the_first_read_reports_its_stages_as_they_happen(world):
 # ---------------------------------------------------------------- the Claude key
 
 
-def test_on_the_key_nothing_is_added():
-    h = claude.headers("sk-ant-api03-test")
+def test_on_the_key_a_request_carries_the_key_alone(monkeypatch):
+    key = claude.Credential(claude.KEY, "sk-ant-api03-test")
+    h = claude.headers(key)
     assert h["x-api-key"] == "sk-ant-api03-test" and "authorization" not in h and "anthropic-beta" not in h
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-test")
+    assert claude.credential() == key
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    assert claude.credential() is None
 
 
-def test_an_error_line_names_the_credential_refused(monkeypatch):
+def test_an_error_line_names_the_key_refused(monkeypatch):
     import anthropic
     import httpx2
     from harness.server import _plain_error
@@ -452,7 +569,6 @@ def test_an_error_line_names_the_credential_refused(monkeypatch):
     request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
     limited = anthropic.RateLimitError("limit", response=httpx2.Response(429, request=request),
                                        body={"error": {"message": "This request would exceed your limit."}})
-    assert _plain_error(limited) == ("The analyst couldn't reply on ANTHROPIC_API_KEY: This request would "
-                                     "exceed your limit.")
+    assert _plain_error(limited) == "The analyst couldn't reply on ANTHROPIC_API_KEY: This request would exceed your limit."
     refused = anthropic.AuthenticationError("no", response=httpx2.Response(401, request=request), body=None)
     assert _plain_error(refused) == "The Claude key was refused. Check ANTHROPIC_API_KEY in .env."

@@ -3,8 +3,13 @@ bid and ask are the test's, and the fixture judge keyed by the texts each check 
 
 from __future__ import annotations
 
+import atexit
 import json
+import shutil
+import tempfile
+from pathlib import Path
 
+from harness import schema
 from harness.derive import default_registry
 from harness.judge import FixtureJudge
 from harness.store import Store
@@ -13,6 +18,34 @@ ASOF = "2026-11-04"
 RETRIEVED = "2026-11-04T15:00:00+00:00"
 TARIFF = "metric:us_effective_tariff_rate_pct"
 YALE = "Resolves to the Yale Budget Lab's published average effective tariff rate."
+WHY = "the case this test states"  # the reasoning each stated assumption is written with (ONTOLOGY.md 2; TOOLS.md 5)
+
+
+def stated(value, why: str = WHY) -> dict:
+    """An assumption as the analyst states it: its value, or its value's fields, with its basis, here the reasoning."""
+    return {**value, "note": why} if isinstance(value, dict) else {"value": value, "note": why}
+
+
+def _based(v) -> bool:
+    return isinstance(v, dict) and bool(set(v) & set(schema.BASIS))
+
+
+def with_basis(kind: str, fields: dict | None) -> dict | None:
+    """The fields of an object or a link of this type or relation, each assumption a test gives as a bare figure stated
+    with its basis; a market's price taken states none."""
+    t = schema.OBJECTS.get(kind) or schema.RELATIONS.get(kind)
+    if not fields or t is None:
+        return fields
+    out = dict(fields)
+    for f in t.stated:
+        v = out.get(f.name)
+        if v is None or f.kind not in schema.BASED or _based(v) or v is True:
+            continue
+        if f.kind == schema.CHANCES:
+            out[f.name] = [c if _based(c) else stated(c) for c in v]
+        else:
+            out[f.name] = stated(v)
+    return out
 
 
 def key(kind: str, statement: str, evidence: list[dict]) -> tuple:
@@ -38,11 +71,29 @@ class Venues:
         return {}
 
 
+_BUILT: dict[tuple, Path] = {}  # each base written in this process, by the base and the as-of: its store
+
+
+def _built(base, asof: str, name: str) -> Path:
+    """The store `base` writes into a new World as of `asof`, written once in this process and closed, its directory
+    removed when the process ends."""
+    if (base, asof) not in _BUILT:
+        root = Path(tempfile.mkdtemp(prefix="sl-test-base-"))
+        atexit.register(shutil.rmtree, root, True)
+        made = World(root / name, asof=asof)
+        base(made.store)
+        made.store.close()
+        _BUILT[(base, asof)] = root / name
+    return _BUILT[(base, asof)]
+
+
 class World:
     """A store as of ASOF holding cash, with markets whose books the test sets, and the fixture judge: an answer from
     `answers` by key, else `default`."""
 
-    def __init__(self, path, answers=None, default=0.9, asof=ASOF, registry=None):
+    def __init__(self, path, answers=None, default=0.9, asof=ASOF, registry=None, base=None):
+        """`base`, where given, writes into the store what every test of its kind begins from: it is written once in a
+        process, and each World given it begins from a copy of that store."""
         self.judge = FixtureJudge(answers or {}, default=lambda kind, statement, evidence: default, key=key)
         self.venues = Venues()
         self.books: dict[str, dict] = {}
@@ -52,11 +103,15 @@ class World:
             "history": lambda subject, covering: {"payload": {"data": [], "pagination": {}},
                                                   "request": {"endpoint": "/prices-history"}, "retrieved_at": RETRIEVED},
         }
-        self.store = Store.create(path, registry=registry or default_registry(), judge=self.judge, venues=self.venues,
-                                  fetchers=fetchers)
+        opened = dict(registry=registry or default_registry(), judge=self.judge, venues=self.venues, fetchers=fetchers)
+        if base is not None:
+            shutil.copytree(_built(base, asof, Path(path).name), path)
+            self.store = Store.open(path, **opened)
+            return
+        self.store = Store.create(path, **opened)
         self.store.add("Metric", {"id": "us_effective_tariff_rate_pct", "name": "the US effective tariff rate", "unit": "pct",
-                                  "resolution_source": "Yale Budget Lab"})
-        self.store.add("Portfolio", {"asof": asof, "holdings": [{"ticker": "CASH", "dollars": 1000.0}]})
+                                  "kind": "level", "resolution_source": "Yale Budget Lab"})
+        self.store.add("Portfolio", {"asof": asof, "holdings": [{"cash": 1000.0}]})
 
     def market(self, vid: str, question: str, bid: float | None, ask: float | None, rules: str = YALE,
                last: float | None = None) -> str:
@@ -82,29 +137,40 @@ class World:
 
     def prop(self, title: str, relation: str = "occurs", value: float | None = None, kind: str = "hitting",
              end: str = "2027-03-31", start: str | None = ASOF, metric: str | None = None, **more) -> str:
-        fields = {"title": title, "text": f"{title}: the proposition", "relation": relation, "window_end": end,
+        if "chance" in more:  # a chance stated on its own, its probability
+            item = more["chance"] if isinstance(more["chance"], dict) else {"value": more["chance"]}
+            more = {**{k: v for k, v in more.items() if k != "chance"}, "chances": [item]}
+        fields = {"title": title, "text": f"{title}: the proposition", "comparison": relation, "window_end": end,
                   "kind": kind, **more}
         if value is not None:
             fields.update(value=value, metric=metric or TARIFF)
+        elif metric is not None:  # the occurrence a proposition that occurs names
+            fields["metric"] = metric
         if start and kind == "hitting":
             fields["window_start"] = start
-        return self.store.add("Proposition", fields)["id"]
+        return self.store.add("Proposition", with_basis("Proposition", fields))["id"]
 
     def link(self, a, relation, b, **fields) -> str:
-        return self.store.link(a, relation, b, fields or None)["id"]
+        return self.store.link(a, relation, b, with_basis(relation, fields) or None)["id"]
 
     def derived(self, oid: str, field: str):
-        return self.store.get(oid)["derived"][field].get("value")
-
-    def reason(self, oid: str, field: str):
-        return self.store.get(oid)["derived"][field].get("reason")
+        return self.store.get(oid)["derived"].get(field, {}).get("value")
 
     def interval(self, pid: str) -> tuple:
         d = self.store.get(pid)["derived"]
-        return d["lo"]["value"], d["hi"]["value"]
+        return tuple(d["range"]["value"])
 
     def point(self, pid: str):
-        return self.derived(pid, "p")
+        return self.derived(pid, "probability")
 
-    def derive(self, pid: str, reads: list[str], *chances: dict) -> dict:
-        return self.store.edit(pid, "derivation", {"reads": reads, "chances": list(chances)})
+    def chances(self, pid: str, *items: dict, keep: bool = True) -> dict:
+        """State chances of pid, each {given, given_not, value}; with `keep`, beside those it states, any given the same
+        replaced."""
+        cond = lambda c: (sorted(c.get("given") or []), sorted(c.get("given_not") or []))  # noqa: E731
+        new = [{"given": [], "given_not": [], **c} for c in items]
+        held = [c for c in (self.store.stated_of(pid).get("chances") or []) if keep and
+                all(cond(c) != cond(n) for n in new)]
+        return self.store.edit(pid, "chances", held + with_basis("Proposition", {"chances": new})["chances"])
+
+    def left_open(self, pid: str):
+        return self.derived(pid, "left_open")

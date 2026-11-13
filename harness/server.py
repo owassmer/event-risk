@@ -7,8 +7,9 @@ stores/{name}` opens a store and its conversation, readable with no keys and con
 directory, so the shipped store never changes, with no keys read and no judge, venue, or data client built, so
 nothing is fetched or asked and every number reads from the store's saved data and its cache.
 
-The analyst works in its own thread. Its events, the first read's stages, and each change to the store reach the
-browser over server-sent events; the panels are rendered here, by render.py, under the store's lock, between the
+The analyst works in its own thread. When a store is opened with its keys, and when a reply ends, which of its kept
+markets have settled is read in the background, and the outcomes they determine recorded (harness.settlements). Its
+events, the first read's stages, and each change to the store reach the browser over server-sent events; the panels are rendered here, by render.py, under the store's lock, between the
 analyst's calls. While it works they render from what the store holds; when a reply ends they render once more
 with the judge and the data clients. A message sent while it works waits, and goes when the reply ends.
 
@@ -43,24 +44,29 @@ import threading
 import time
 import traceback
 import webbrowser
+from concurrent.futures import wait
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from harness import claude, readings, render
+from harness import claude, readings, render, settlements
 from harness.analyst import ROOT, Analyst, FileRefused, keep_file, live, load_env, open_store
+from harness.derive.engine import Waiting
 from harness.store import STORE_FILE, Store, StoreError
 from harness.trace import Trace
 from harness.venues import Venues
-from harness.venues.polymarket import NY
+from harness.venues.markets import NY
 from harness.world import World
 
 WEB = ROOT / "web"
 STORES = ROOT / "stores"
 EXAMPLE = ROOT / "example"  # the one finished conversation the repository ships
+# The example's store as the repository holds it, compressed: a broad portfolio's store, with the data it re-derives
+# every number from, runs past the 100 MB a hosted repository takes in one file, and compresses to about a sixth.
+PACKED = STORE_FILE + ".gz"
 READ_ONLY = "This is a finished example, read only. Start your own with uv run event-risk."
 PORT = 8765
 KEYS = {  # each key, and what the page cannot do without it: one plain line each
@@ -73,6 +79,7 @@ KEYS = {  # each key, and what the page cannot do without it: one plain line eac
 LABELLED = ("from_id", "to_id", "id", "proposition_id", "source_id")  # the ids a call's input names
 WRITES = ("add", "link", "note", "edit", "remove", "search_markets", "search_web", "search_company")
 PREVIEW = 600  # a call's result as the work line first shows it; all of it opens on request
+LATER_RENDER = 1.0  # seconds before the panels are rendered again while a value they show is being made apart
 SITES = ("same-origin", "none")  # Sec-Fetch-Site of the page's own requests, and of one the person makes by hand
 REFUSED = "This server answers only its own page."
 
@@ -105,6 +112,11 @@ class Hub:
                 q.put(event)
 
 
+def _now() -> str:
+    """This moment, as the store writes its moments."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 class Page:
     """The conversation the page shows: its store, its analyst, and the messages waiting."""
 
@@ -122,8 +134,13 @@ class Page:
         self.next_id = 1
         self.panels = {"portfolio": "", "ledger": ""}
         self.error: str | None = None
+        self.figures_at: str | None = None  # when both panels last rendered whole
+        self.render_failed: str | None = None  # since when the panels have not rendered, where the latest did not
+        self._stale_shown: dict | None = None  # the stale state the page was last told
         self.dirty = threading.Event()
         self.ranking = threading.Event()  # readings taken between replies moved values: the events move into rank
+        self.unseen = False  # the panels have moved since a browser last saw them: rendered when one connects
+        self.later = False  # a value the panels show is being made apart: they are rendered again shortly
         self.venues = None if read_only else Venues()  # the analyst's and the readings' one set of venue clients
         threading.Thread(target=self._render_loop, daemon=True).start()
         if not read_only:
@@ -137,7 +154,7 @@ class Page:
         analyst's work goes without. A finished example reads no keys, and its one line says how to start one's own."""
         if self.read_only:
             return [READ_ONLY]
-        if claude.api_key() is None:
+        if claude.credential() is None:
             return [KEYS[claude.KEY]]
         return [line for key, line in KEYS.items() if key != claude.KEY and not os.environ.get(key)]
 
@@ -147,13 +164,34 @@ class Page:
                     "waiting": [{"id": w["id"], "text": w["text"], "files": [f["name"] for f in w.get("files") or []]}
                                 for w in self.waiting if w["op"] == "say"],
                     "missing": self.missing_keys(),
-                    "can_reply": not self.read_only and claude.api_key() is not None,
+                    "can_reply": not self.read_only and claude.credential() is not None,
                     "read_only": self.read_only,
-                    "session": self.session, "error": self.error,
+                    "session": self.session, "error": self.error, "stale": self.stale(),
                     "has_portfolio": bool(self.panels["portfolio"]), "has_ledger": bool(self.panels["ledger"])}
 
+    def stale(self) -> dict | None:
+        """Where the figures shown are not the store's now (a failed refresh keeps the last observation at
+        its recorded time): {"why", "since", "figures_at"}, "full" or "io" where the store's file cannot be written
+        (Store.unwritable), and "render" where the panels could not be rendered for another cause; `figures_at` is
+        when both panels last rendered whole. None while every write commits and the panels render."""
+        store = self.store
+        if store is None:
+            return None
+        if store.unwritable:
+            return {"why": store.unwritable["why"], "since": store.unwritable["since"], "figures_at": self.figures_at}
+        if self.render_failed:
+            return {"why": "render", "since": self.render_failed, "figures_at": self.figures_at}
+        return None
+
     def _publish_state(self) -> None:
-        self.hub.publish({"type": "state", **self.state()})
+        state = self.state()
+        self._stale_shown = state["stale"]
+        self.hub.publish({"type": "state", **state})
+
+    def _publish_stale(self) -> None:
+        """The page told when what is stale changes, where nothing else tells it."""
+        if self.stale() != self._stale_shown:
+            self._publish_state()
 
     # ---------------------------------------------------------------- stores
 
@@ -174,10 +212,30 @@ class Page:
             sessions = [e["session"] for e in Trace(self.store.trace_path).entries() if e.get("type") == "session"]
             self.session = sessions[-1] if sessions else None
             self.analyst = None
-        self._render(final=True)
+        if self.shown():
+            self._render(final=True)
+        else:
+            self.unseen = True
         self.hub.publish({"type": "conversation"})
         self.hub.publish({"type": "rank"})
         self._publish_state()
+        self._settle()
+
+    def _settle(self) -> None:
+        """Read, in the background, which of the open store's kept markets have settled, and record the outcomes they
+        determine (harness.settlements). A finished example, read only, reads nothing."""
+        store = self.store
+        if store is None or self.read_only:
+            return
+
+        def run() -> None:
+            try:
+                settlements.read(store, self.venues)
+            except Exception:  # a store closed meanwhile, or a read that failed whole: the next one tries again
+                if store is self.store:
+                    traceback.print_exc()
+
+        threading.Thread(target=run, daemon=True).start()
 
     def new(self) -> None:
         if self.read_only:
@@ -197,6 +255,7 @@ class Page:
             with self.store.lock:
                 self.store.close()
         self.store, self.analyst, self.session, self.waiting, self.error = None, None, None, [], None
+        self.figures_at = self.render_failed = None
         self.created = False
 
     def _create(self) -> None:
@@ -239,7 +298,7 @@ class Page:
     def send(self, text: str, files: list[dict]) -> None:
         if self.read_only:
             raise StoreError(READ_ONLY)
-        if claude.api_key() is None:
+        if claude.credential() is None:
             raise StoreError(KEYS["ANTHROPIC_API_KEY"])
         if not text.strip() and not files:
             raise StoreError("Write a message or drop a file.")
@@ -265,7 +324,7 @@ class Page:
     def _operate(self, item: dict) -> None:
         if self.read_only:
             raise StoreError(READ_ONLY)
-        if claude.api_key() is None:
+        if claude.credential() is None:
             raise StoreError(KEYS["ANTHROPIC_API_KEY"])
         with self.lock:
             if self.busy or self.store is None:
@@ -324,6 +383,7 @@ class Page:
             self.ranking.clear()
             self.hub.publish({"type": "store"})
             self.hub.publish({"type": "rank"})  # the reply's values are in: the events move into rank
+            self._settle()
         self._publish_state()
 
     # ---------------------------------------------------------------- what the analyst does
@@ -360,6 +420,8 @@ class Page:
             out["preview"] = _short(event.get("result"))
             if event["tool"] in WRITES:
                 self.dirty.set()
+            if event["tool"] == "add" and event.get("ok") and (event.get("input") or {}).get("type") == "Portfolio":
+                self._exposures()
         elif kind in ("user", "rewind"):
             self.dirty.set()
         elif kind == "answer":
@@ -369,10 +431,30 @@ class Page:
             return
         self.hub.publish({"type": "analyst", "event": out})
 
+    def _exposures(self) -> None:
+        """The portfolio's exposures and volatility, computed on a thread of their own once add has answered
+        (exposures), their stages reported as they happen, while the analyst reads what add returned."""
+        store = self.store
+        if store is None or self.read_only:
+            return
+
+        def run() -> None:
+            try:
+                exposures(store)
+            except Exception:  # a store closed or renamed meanwhile: the next read computes them where it needs them
+                if store is self.store:
+                    traceback.print_exc()
+
+        threading.Thread(target=run, daemon=True, name="exposures").start()
+
     def _progress(self, event: dict) -> None:
         """A stage of the first read. When a part is ready, the portfolio panel shows it at once."""
         self.hub.publish({"type": "progress", **event})
-        if event.get("state") == "done" and event.get("derivation") in ("holdings", "lookthrough", "g"):
+        if not self.shown():  # no browser to show the panel to: one that connects is rendered it then
+            self.unseen = True
+            return
+        if event.get("state") == "done" and event.get("derivation") in ("holdings", "lookthrough", "weights", "g",
+                                                                         "volatility"):
             store = self.store
             if store is None:
                 return
@@ -397,33 +479,62 @@ class Page:
         store = self.store
         if store is None:
             return
-        try:
-            with store.lock, _quiet(store):
-                if final:
-                    reader = render.Reader(store)
-                    portfolio = render.portfolio_panel(reader)
-                    ledger = render.ledger_panel(reader)
-                else:
-                    with render.cache_only(store):
-                        reader = render.Reader(store, pending=True)
-                        portfolio = render.portfolio_panel(reader)
-                        ledger = render.ledger_panel(reader)
+        self.later = False
+        try:  # a value made apart is never waited for holding the lock: shown as last worked out, rendered again
+            with store.lock, _quiet(store), (render.reading(store) if final else render.cache_only(store)) as read:
+                reader = render.Reader(store, pending=not final)
+                portfolio = render.portfolio_panel(reader)
+                ledger = render.ledger_panel(reader)
+            self.later = read.later
         except Exception:
             traceback.print_exc()
+            self.render_failed = self.render_failed or _now()
+            self._publish_stale()
             return
+        self.render_failed = None
+        self.figures_at = _now()
         self._panel("portfolio", portfolio)
         self._panel("ledger", ledger)
+        self._publish_stale()
 
     def _render_loop(self) -> None:
         while True:
             self.dirty.wait()
             time.sleep(0.2)  # the calls of one reply's batch, together
             self.dirty.clear()
-            self._render(final=False)
-            self.hub.publish({"type": "store"})
-            if self.ranking.is_set() and not self.busy:  # between replies, rows move into rank as values move
-                self.ranking.clear()
-                self.hub.publish({"type": "rank"})
+            self._round()
+
+    def follow(self) -> queue.Queue:
+        """A browser follows the page from here: its events, and, where the panels moved while no browser followed,
+        a render of them."""
+        q = self.hub.subscribe()
+        if self.unseen:
+            self.dirty.set()
+        return q
+
+    def shown(self) -> bool:
+        """Whether a browser follows the page, so that a render has someone to show its panels to."""
+        with self.hub.lock:
+            return bool(self.hub.clients)
+
+    def _round(self) -> None:
+        """One render of what moved, for the browsers following the page; with none, the panels wait unseen and the one
+        that connects is rendered them. While a reply is under way it shows each value as last worked out where it is not
+        worked out at the newest state (cache only), so the page never computes in the analyst's place; between replies
+        it works out what moved, so a reading taken between them, a minute's refresh of the prices, changes every value
+        it moves in place. A value made apart is never waited for holding the lock: it shows as last worked
+        out, and the panels are rendered again shortly until it is made."""
+        if not self.shown():
+            self.unseen = True
+            return
+        self.unseen = False
+        self._render(final=not self.busy)
+        if self.later:  # a value being made apart: rendered again shortly, its figure changing in place once made
+            threading.Timer(LATER_RENDER, self.dirty.set).start()
+        self.hub.publish({"type": "store"})
+        if self.ranking.is_set() and not self.busy:  # between replies, rows move into rank as values move
+            self.ranking.clear()
+            self.hub.publish({"type": "rank"})
 
     def _live_loop(self) -> None:
         """While the open store's as-of is today, its latest marks and kept books are read again every minute
@@ -442,20 +553,25 @@ class Page:
             except Exception:  # a store closed while its readings were taken, or a read that failed whole
                 if store is self.store:
                     traceback.print_exc()
+                    self._publish_stale()  # a reading the store could not keep: the page says so
                 continue
             if kept and store is self.store:
                 self.ranking.set()
                 self.dirty.set()
 
-    def view(self, target: str) -> dict:
+    def view(self, target: str, *, now: bool = False) -> dict:
+        """A view on the right, read at once: a value it cannot give at the newest state without waiting, or
+        without working it out under the store's lock, is shown as it was last worked out. Where one is being worked
+        out apart, the view says so (`later`), and the page reads it again once it is made; between replies, where it
+        held one it would work out here (`work`), the page reads it again at once with `now`, working them out."""
         store = self.store
         if store is None:
             return {"title": "", "html": ""}
-        with store.lock:
-            if self.busy:
-                with render.cache_only(store):
-                    return render.view(store, target, pending=True)
-            return render.view(store, target)
+        busy = self.busy
+        with store.lock, (render.cache_only(store) if busy else render.reading(store, inline=not now)) as read:
+            out = render.view(store, target, pending=busy)
+        return {**out, **({"later": True} if read.later else {}),
+                **({"work": True} if read.unworked and not busy else {})}
 
     def chips(self, ids: list[str]) -> dict:
         store = self.store
@@ -498,6 +614,36 @@ class Page:
         return {}
 
 
+EXPOSURES = ("g", "volatility")  # what the portfolio panel shows after the look-through, each from every name's prices
+
+
+def exposures(store: Store) -> None:
+    """The portfolio's exposures and its volatility, computed straight after add answers, so that the analyst reads
+    what it owns while they are fitted, and the portfolio panel fills as each is ready. Each is computed as a
+    call computes it, standing aside for the reads it needs that are under way (Store.standing_aside): it waits for
+    them holding no lock, so the analyst's calls and the page's reads go on meanwhile, and takes the store's lock only
+    to compute, its stages reported. Nothing is computed twice: a call that needs them meanwhile computes them as this
+    does, and whichever comes second finds the first's Computation by its inputs' hash (Engine.value). A read that
+    fails twice leaves the value uncomputed; the call that next needs it reads it again, and fails, with nothing
+    written, where it still cannot be read (TOOLS.md 5)."""
+    failed: set = set()
+    met: dict = {}
+    for name in EXPOSURES:
+        while True:
+            with store.lock:
+                if store.type_of("portfolio") is None:  # rewound or removed meanwhile
+                    return
+                with store.standing_aside(failed, met) as waits, store.engine.strict():
+                    try:
+                        store.engine.value(name, "portfolio")
+                    except Waiting:
+                        pass
+                waits = list(waits)
+            if not waits:
+                break
+            wait(waits)
+
+
 @contextmanager
 def _quiet(store: Store):
     """The store reporting no stages while the page reads it."""
@@ -525,6 +671,13 @@ def _plain_error(err: Exception) -> str:
     return f"The reply stopped with an error: {str(err)[:300] or type(err).__name__}"
 
 
+# The ways a reply ends without its whole answer, as the Messages API reports them in stop_reason
+# (https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons): the model declined to respond, its
+# safety classifiers' answer, given as a response and not an error; or the response reached its max_tokens, or filled
+# the model's context window, and is cut off. The page says which, where the reply's words would be.
+ENDED = ("refusal", "max_tokens", "model_context_window_exceeded")
+
+
 def turns(entries: list[dict], current: str | None) -> list[dict]:
     """The conversation as the page shows it: each turn's message, then its stretches of work and its words, in
     order. The turns a rewind replaced stay in the trace and are not shown."""
@@ -546,6 +699,8 @@ def turns(entries: list[dict], current: str | None) -> list[dict]:
             elif turn is None:
                 continue
             elif kind == "assistant":
+                if e.get("stop_reason") in ENDED:  # a reply that ends without its whole answer, by why it ended
+                    turn["ended"] = e["stop_reason"]
                 for b in e["content"]:
                     if b.get("type") == "text":
                         if b.get("text"):
@@ -665,7 +820,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/panels":
                 return self._json(page.panels)
             if path == "/api/view":
-                return self._json(page.view(q.get("id", "")))
+                return self._json(page.view(q.get("id", ""), now=q.get("now") == "1"))
             if path == "/api/chips":
                 ids = [x for x in q.get("ids", "").split(",") if x]
                 return self._json(page.chips(ids))
@@ -747,7 +902,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream")
 
     def _events(self) -> None:
-        q = self.page.hub.subscribe()
+        q = self.page.follow()
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -828,7 +983,13 @@ def _serve(page: Page, prog: str, port: int, browser: bool) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = _arguments("event-risk", "What could move a portfolio: the page.")
     parser.add_argument("--store", help="open an existing store, stores/{name}")
+    parser.add_argument("--readings-every", type=float, default=readings.INTERVAL, metavar="SECONDS",
+                        help="how often, while the as-of is today, the latest marks and the kept markets' books are "
+                             f"read again between calls (default {readings.INTERVAL:g})")
     args = parser.parse_args(argv)
+    if not args.readings_every > 0:
+        parser.error("--readings-every takes a number of seconds above 0")
+    readings.INTERVAL = args.readings_every  # the page's minute reads it at each turn (Page._live_loop)
     load_env()
     page = Page()
     if args.store:
@@ -837,22 +998,35 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def unpacked(example_dir: Path, into: Path) -> Path:
+    """A copy of a shipped example at `into`: every file as it is, and its store uncompressed."""
+    import gzip
+
+    shutil.copytree(example_dir, into, ignore=shutil.ignore_patterns(PACKED))
+    with gzip.open(example_dir / PACKED, "rb") as packed, open(into / STORE_FILE, "wb") as out:
+        shutil.copyfileobj(packed, out, 1 << 20)
+    return into
+
+
 def example(argv: list[str] | None = None) -> int:
     """The finished conversation the repository ships, read only and with no keys, on a copy in a temporary
-    directory that goes when the page stops."""
+    directory that goes when the page stops: its trace and files as they are, and its store as it is once
+    uncompressed (PACKED)."""
     args = _arguments("example", "A finished conversation and its ledger, read only.").parse_args(argv)
-    if not (EXAMPLE / STORE_FILE).is_file():
+    if not (EXAMPLE / PACKED).is_file():
         print(f"example: there is no example at {EXAMPLE}", file=sys.stderr)
         return 1
     root = Path(tempfile.mkdtemp(prefix="event-risk-example-"))
 
-    def stop(*_):  # an interrupt or a termination stops the page, and the copy goes with it
+    def stop(*_):  # the first interrupt or termination stops the page; any after it waits while the copy goes
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     try:
-        shutil.copytree(EXAMPLE, root / EXAMPLE.name)
+        unpacked(EXAMPLE, root / EXAMPLE.name)
         page = Page(root=root, read_only=True)
         page.open(root / EXAMPLE.name)
         _serve(page, "example", args.port, not args.no_browser)

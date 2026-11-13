@@ -18,10 +18,15 @@ const S = {
   keyboard: false,  // whether the last navigation came from the keyboard
   loaded: false,    // whether the page's first reading of the server has succeeded
   chips: new Map(),
+  seen: new Map(),  // each view as it was last shown, by its target: what opening it again shows at once
   live: null,       // the turn being written: {turn, el, work, text}
   files: [],        // attachments waiting in the composer
   labels: {},       // what a member calls each id a call names
-  rank: "emove",    // the ledger's order: by expected move, or worst case first
+  rank: "volatility",    // the ledger's order: by volatility, or worst outcome first
+  rows: "moves",         // the assumptions grid's lower rows: each price's move, or each price's level there
+  tab: "outcomes",       // an opened event's view: its outcomes, its probability, or its assumptions
+  weightBy: "company",   // which list of where the portfolio's weight is the portfolio panel shows
+  outcome: null,         // the outcome selected, {event, id}: marked in the picture, the tree and each grid
 };
 
 // ---------------------------------------------------------------- small helpers
@@ -188,8 +193,8 @@ function list(lines, i, indent) {
 
 // ---------------------------------------------------------------- ids in the analyst's words, as chips
 
-const TICKER = "[A-Z0-9][A-Z0-9.\\-]*(?::[A-Z0-9.\\-]+)?";
-const ID = `(?:prop:\\d+|channel:\\d+|src:\\d+|note:\\d+|link:\\d+|cmp:\\d+|jdg:\\d+|market:(?:polymarket|kalshi|hyperliquid):[A-Za-z0-9_.#\\-]+|metric:price:${TICKER}|metric:[a-z][a-z0-9_]*|name:${TICKER})`;
+const TICKER = "[A-Z0-9][A-Z0-9.&\\-]*(?::[A-Z0-9.\\-]+)?";  // as harness/schema.py's TICKER: "M&M.NS" is a symbol
+const ID = `(?:prop:\\d+|factor:\\d+|src:\\d+|note:\\d+|link:\\d+|cmp:\\d+|market:(?:polymarket_us|polymarket|kalshi):[A-Za-z0-9_.#\\-]+|metric:price:${TICKER}|metric:[a-z][a-z0-9_]*|name:${TICKER}|cash:[A-Z]{3})`;  // cash:{CURRENCY}, as schema.CASH_ID_RE
 const ID_IN_TEXT = new RegExp(`(?<![\\w:/])${ID}`, "g");
 const ID_WHOLE = new RegExp(`^${ID}$`);
 const trimId = (s) => s.replace(/[.\-:]+$/, "");
@@ -211,7 +216,7 @@ function fillChip(a) {
   if (!c) { a.textContent = ""; return; }
   a.classList.toggle("gone", !c.exists);
   a.title = c.title || c.label;
-  a.innerHTML = `<span class="chip-t">${esc(c.label)}</span>${c.value ? `<span class="chip-v">${esc(c.value)}</span>` : ""}`;
+  a.innerHTML = `<span class="chip-t">${esc(c.label)}</span>${c.value ? `<span class="chip-v${c.tone ? " " + c.tone : ""}">${esc(c.value)}</span>` : ""}`;
 }
 
 // `typing`: the text is still arriving, so an id at its very end may be part of a longer one, and waits
@@ -287,7 +292,6 @@ async function fetchChips(refresh) {
 
 // ---------------------------------------------------------------- the work line
 
-const VENUE = { polymarket: "Polymarket", kalshi: "Kalshi", hyperliquid: "Hyperliquid" };
 // each kind of a company's record, as the work line names it
 const RECORD = { news: "news", earnings: "earnings", guidance: "guidance", ratings: "analysts' ratings",
   risk_factors: "risk factors", annual_report: "annual report", current_reports: "current reports" };
@@ -298,7 +302,7 @@ const KINDS = [["web", "web search", "web searches"], ["page", "page read", "pag
   ["record", "company record", "company records"],
   ["market", "market search", "market searches"], ["change", "change", "changes"], ["lookup", "lookup", "lookups"]];
 const TYPES = { Proposition: "events and questions", Market: "markets", Metric: "levels", Name: "holdings",
-  Channel: "factors", Source: "pages", Note: "notes", Portfolio: "portfolio" };
+  Factor: "factors", Source: "pages", Note: "notes", Portfolio: "portfolio" };
 
 function host(url) {
   try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return url || "a page"; }
@@ -319,18 +323,19 @@ function describe(c) {
       if (i.type === "Portfolio") return "Pricing the portfolio";
       if (i.type === "Proposition") return f.title ? `Defining “${f.title}”` : "Defining an event";
       if (i.type === "Metric") return f.name ? `Following ${f.name}` : "Following a new level";
-      if (i.type === "Channel") return f.name ? `Adding the factor ${f.name}` : "Adding a factor";
+      if (i.type === "Factor") return f.name ? `Adding the factor ${f.name}` : "Adding a factor";
       return "Adding to its work";
     case "link": {
       const r = i.relation;
       const a = said(i.from_id, null), b = said(i.to_id, null);
       if (r === "watches") return b ? `Adding ${b} to the events` : "Adding an event";
-      if (r === "quoted_by") return a && b ? `Matching ${a} to the market ${b}` : "Matching a question to a market";
+      if (r === "asks") return a && b ? `Matching ${a} to the market ${b}` : "Matching a question to a market";
       if (r === "implies") return a && b ? `Relating ${a} to ${b}` : "Relating two questions";
       if (r === "and" || r === "or" || r === "then") return a ? `Breaking ${a} into smaller questions` : "Breaking an event into smaller questions";
       if (r === "evidence") return a && b ? `Quoting ${b} for ${a}` : "Quoting a page";
       if (r === "consequence") return a && b ? `Estimating the shock to ${b} from ${a}` : "Estimating an event's shock to a price";
-      if (r === "tracks") return a && b ? `Tying ${a} to ${b}` : "Tying a level to a factor";
+      if (r === "way") return a && b ? `Adding ${b} as a way ${a} can turn out` : "Adding a way an event can turn out";
+      if (r === "worth") return a && b ? `Valuing ${b} in ${a}` : "Valuing a holding in an outcome";
       return a && b ? `Connecting ${a} and ${b}` : "Connecting two parts of its work";
     }
     case "note": {
@@ -339,10 +344,7 @@ function describe(c) {
     }
     case "edit": return said(i.id, null) ? `Revising ${said(i.id)}` : "Revising its work";
     case "remove": return said(i.id, null) ? `Removing ${said(i.id)}` : "Removing part of its work";
-    case "search_markets": {
-      const q = Object.values(i.params || {}).find((v) => typeof v === "string" && v.trim());
-      return `Searching ${VENUE[i.venue] || "a market"}${q ? ` for “${q}”` : ""}`;
-    }
+    case "search_markets": return i.text ? `Searching the markets for “${i.text}”` : "Searching the markets";
     case "search_web": return i.text ? `Searching the web for “${i.text}”` : "Searching the web";
     case "fetch_source": return `Reading ${host(i.url)}`;
     case "search_company": {
@@ -350,7 +352,12 @@ function describe(c) {
       return i.ticker ? `Reading ${i.ticker}'s ${what || "record"}` : "Reading a company's record";
     }
     case "exposure": return "Reading the portfolio's dollar beta to each factor";
-    case "window_returns": return i.start ? `Looking at how the factors moved from ${i.start} to ${i.end}` : "Looking at how the factors moved in a past stretch";
+    case "window_returns": {
+      // the factors, and each company or fund it names
+      const all = ["the factors", ...(i.names || []).map((n) => said(n, String(n).replace(/^name:/, "")))];
+      const what = all.length > 1 ? `${all.slice(0, -1).join(", ")} and ${all.at(-1)}` : all[0];
+      return i.start ? `Looking at how ${what} moved from ${i.start} to ${i.end}` : `Looking at how ${what} moved in a past stretch`;
+    }
     case "get": return said(i.id, null) ? `Reading ${said(i.id)}` : "Reading its work";
     case "query": return `Looking through its ${TYPES[i.type] || "work"}`;
     case "neighbors": return said(i.id, null) ? `Reading what connects to ${said(i.id)}` : "Reading what connects";
@@ -367,8 +374,13 @@ function stageText(p) {
     if (p.kind === "constituents" && p.subject) return `Looking inside ${p.subject}`;
     return "Looking inside the funds";
   }
+  if (p.stage === "industries") {  // where each company is listed, then its profile: its industry and its home
+    return p.kind === "profile" && p.of ? `Reading each company's industry and country, ${p.done} of ${p.of}`
+      : "Reading each company's industry and country";
+  }
   if (p.stage === "prices") return `Loading two years of ${p.kind === "dividends" ? "dividends" : "prices"}, ${p.done} of ${p.of}`;
   if (p.stage === "exposures") return "Fitting the holdings' betas";
+  if (p.stage === "distribution") return "Valuing outcomes at the horizon";
   if (p.stage === "news") return "Reading the news on the largest holdings";
   return null;
 }
@@ -497,6 +509,7 @@ function turnEl(turn) {
   const reply = $(".reply", el);
   for (const item of turn.items) reply.append(itemEl(item));
   if (turn.stopped) reply.append(stoppedEl());
+  if (turn.ended) reply.append(endedEl(turn.ended));
   decorate(reply);
   return el;
 }
@@ -513,6 +526,20 @@ function itemEl(item) {
   d.className = "md" + (item.partial ? " partial" : "");
   d.innerHTML = md(item.text);
   d._item = item;
+  return d;
+}
+
+// a reply that ends without its whole answer, by why it ended (server.py ENDED)
+const ENDED = {
+  refusal: "The analyst declined to reply.",
+  max_tokens: "The reply was cut off at its length limit.",
+  model_context_window_exceeded: "The reply was cut off: the conversation filled the analyst's context window.",
+};
+
+function endedEl(why) {
+  const d = document.createElement("div");
+  d.className = "stopped";
+  d.textContent = ENDED[why] || "";
   return d;
 }
 
@@ -548,7 +575,24 @@ async function loadConversation() {
   Object.assign(S.labels, got.labels || {});
   S.turns = got.turns || [];
   renderConversation();
+  resumeLive();
   requestAnimationFrame(() => toBottom(true));
+}
+
+// A page opened while a reply runs: the last stretch of that reply's work is the one under way, live as it is from
+// its first event, and the analyst's next events continue it rather than start another line beneath it.
+function resumeLive() {
+  if (!S.state || !S.state.busy) return;
+  const turn = S.turns[S.turns.length - 1];
+  if (!turn || turn.session !== S.state.session) return;
+  const el = $(`#conversation .turn[data-turn="${turn.turn}"][data-session="${turn.session}"]`);
+  const last = (turn.items || [])[(turn.items || []).length - 1];
+  const node = el && $(".reply", el) && $(".reply", el).lastElementChild;
+  if (!last || last.kind !== "work" || !node || node._work !== last) return;
+  last.live = true;
+  last.status = last.status || "Thinking";
+  S.live = { el, work: last, workEl: node, text: null, textEl: null };
+  updateWork(node);
 }
 
 // the live turn, from the analyst's events
@@ -653,6 +697,13 @@ function onAnalyst(ev) {
       if (L.textEl) { L.textEl.classList.add("partial"); typewriter(L.textEl, true); }
       finishLive(L);
       $(".reply", L.el).append(stoppedEl());
+      break;
+    case "assistant":
+      if (ENDED[ev.stop_reason] && !L.el._turn.ended) {
+        L.el._turn.ended = ev.stop_reason;
+        if (L.textEl) { L.textEl.classList.add("partial"); typewriter(L.textEl, true); }
+        $(".reply", L.el).append(endedEl(ev.stop_reason));
+      }
       break;
     case "answer":
       finishLive(L);
@@ -864,11 +915,34 @@ $("#waiting").addEventListener("click", (e) => {
   if (b) post("/api/cancel", { id: +b.dataset.cancel }).catch((err) => notice(err.message));
 });
 
+// Where the figures shown are not the store's now (Page.stale): why, and the moment they are from, in New York as the
+// page's other moments are, with its day where that is not today. Where no render has finished since the store
+// opened, there is no earlier moment, and the first sentence is the line.
+const STALE = {
+  full: ["The disk is full, so nothing new can be saved.", "Figures are as of"],
+  io: ["Nothing new can be saved.", "Figures are as of"],
+  render: ["Figures couldn't be updated.", "They're as of"],
+};
+const NY_TIME = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+const NY_DAY = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", month: "short", day: "numeric" });
+
+function staleLine(stale) {
+  const words = stale && STALE[stale.why];
+  if (!words) return "";
+  const t = stale.figures_at ? new Date(stale.figures_at) : null;
+  if (!t || isNaN(t)) return words[0];
+  const at = NY_TIME.format(t) + (NY_DAY.format(t) === NY_DAY.format(new Date()) ? "" : ` on ${NY_DAY.format(t)}`);
+  return `${words[0]} ${words[1]} ${at}.`;
+}
+
 function applyState(st) {
   S.state = st;
   $("#stop").hidden = !st.busy;
-  // a missing key's line, where it stops something, and a finished example's, above the composer
-  $("#keys").innerHTML = (st.missing || []).map((l) => `<div>${esc(l)}</div>`).join("");
+  // above the composer: where the figures are from an earlier moment, and a missing key's line where it stops
+  // something, or a finished example's
+  const stale = staleLine(st.stale);
+  $("#keys").innerHTML = (stale ? `<div class="stale" role="status">${esc(stale)}</div>` : "")
+    + (st.missing || []).map((l) => `<div>${esc(l)}</div>`).join("");
   $("#composer").classList.toggle("off", !st.can_reply);
   input.disabled = !st.can_reply;
   $("#file").disabled = !st.can_reply;
@@ -892,9 +966,10 @@ const RANGES = [["1M", 1], ["6M", 6], ["1Y", 12], ["2Y", 24]];
 const CW = 400, CH = 120;
 
 function chartValue(kind, v) {
-  if (kind === "chance") {
-    const t = Math.round(v * 1000) / 10;
-    return t < 10 ? `${t.toFixed(1)}%` : `${Math.round(v * 100)}%`;
+  if (kind === "chance") return `${(Math.round(v * 1000) / 10).toFixed(1)}%`;  // a probability: one decimal, always
+  if (kind === "cents") {  // a market's price: whole cents, with a tenth where it has one
+    const c = Math.round(v * 1000) / 10;
+    return `${Number.isInteger(c) ? c.toFixed(0) : c.toFixed(1)}\u00a2`;
   }
   return (v < 0 ? "\u2212" : "") + "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -921,12 +996,15 @@ function chartRanges(points) {
 
 function drawCharts(root) {
   for (const el of $$("[data-chart]", root)) if (el._chart !== el.dataset.chart) drawChart(el);
+  for (const el of $$("[data-dist]", root)) if (el._dist !== el.dataset.dist || el._w !== el.clientWidth) drawDist(el);
+  for (const el of $$("[data-history]", root)) if (el._w !== el.clientWidth) el._history = null;
+  applyRows();
+  applyOutcome();
 }
 
 function drawChart(el) {
   el._chart = el.dataset.chart;
   const spec = JSON.parse(el.dataset.chart);
-  if (el.classList.contains("spark")) { el.innerHTML = sparkSvg(spec.points); return; }
   const ranges = spec.ranges ? chartRanges(spec.points) : [];
   if (!ranges.includes(el._range)) el._range = ranges.includes(spec.range) ? spec.range : ranges[ranges.length - 1];
   el.innerHTML =
@@ -991,28 +1069,256 @@ function plot(el, spec) {
   box.onpointerleave = () => show(pts.length - 1, false);
 }
 
-// a line of a month, small enough to sit in a ledger line
-function sparkSvg(points) {
-  const w = 64, h = 16, vals = points.map((p) => p[1]);
-  let lo = Math.min(...vals), hi = Math.max(...vals);
-  if (hi - lo < 0.005) { const m = (hi + lo) / 2; lo = m - 0.0025; hi = m + 0.0025; }
-  const x = (i) => 1 + (i * (w - 4)) / (points.length - 1);
-  const y = (v) => 2 + ((hi - v) / (hi - lo)) * (h - 4);
-  const d = points.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
-  const n = points.length - 1;
-  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" aria-hidden="true"><path d="${d}"/>` +
-    `<circle cx="${x(n).toFixed(1)}" cy="${y(points[n][1]).toFixed(1)}" r="1.8"/></svg>`;
+// ---------------------------------------------------------------- an event's outcomes at the horizon
+
+// The picture: one row for each outcome, its own range at the horizon's end at its own height, so a rare outcome's
+// range reads as whole as a likely one's; its probability beside its title; its P&L were it known today a line, and
+// its 5th to 95th percentiles beneath; then all of them together, quietly. Every row is the engine's draws counted
+// on one set of bins and shares one dollar axis, today at zero; losses rust and gains teal either side of it. Each
+// row's height is its own peak, which is drawing and no figure. Each is drawn at the width it has.
+let clipSeq = 0;
+
+function drawDist(el) {
+  el._dist = el.dataset.dist;
+  const w = el._w = el.clientWidth;
+  if (!w) return;
+  const spec = JSON.parse(el.dataset.dist);
+  const X = (v) => ((v - spec.lo) / (spec.hi - spec.lo)) * w;
+  const z = X(0), PH = 28, H = PH + 10;
+  const centres = spec.edges.slice(0, -1).map((a, i) => (a + spec.edges[i + 1]) / 2);
+  const shape = (mass) => {
+    const top = Math.max(...mass) || 1;
+    const pts = centres.map((c, i) => `L${X(c).toFixed(1)},${(PH - (mass[i] / top) * (PH - 2)).toFixed(1)}`).join("");
+    return `M${X(spec.edges[0]).toFixed(1)},${PH}${pts}L${X(spec.edges[spec.edges.length - 1]).toFixed(1)},${PH}Z`;
+  };
+  const plot = (row, cls) => {
+    const k = ++clipSeq, d = shape(row.mass);
+    const spread = row.q05 != null && row.q95 != null
+      ? `<path class="pr" d="M${X(row.q05).toFixed(1)},${PH + 3}v4M${X(row.q05).toFixed(1)},${PH + 5}H${X(row.q95).toFixed(1)}M${X(row.q95).toFixed(1)},${PH + 3}v4"/>` : "";
+    const at = row.centre != null ? row.centre : row.mean;
+    return `<svg class="dr dist-plot" style="width:${w}px;height:${H}px" viewBox="0 0 ${w} ${H}" aria-hidden="true">` +
+      `<clipPath id="dl${k}"><rect x="0" y="0" width="${Math.max(z, 0).toFixed(1)}" height="${PH}"/></clipPath>` +
+      `<clipPath id="dg${k}"><rect x="${z.toFixed(1)}" y="0" width="${Math.max(w - z, 0).toFixed(1)}" height="${PH}"/></clipPath>` +
+      `<line class="base" x1="0" x2="${w}" y1="${PH}" y2="${PH}"/>` +
+      (cls === "all" ? `<path class="m all" d="${d}"/>` :
+        `<path class="m loss" d="${d}" clip-path="url(#dl${k})"/><path class="m gain" d="${d}" clip-path="url(#dg${k})"/>`) +
+      `<path class="edge" d="${d}"/>` +
+      `<line class="zero" x1="${z.toFixed(1)}" x2="${z.toFixed(1)}" y1="0" y2="${H}"/>` +
+      (at != null ? `<line class="ctr" x1="${X(at).toFixed(1)}" x2="${X(at).toFixed(1)}" y1="2" y2="${PH}"/>` : "") +
+      spread + "</svg>";
+  };
+  let html = "";
+  for (const row of spec.rows) {
+    html += `<div class="dist-row" data-outcome="${esc(row.id)}" tabindex="0"><div class="dist-l"><span class="dist-t">${esc(row.title)}</span>` +
+      `${row.base ? '<span class="otag">baseline</span>' : ""}<span class="dist-p n">${esc(row.p)}</span></div>${plot(row, "")}</div>`;
+  }
+  if (spec.all && spec.all.mass) {
+    html += `<div class="dist-row all"><div class="dist-l"><span class="dist-t">All outcomes</span></div>${plot(spec.all, "all")}</div>`;
+  }
+  const n = spec.ticks.length;
+  html += `<div class="dist-axis">` + spec.ticks.map(([t, label], i) =>
+    `<span class="${i === 0 ? "start" : i === n - 1 ? "end" : "mid"}" style="left:${(X(t) / w * 100).toFixed(3)}%">${esc(label)}</span>`).join("") + "</div>";
+  el.innerHTML = html;
 }
+
+// The outcomes grid's lower rows, by the reader's choice: each price's move, each price's level, or each holding's
+// P&L; the choice holds from one event to the next, and through a refresh.
+function applyRows() {
+  for (const t of $$("#detail table.og, #base table.og")) {
+    if (t.dataset.fixed) continue;  // a grid of one view shows it
+    const scope = t.closest("[data-pane]") || t.closest(".ev") || document;
+    const have = $$("button[data-rows]", scope).map((b) => b.dataset.rows);
+    const want = have.includes(S.rows) ? S.rows : have[0];
+    if (want) t.dataset.rows = want;
+    for (const b of $$("button[data-rows]", scope)) b.setAttribute("aria-pressed", String(b.dataset.rows === want));
+  }
+  applyTabs();
+}
+
+// An opened event's view by the reader's choice, held from one event to the next
+function applyTabs() {
+  for (const ev of $$("#detail .ev.ws, #base .ev.ws")) {
+    ev.dataset.tab = S.tab;
+    for (const b of $$("button[data-tab]", ev)) b.setAttribute("aria-selected", String(b.dataset.tab === S.tab));
+  }
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("#detail button[data-tab], #base button[data-tab]");
+  if (!b) return;
+  e.preventDefault();
+  S.tab = b.dataset.tab;
+  applyTabs();
+  for (const el of $$("[data-history]")) el._history = null;
+  drawCharts($("#base"));
+  drawCharts($("#detail"));
+});
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("#detail button[data-rows], #base button[data-rows]");
+  if (!b) return;
+  e.preventDefault();
+  S.rows = b.dataset.rows;
+  applyRows();
+});
+
+// ---------------------------------------------------------------- a probability's history
+
+// How the probability got here: ours as it stood at each reply and now, each value standing until the next, drawn as
+// steps on a time axis; the selected outcome's in its place, ours faint behind it; beside them each market that
+// informs it, from its daily closes to now; and the range the markets imply today at the right edge.
+const HH = 120, HTOP = 8;
+
+function stamp(iso) {
+  return Date.parse(iso.length === 10 ? `${iso}T00:00:00Z` : iso);
+}
+
+function when(t, span) {
+  const d = new Date(t);
+  const day = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return span < 2 * 864e5 ? `${day}, ${d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}` : day;
+}
+
+function pctTicks(lo, hi) {
+  const span = hi - lo, steps = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.25];
+  const step = steps.find((s) => span / s <= 4) || 0.25;
+  const out = [];
+  for (let v = Math.ceil(lo / step - 1e-9) * step; v <= hi + 1e-9; v += step) out.push(Math.round(v * 1e4) / 1e4);
+  return out;
+}
+
+// the markets beside a history, each its own dash: a line, a dash, a dot
+const DASHES = ["", "5 3", "1.2 2.6"];
+function dashKey(i) {
+  const d = DASHES[i % DASHES.length];
+  return `<svg class="k-dash" viewBox="0 0 16 6" aria-hidden="true"><line x1="0" x2="16" y1="3" y2="3"${d ? ` stroke-dasharray="${d}"` : ""}/></svg>`;
+}
+
+function drawHistory(el) {
+  const step = S.trail[S.shown - 1];
+  const sel = S.outcome && step && S.outcome.event === step.target ? S.outcome.id : null;
+  el._history = el.dataset.history + "|" + sel;
+  const w = el._w = el.clientWidth;
+  if (!w) return;
+  const spec = JSON.parse(el.dataset.history);
+  const picked = sel && spec.outcomes[sel], main = picked ? picked.points : spec.ours;
+  const lines = [main, ...(main !== spec.ours ? [spec.ours] : []), ...spec.markets.map((m) => m.points)];
+  const all = lines.flat();
+  let t0 = Math.min(...all.map((p) => stamp(p[0]))), t1 = Math.max(...all.map((p) => stamp(p[0])));
+  if (t1 - t0 < 6e4) { t0 -= 3e4; t1 += 3e4; }
+  const vals = all.map((p) => p[1]).concat(spec.band || []);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const pad = Math.max(0.01, (hi - lo) * 0.12);
+  lo = Math.max(0, lo - pad); hi = Math.min(1, hi + pad);
+  const left = 40, right = spec.band ? 16 : 6, base = HTOP + HH;
+  const x = (t) => left + ((stamp(t) - t0) / (t1 - t0)) * (w - left - right);
+  const y = (v) => HTOP + ((hi - v) / (hi - lo)) * HH;
+  const steps = (pts) => pts.map((p, i) => (i ? `H${x(p[0]).toFixed(1)}V${y(p[1]).toFixed(1)}` : `M${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`)).join("");
+  const linear = (pts) => pts.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
+  let svg = "";
+  for (const v of pctTicks(lo, hi)) {
+    svg += `<line class="grid" x1="${left}" x2="${w - right}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"/>` +
+      `<text class="tick" x="${left - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${chartValue("chance", v)}</text>`;
+  }
+  // each market its own line, told apart by its dash, the same dash beside its name below and its figure above
+  spec.markets.forEach((m, i) => { svg += `<path class="mkt" d="${linear(m.points)}"${DASHES[i % DASHES.length] ? ` stroke-dasharray="${DASHES[i % DASHES.length]}"` : ""}><title>${esc(m.label)}</title></path>`; });
+  if (main !== spec.ours) svg += `<path class="ours faint" d="${steps(spec.ours)}"/>`;
+  svg += `<path class="ours" d="${steps(main)}"/>`;
+  main.forEach((p, i) => {
+    svg += `<circle class="ours${i === main.length - 1 ? " now" : ""}" cx="${x(p[0]).toFixed(1)}" cy="${y(p[1]).toFixed(1)}" r="3"/>`;
+  });
+  if (spec.band) svg += `<rect class="band" x="${(w - right + 6).toFixed(1)}" y="${y(spec.band[1]).toFixed(1)}" width="6" height="${Math.max(2, y(spec.band[0]) - y(spec.band[1])).toFixed(1)}"><title>Market-implied range today</title></rect>`;
+  svg += `<text class="tick" x="${left}" y="${base + 16}">${esc(when(t0, t1 - t0))}</text>` +
+    `<text class="tick" x="${w - right}" y="${base + 16}" text-anchor="end">${esc(when(t1, t1 - t0))}</text>` +
+    `<line class="cursor" y1="${HTOP}" y2="${base}" x1="-9" x2="-9"/>`;
+  const names = [picked ? `${picked.title}, at each reply` : "Forecast, at each reply", ...spec.markets.map((m) => m.label)];
+  el.innerHTML = `<div class="h-read"></div><svg class="dr" style="width:${w}px;height:${base + 22}px" viewBox="0 0 ${w} ${base + 22}">${svg}</svg>` +
+    `<div class="h-key">${names.map((n, i) => i ? `<span class="k-mkt">${dashKey(i - 1)}${esc(n)}</span>` : `<span class="k-ours">${esc(n)}</span>`).join("")}` +
+    `${picked ? '<span class="k-event">The event, at each reply</span>' : ""}</div>`;
+  // what stood at a moment: each line's value as it stood then, ours a step that holds until the next reply
+  const at = (pts, t) => { let v = null; for (const p of pts) if (stamp(p[0]) <= t) v = p[1]; return v; };
+  const read = $(".h-read", el), cursor = $("line.cursor", el), svgEl = $("svg", el);
+  const show = (t, hover) => {
+    const own = main !== spec.ours ? "This outcome" : "Forecast";
+    const parts = [["k-ours", own, at(main, t)],
+      // "Market" is the event's own market; a market on what the event rests on is its dash, named in the key below
+      ...spec.markets.map((m, i) => ["k-mkt", spec.markets.length > 1 || m.label !== m.short ? dashKey(i) : esc("Market"),
+                                     at(m.points, t)])];
+    read.innerHTML = `<span class="ch-d">${esc(when(t, t1 - t0))}</span>` + parts.filter(([, , v]) => v !== null)
+      .map(([cls, n, v]) => ` <span class="${cls}">${cls === "k-ours" ? esc(n) : n} <span class="n">${chartValue(cls === "k-ours" ? "chance" : "cents", v)}</span></span>`).join("");
+    const cx = hover ? left + ((t - t0) / (t1 - t0)) * (w - left - right) : -9;
+    cursor.setAttribute("x1", cx); cursor.setAttribute("x2", cx);
+    cursor.style.visibility = hover ? "visible" : "hidden";  // drawn only where the pointer reads
+  };
+  show(t1, false);
+  svgEl.onpointermove = (ev) => {
+    const r = svgEl.getBoundingClientRect();
+    const f = Math.max(0, Math.min(1, (ev.clientX - r.left - left) / (w - left - right)));
+    show(t0 + f * (t1 - t0), true);
+  };
+  svgEl.onpointerleave = () => show(t1, false);
+}
+
+// One outcome is selected at a time, and shows as selected wherever it appears in the open event: its mark, its row
+// in the tree, its column in each grid, and its probability's history.
+function applyOutcome() {
+  const step = inspected() || S.trail[S.shown - 1];  // the event, kept in view while a figure of it is inspected
+  const id = S.outcome && step && S.outcome.event === step.target ? S.outcome.id : null;
+  for (const el of $$("#detail [data-outcome], #base [data-outcome]")) el.classList.toggle("sel", el.dataset.outcome === id);
+  for (const el of $$("#detail [data-history], #base [data-history]")) if (el._history !== el.dataset.history + "|" + id) drawHistory(el);
+}
+
+function selectOutcome(id) {
+  const step = inspected() || S.trail[S.shown - 1];
+  if (!step) return;
+  S.outcome = S.outcome && S.outcome.event === step.target && S.outcome.id === id ? null : { event: step.target, id };
+  applyOutcome();
+}
+
+document.addEventListener("click", (e) => {
+  const o = e.target.closest("#detail [data-outcome], #base [data-outcome]");
+  if (!o || e.target.closest("[data-go]")) return;
+  selectOutcome(o.dataset.outcome);
+});
+document.addEventListener("keydown", (e) => {
+  const o = e.target instanceof Element && e.target.matches("#detail [data-outcome][tabindex], #base [data-outcome][tabindex]") ? e.target : null;
+  if (!o || (e.key !== "Enter" && e.key !== " ")) return;
+  e.preventDefault();
+  selectOutcome(o.dataset.outcome);
+});
+
+// a drawing follows the width it has, as a panel opens, widens or folds
+const resized = new ResizeObserver((entries) => {
+  for (const { target } of entries) if (target._w !== target.clientWidth) drawCharts(target.parentElement || target);
+});
+const watchSizes = (root) => { for (const el of $$("[data-dist], [data-history]", root)) resized.observe(el); };
 
 // ---------------------------------------------------------------- merging a panel into place
 
 const TRANSIENT = ["enter", "changed", "all", "open"];
+
+// A figure shown stays until its new value arrives. A step opened anew shows its placeholders: there is nothing
+// shown before it.
+const waits = (el) => el.matches(".wait") || !!el.querySelector(".wait");
+
+// a figure on screen stays until its replacement is a figure: where the new rendering has only a placeholder in its
+// place (a value worked out for the first time elsewhere on the page, or a render that could not give it), the element
+// shown stays as it is, at the innermost element that holds the placeholder, so the figures around it still change
+function keepsShown(live, next) {
+  if (!waits(next) || waits(live)) return false;
+  if (next.dataset.k) return ![...next.querySelectorAll("[data-k]")].some(waits);  // a keyed element inside it holds it
+  return next.matches(".wait") || [...next.children].some((c) => c.matches(".wait"));
+}
 
 // `live` keeps its own attributes when it is the panel itself (`root`): only what is inside it is merged
 function morph(live, next, root = true) {
   if (!root) syncAttrs(live, next);
   if (!root && next.dataset.md !== undefined && live._md === next.dataset.md) return;  // a note, rendered as it stands
   if (!root && next.dataset.chart !== undefined && live._chart === next.dataset.chart) return;  // a chart, drawn as it stands
+  for (const k of ["dist"]) {  // a drawing whose spec is the same stays as it is drawn
+    if (!root && next.dataset[k] !== undefined && live["_" + k] === next.dataset[k]) return;
+  }
+  if (!root && next.dataset.history !== undefined && (live._history || "").startsWith(next.dataset.history + "|")) return;
   const lc = [...live.childNodes];
   const nc = [...next.childNodes];
   const keyed = new Map();
@@ -1031,7 +1337,9 @@ function morph(live, next, root = true) {
     }
     if (match && !used.has(match)) {
       used.add(match);
-      if (n.nodeType === 3) {
+      if (n.nodeType === 1 && keepsShown(match, n)) {
+        // what is shown stays; the view read again (later) or the next render brings its new value
+      } else if (n.nodeType === 3) {
         if (match.nodeValue !== n.nodeValue) { match.nodeValue = n.nodeValue; flash(match.parentElement); }
       } else if (n.nodeType === 1) {
         morph(match, n, false);
@@ -1088,24 +1396,47 @@ document.addEventListener("animationend", (e) => {
 
 function setPanel(name, html) {
   const box = name === "portfolio" ? $("#portfolio") : $("#ledger");
+  const first = name === "ledger" && !$("[data-ranked]", box);  // the list's first showing
   const tpl = document.createElement("template");
   tpl.innerHTML = html;
   const next = document.createElement("div");
   next.append(tpl.content);
   morph(box, next);
   drawCharts(box);
+  watchSizes(box);
   focusable(box);
   layout();
   markOpeners();
   if (name === "ledger") markRank();
+  // a list first shown with no reply under way is in rank from the start; while the analyst works its rows hold the
+  // places they come in, and a reply's end or a refresh that moves a value ranks them (the server's "rank")
+  if (first && S.state && !S.state.busy) rankRows(false);
+  if (name === "portfolio") markWeightBy();
 }
 
-// the events in rank: by expected move, or worst case first; with `glide`, each moves to its place
+// where the portfolio's weight is, one list at a time: by company, by industry, or by country
+function markWeightBy() {
+  $("#portfolio").dataset.wt = S.weightBy;
+  for (const b of $$("#portfolio [data-wt]")) b.setAttribute("aria-pressed", String(b.dataset.wt === S.weightBy));
+}
+
+$("#portfolio").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-wt]");
+  if (!b) return;
+  e.preventDefault();
+  S.weightBy = b.dataset.wt;
+  markWeightBy();
+});
+
+// the events in rank: by volatility, or worst outcome first; with `glide`, each moves to its place. The ledger's list
+// and By holding are each a list in rank, its rows carrying their place in both orders.
 function rankRows(glide) {
-  const ol = $("#ledger ol.events");
-  if (!ol) return;
-  const rows = $$(":scope > li[data-k]", ol);
-  const key = S.rank === "worst" ? "worst" : "emove";
+  for (const ol of $$("#ledger [data-ranked], #detail [data-ranked]")) rankList(ol, glide);
+}
+
+function rankList(ol, glide) {
+  const rows = $$(":scope > [data-k]", ol);
+  const key = S.rank === "worst" ? "worst" : "volatility";
   const sorted = rows.slice().sort((a, b) => (+a.dataset[key]) - (+b.dataset[key]));
   if (sorted.every((r, k) => r === rows[k])) return;
   const moving = glide && !reducedMotion.matches;
@@ -1121,17 +1452,26 @@ function rankRows(glide) {
 }
 
 function markRank() {
-  $("#ledger").dataset.rank = S.rank;  // each line shows the figure the ledger is ranked by
-  for (const b of $$("#ledger [data-rank]")) b.setAttribute("aria-pressed", String(b.dataset.rank === S.rank));
+  // each row marks the figure the ledger is ordered by
+  for (const box of [$("#ledger"), $("#detail")]) box.dataset.rank = S.rank;
+  for (const b of $$("[data-rank]")) if (b.tagName === "BUTTON") b.setAttribute("aria-pressed", String(b.dataset.rank === S.rank));
 }
 
-$("#ledger").addEventListener("click", (e) => {
-  const b = e.target.closest("[data-rank]");
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-rank]");
   if (!b) return;
   e.preventDefault();
   S.rank = b.dataset.rank;
   markRank();
   rankRows(true);
+});
+
+// By holding's switch back to the list: the ledger, as it was left
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-ledger]");
+  if (!b) return;
+  e.preventDefault();
+  returnTo(-1);
 });
 
 // a list shown in part: the rest of it, on request
@@ -1166,7 +1506,7 @@ function folds(root) {
 // read again. Every response is for one navigation: one that a later navigation, Back, a breadcrumb, or a new
 // conversation replaced is dropped. One thing is marked as selected (markOpeners).
 
-const SCOPES = { portfolio: "#portfolio", ledger: "#ledger", detail: "#detail", conversation: "#conversation" };
+const SCOPES = { portfolio: "#portfolio", ledger: "#ledger", detail: "#detail", base: "#base", conversation: "#conversation" };
 
 function scopeOf(el) {
   for (const [name, sel] of Object.entries(SCOPES)) if (el.closest(sel)) return name;
@@ -1192,7 +1532,8 @@ async function openStep(target, title, { push = true, from = null } = {}) {
   if (push) {
     // what opens from inside the open view goes a step deeper; what opens from the portfolio or the conversation
     // starts the trail again, so one thing is selected at a time; and what is already on the trail returns to it
-    const depth = from && scopeOf(from) === "detail" ? S.shown : 0;
+    // the event kept in view beside its inspector is the trail's first step: what opens from it goes one step deeper
+    const depth = from && scopeOf(from) === "detail" ? S.shown : from && scopeOf(from) === "base" ? 1 : 0;
     const again = S.trail.slice(0, depth).findIndex((s) => s.target === target);
     if (again >= 0) { returnTo(again); return; }
     S.trail = S.trail.slice(0, depth);
@@ -1202,33 +1543,89 @@ async function openStep(target, title, { push = true, from = null } = {}) {
   const step = S.trail[S.trail.length - 1];
   renderTrail();
   markOpeners();
+  const seen = S.seen.get(target);
+  if (seen) {  // shown before: at once, as it was last shown, and its figures read again in place
+    step.title = seen.title || step.title;
+    step.wide = seen.wide;
+    showStep(step, seen.html, 0);
+    refreshStep();
+    if (narrow()) { $("#app").classList.remove("show-left"); $("#app").classList.add("show-right"); }
+    return;
+  }
+  // a step slow to come: the panel says what is opening, rather than keep the view it leaves under the new crumb
+  const opening = setTimeout(() => { if (token === S.nav && S.trail.includes(step)) showOpening(step); }, 250);
   try {
     const got = await api(`/api/view?id=${encodeURIComponent(target)}`);
+    clearTimeout(opening);
     if (token !== S.nav) return;  // a later navigation replaced this one
     step.title = got.title || step.title;
+    step.wide = !!got.wide;
     showStep(step, got.html, 0);
     if (seq !== S.storeSeq) refreshStep();  // the store changed while it loaded: its figures are read again
+    else readAgainLater(step, got);
   } catch (e) {
+    clearTimeout(opening);
     if (token !== S.nav) return;
     notice(e.message);
     if (push) { S.trail = S.trail.slice(0, S.shown); renderTrail(); markOpeners(); }  // the view on screen stays
+    if (S.opening) restoreShown();
     return;
   }
   if (narrow()) { $("#app").classList.remove("show-left"); $("#app").classList.add("show-right"); }
 }
 
+function showOpening(step) {
+  const detail = $("#detail");
+  S.opening = true;
+  detail.innerHTML = `<p class="opening"><span class="wait" aria-hidden="true"></span><span>Opening ${esc(step.title)}</span></p>`;
+  detail.hidden = false;
+  $("#ledger").hidden = true;
+  layout();
+}
+
+// the view the trail is at, shown again where a step on its way was dropped or failed
+function restoreShown() {
+  S.opening = false;
+  if (S.shown > 0) { const s = S.trail[S.shown - 1]; showStep(s, s.html || "", s.scroll || 0); } else showLedger();
+}
+
+// what an inspected figure was opened from, an event, a holding, a factor, a market or a list: the trail's first step,
+// kept in view while a step deeper is shown; a figure's working opened on its own has nothing to keep beside it
+const inspected = () => S.shown > 1 && S.trail[0] && !/^x:/.test(S.trail[0].target) && S.trail[0].html ? S.trail[0] : null;
+
+function showBase() {
+  const ev = inspected(), base = $("#base");
+  if (!ev || narrow()) { if (base.dataset.target) { base.innerHTML = ""; delete base.dataset.target; } return; }
+  if (base.dataset.target === ev.target && base._html === ev.html) return;
+  const keep = base.dataset.target === ev.target ? $("#base-scroll").scrollTop : 0;
+  base.innerHTML = ev.html;
+  base._html = ev.html;
+  base.dataset.target = ev.target;
+  decorate(base);
+  drawCharts(base);
+  watchSizes(base);
+  requestAnimationFrame(() => { folds(base); $("#base-scroll").scrollTop = keep; });
+}
+
 function showStep(step, html, scroll) {
   const detail = $("#detail");
+  S.opening = false;
   step.html = html;
+  S.seen.set(step.target, { html, title: step.title, wide: step.wide });
   detail.innerHTML = html;
   decorate(detail);
+  layout();  // the panel takes the width its step reads in before anything in it is drawn
   drawCharts(detail);
+  watchSizes(detail);
   requestAnimationFrame(() => folds(detail));
   detail.hidden = false;
   $("#ledger").hidden = true;
+  markRank();
+  rankRows(false);
   S.shown = S.trail.indexOf(step) + 1;
   renderTrail();
   layout();
+  showBase();
   markOpeners();
   const box = $("#right-scroll");
   box.scrollTop = scroll;
@@ -1239,6 +1636,7 @@ function showStep(step, html, scroll) {
 }
 
 function showLedger() {
+  S.opening = false;
   $("#detail").hidden = true;
   $("#detail").innerHTML = "";
   $("#ledger").hidden = false;
@@ -1265,11 +1663,12 @@ function returnTo(k) {
 }
 
 function back() {
-  if (S.trail.length > S.shown) {  // a step still loading: it is dropped, and the view on screen stays
+  if (S.trail.length > S.shown) {  // a step still loading: it is dropped, and the view it left shows again
     S.nav++;
     S.trail = S.trail.slice(0, S.shown);
     renderTrail();
     markOpeners();
+    if (S.opening) restoreShown();
     return;
   }
   returnTo(S.shown - 2);
@@ -1279,31 +1678,48 @@ function back() {
 function resetTrail() {
   S.nav++;
   S.trail = [];
+  S.seen.clear();
   S.left = null;
   S.ledgerScroll = 0;
   showLedger();
 }
 
-async function refreshStep() {
+async function refreshStep({ now = false } = {}) {
   const step = S.trail[S.shown - 1];
-  if (!S.shown || !step) return;
+  if (!S.shown || !step || S.opening) return;  // a step on its way: the one it leaves is not shown to refresh
   const token = S.nav, seq = ++S.refreshSeq;
   try {
-    const got = await api(`/api/view?id=${encodeURIComponent(step.target)}`);
+    const got = await api(`/api/view?id=${encodeURIComponent(step.target)}${now ? "&now=1" : ""}`);
     if (token !== S.nav || seq !== S.refreshSeq || S.trail[S.shown - 1] !== step) return;  // superseded
     step.html = got.html;
     step.title = got.title || step.title;
+    step.wide = !!got.wide;
+    S.seen.set(step.target, { html: got.html, title: step.title, wide: step.wide });
     const tpl = document.createElement("template");
     tpl.innerHTML = got.html;
     const next = document.createElement("div");
     next.append(tpl.content);
     morph($("#detail"), next);
     decorate($("#detail"));
+    for (const ol of $$("#detail [data-ranked]")) rankList(ol, false);
     drawCharts($("#detail"));
+    watchSizes($("#detail"));
     requestAnimationFrame(() => folds($("#detail")));
     renderTrail();
     markOpeners();
+    readAgainLater(step, got);
   } catch { /* the step stays as it was */ }
+}
+
+// a view shown with values as last worked out: read again at once working them out (work), or, with a value being
+// worked out apart (later), read again until it is there; each figure changes in place
+let laterTimer = null;
+function readAgainLater(step, got) {
+  clearTimeout(laterTimer);
+  if (got.work) { refreshStep({ now: true }); return; }
+  if (!got.later) { step.laterWait = 0; return; }
+  step.laterWait = Math.min(Math.max(500, (step.laterWait || 0) * 1.5), 5000);
+  laterTimer = setTimeout(() => { if (S.trail[S.shown - 1] === step) refreshStep(); }, step.laterWait);
 }
 
 function renderTrail() {
@@ -1358,7 +1774,7 @@ document.addEventListener("click", (e) => {
   const a = e.target.closest("[data-to]");
   if (!a) return;
   e.preventDefault();
-  const note = $(`#detail [data-note="${CSS.escape(a.dataset.to)}"]`);
+  const note = $(`#detail [data-note="${CSS.escape(a.dataset.to)}"]`) || $(`#base [data-note="${CSS.escape(a.dataset.to)}"]`);
   if (!note) return;
   $(".fold", note)?.classList.add("open");
   note.scrollIntoView({ block: "center", behavior: reducedMotion.matches ? "auto" : "smooth" });
@@ -1373,8 +1789,10 @@ document.addEventListener("click", (e) => {
   e.preventDefault();
   S.keyboard = e.detail === 0;  // a click the keyboard made
   // what the breadcrumb says until the step's own title arrives: an event's title, a holding's name, the figure
-  const named = $(".chip-t, .et, .tk", a);
+  const named = $(".chip-t, .et, .tk, .nm", a);
   const label = (named ? named.textContent : a.textContent).trim() || a.dataset.go;
+  const mark = e.target.closest("[data-outcome]");
+  if (mark && a.contains(mark)) S.outcome = { event: a.dataset.go, id: mark.dataset.outcome };
   openStep(a.dataset.go, label.slice(0, 60), { from: a });
 });
 
@@ -1404,17 +1822,25 @@ document.addEventListener("keydown", (e) => { if (e.key === "Tab" || e.key === "
 // On a window narrower than a laptop's both panels fold into toggles (style.css, max-width 1100px). Where both panels
 // would leave the conversation narrower than a comfortable reading width, about 560px, the portfolio folds into its
 // toggle and the events stay docked: the panels and their padding take 788px, so below 1350px (`fold-left`).
+// While an event or a figure's working is open, the right panel is wider (a step says so: `wide`), and stays so while
+// the trail goes deeper from it; the portfolio then folds below 1580px, where both panels would crowd the conversation.
 const NARROW = matchMedia("(max-width: 1100px)");
-const CROWDED = matchMedia("(max-width: 1349px)");
 const narrow = () => NARROW.matches;
+const wideStep = () => S.shown > 0 && S.trail.slice(0, S.shown).some((s) => s.wide);
 
 function layout() {
   const app = $("#app");
   const hasLeft = !!$("#portfolio").innerHTML.trim();
   const hasRight = !!$("#ledger").innerHTML.trim() || S.trail.length > 0;
+  const wide = hasRight && wideStep();
   app.classList.toggle("has-left", hasLeft);
   app.classList.toggle("has-right", hasRight);
-  const foldLeft = !narrow() && CROWDED.matches && hasLeft && hasRight;
+  app.classList.toggle("wide", wide);
+  const foldLeft = !narrow() && hasLeft && hasRight && (wide || innerWidth < 1350);
+  app.classList.toggle("examining", !narrow() && wide);
+  const base = inspected();
+  app.classList.toggle("inspecting", !narrow() && !!base);
+  $("#base-scroll").hidden = !base || narrow();
   app.classList.toggle("fold-left", foldLeft);
   const left = hasLeft && (narrow() || foldLeft), right = hasRight && narrow();
   $('[data-toggle="left"]').hidden = !left;
@@ -1424,7 +1850,7 @@ function layout() {
 }
 
 NARROW.addEventListener("change", layout);
-CROWDED.addEventListener("change", layout);
+addEventListener("resize", layout);
 const folded = () => narrow() || $("#app").classList.contains("fold-left");
 
 $("#toggles").addEventListener("click", (e) => {
@@ -1548,13 +1974,25 @@ function connect() {
   };
 }
 
+// Everything read again, as at the start and after a reconnection: the state, the panels, and the conversation; and
+// the open view and every chip, whose values may have moved while the page was away. Another conversation, opened
+// meanwhile, starts from its ledger.
 async function loadAll() {
+  const before = S.state && S.state.store;
   const [state, panels] = await Promise.all([api("/api/state"), api("/api/panels")]);
   applyState(state);
   setPanel("portfolio", panels.portfolio || "");
   setPanel("ledger", panels.ledger || "");
   rankRows(false);
   await loadConversation();
+  if (S.loaded && before !== state.store) {
+    S.chips.clear();
+    chipAsked.clear();
+    resetTrail();
+  } else if (S.shown) {
+    refreshStep();
+  }
+  wantChips(true);
 }
 
 S.stick = true;

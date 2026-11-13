@@ -22,11 +22,11 @@ def store(tmp_path_factory):
 
 
 def test_the_initial_contents_are_the_market_alone(store):
-    channels = sorted(store.query("Channel"), key=lambda c: c["stated"]["order"])
+    channels = sorted(store.query("Factor"), key=lambda c: c["stated"]["order"])
     assert [c["stated"]["name"] for c in channels] == CHANNELS
-    assert [c["stated"]["proxy_ticker"] for c in channels] == PROXIES
+    assert [c["stated"]["proxy"] for c in channels] == PROXIES
     assert all(store.get(c["id"])["origin"] == "initial" for c in channels)
-    assert all(set(c["stated"]) == {"name", "proxy_ticker", "order"} for c in channels)
+    assert all(set(c["stated"]) == {"name", "proxy", "order"} for c in channels)
 
 
 def test_the_store_ships_no_metric_and_no_page(store):
@@ -40,10 +40,8 @@ def test_the_store_ships_no_metric_and_no_page(store):
     assert shipped == {"channels.yaml", "system.md", "MATH.md", "ONTOLOGY.md", "TOOLS.md", "DATA.md"}
 
 
-def test_each_channel_tracks_its_proxys_price(store):
-    for c in store.query("Channel"):
-        mid = f"metric:price:{c['stated']['proxy_ticker']}"
+def test_each_channels_proxys_price_is_a_metric_the_store_derives(store):
+    for c in store.query("Factor"):
+        mid = f"metric:price:{c['stated']['proxy']}"
         got = store.get(mid)
-        assert got["proxy_of"] == [c["id"]]
-        assert [(l["relation"], l["other"], l.get("conversion")) for l in got["links"]] == \
-            [("tracks", c["id"], "price")]
+        assert got["proxy_of"] == [c["id"]] and got["links"] == []

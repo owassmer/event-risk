@@ -7,6 +7,12 @@ A search is one Messages call with server-side web search, `web_search_20250305`
 `user_location` (`{type: "approximate", city, region, country, timezone}`). It returns the results as data (URL,
 title, page age, and the passages quoted from each), never a synthesis. Each search costs about a cent on the key.
 
+A result's `page_age` is "when the site was last updated" (the tool's documentation, above), given as a date ("April
+30, 2025" in its example) or as an age (read live, 1,291 of 1,622 results: "N days ago", the
+rest none). Each result's `date` is that date, ISO 8601: a stated date read in its format, and an age taken back from
+the moment the search answered, in UTC, a month or a year back by the calendar (`dated`). A page whose age the search
+does not give has none.
+
 A fetch is one Messages call with server-side web fetch, `web_fetch_20260309`, at most 100,000 tokens of content
 (https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool), which returns the page's full text,
 a PDF as base64 that `pdftotext` reads. A page the fetcher cannot reach answers an error code such as
@@ -17,6 +23,7 @@ speaks as of is the analyst's to state, citing the page.
 from __future__ import annotations
 
 import base64
+import calendar
 import ipaddress
 import json
 import os
@@ -27,10 +34,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
 from harness import claude
+from harness.venues.http import TRANSIENT
 
 API = claude.API
 MODEL = "claude-haiku-5-5"  # the small model that runs each search and fetch
@@ -81,6 +89,33 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+AGE = re.compile(r"^(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$", re.IGNORECASE)
+DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d", "%d %B %Y", "%d %b %Y")
+
+
+def dated(page_age: str | None, moment: datetime) -> str | None:
+    """The date a search result's page_age gives, ISO 8601: a date in its stated format, or an age taken back from the
+    moment the search answered; None for a page whose age is not given, or given in a form not read here."""
+    if not isinstance(page_age, str) or not page_age.strip():
+        return None
+    text = " ".join(page_age.split())
+    found = AGE.match(text)
+    if found:
+        n, unit = int(found.group(1)), found.group(2).lower()
+        if unit in ("month", "year"):
+            months = n * (12 if unit == "year" else 1)
+            year, month = divmod(moment.year * 12 + moment.month - 1 - months, 12)
+            day = min(moment.day, calendar.monthrange(year, month + 1)[1])
+            return date(year, month + 1, day).isoformat()
+        return (moment - timedelta(**{f"{unit}s": n})).date().isoformat()
+    for form in DATE_FORMATS:
+        try:
+            return datetime.strptime(text, form).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
 def private_host(hostname: str) -> bool:
     """Hosts Anthropic's fetcher cannot reach: downloaded directly."""
     h = hostname.strip("[]").lower()
@@ -112,17 +147,18 @@ class Web:
     """The web on the Claude key (harness.claude); `key` gives one directly."""
 
     def __init__(self, key: str | None = None, *, opener: Callable | None = None, model: str = MODEL,
-                 timeout: float = 180):
-        self.key = key or claude.api_key()
+                 timeout: float = 180, credential: claude.Credential | None = None):
+        self.credential = credential if credential is not None else \
+            claude.Credential(claude.KEY, key) if key else claude.credential()
         self._open = opener or urllib.request.urlopen
         self.model = model
         self.timeout = timeout
 
     def _call(self, body: dict) -> dict:
-        if self.key is None:
+        if self.credential is None:
             raise WebError("the web is not available here")
         request = urllib.request.Request(API, data=json.dumps(body).encode(), method="POST",
-                                         headers=claude.headers(self.key))
+                                         headers=claude.headers(self.credential))
         for attempt in range(3):
             try:
                 with self._open(request, timeout=self.timeout) as response:
@@ -146,7 +182,7 @@ class Web:
                 if e.code in (401, 403):
                     raise WebError("the web is not available here") from None
                 raise WebError("the web is busy just now; try again shortly") from None
-            except (urllib.error.URLError, TimeoutError):
+            except TRANSIENT:  # the network failed, or the connection dropped or was cut short mid-answer
                 if attempt < 2:
                     time.sleep(2.0 * (attempt + 1))
                     continue
@@ -168,8 +204,7 @@ class Web:
         return blocks
 
     def search(self, text: str, params: dict | None = None) -> dict:
-        """Search results as data: the queries run, and each result's URL, title, page age, and
-        cited passages."""
+        """Search results as data: the queries run, and each result's URL, title, date, and cited passages."""
         params = dict(params or {})
         unknown = [k for k in params if k not in SEARCH_PARAMS]
         if unknown:
@@ -180,6 +215,7 @@ class Web:
         blocks = self._turn({"model": self.model, "max_tokens": 4096, "thinking": {"type": "disabled"},
                              "system": SEARCH_SYSTEM, "tools": [tool],
                              "tool_choice": {"type": "tool", "name": "web_search"}}, f"Query: {text}")
+        answered = datetime.now(timezone.utc)
         queries, by_id, sources, errors = [], {}, {}, []
         for b in blocks:
             if b.get("type") == "server_tool_use" and b.get("name") == "web_search":
@@ -193,7 +229,8 @@ class Web:
                     for r in content:
                         if r.get("type") == "web_search_result" and r.get("url") not in sources:
                             sources[r["url"]] = {"url": r["url"], "title": r.get("title") or "",
-                                                 "page_age": r.get("page_age"), "query": q, "passages": []}
+                                                 "date": dated(r.get("page_age"), answered), "query": q,
+                                                 "passages": []}
                 elif isinstance(content, dict) and content.get("type") == "web_search_tool_result_error":
                     code = str(content.get("error_code"))
                     errors.append(f'the search "{q}" failed: {SEARCH_ERRORS.get(code, code.replace("_", " "))}')
@@ -201,7 +238,7 @@ class Web:
             for c in b.get("citations") or [] if b.get("type") == "text" else []:
                 if c.get("type") != "web_search_result_location" or not c.get("url"):
                     continue
-                s = sources.setdefault(c["url"], {"url": c["url"], "title": c.get("title") or "", "page_age": None,
+                s = sources.setdefault(c["url"], {"url": c["url"], "title": c.get("title") or "", "date": None,
                                                   "query": "", "passages": []})
                 passage = str(c.get("cited_text") or "").strip()
                 if passage and passage not in s["passages"]:
@@ -220,10 +257,17 @@ class Web:
                 found = None
             if found is not None:
                 return found
-        try:
-            return self._direct_fetch(url)
-        except Exception as e:  # the direct download is the last resort; its failure is the fetch's
-            raise WebError(f"the page could not be read: {_why(e)}") from None
+        attempt = 0
+        while True:  # the direct download is the last resort; its failure is the fetch's
+            try:
+                return self._direct_fetch(url)
+            except Exception as e:
+                # a network failure, or a connection dropped or cut short, is read again once; a site's refusal is not
+                again = isinstance(e, TRANSIENT) and not isinstance(e, urllib.error.HTTPError) and attempt == 0
+                if not again:
+                    raise WebError(f"the page could not be read: {_why(e)}") from None
+            attempt += 1
+            time.sleep(2.0)
 
     def _anthropic_fetch(self, url: str) -> dict | None:
         """The page through the web fetch tool; None where the tool returns no page (an error code such as

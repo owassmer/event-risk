@@ -8,5 +8,5 @@
 # the earlier ones do not.
 channels:
   - name: S&P 500
-    proxy_ticker: SPY
+    proxy: SPY
     order: 1

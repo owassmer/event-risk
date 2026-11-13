@@ -1,12 +1,18 @@
 [project]
 name = "event-risk"
 version = "0.1.0"
-description = "A harness for Opus 5.5: what could move a portfolio, how likely, and how much."
+description = "A harness for Fable 5.2: what could move a portfolio, how likely, and how much."
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=2.5.0",
+    "exchange-calendars>=4.13",
+    "highspy>=1.16.0",
+    "httpx>=0.28",
     "numpy>=2.0",
+    "pycountry>=26.2.16",
+    "pydantic>=2.0",
     "pyyaml>=6.0",
+    "truststore>=0.10",
     "tzdata>=2024.1",
 ]
 
@@ -28,3 +34,14 @@ packages = ["harness"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A passing test's temporary directory is removed as it ends, and a passing session's whole; a failure's is kept to be
+# read, for the last session alone. Every checkout's sessions share one base directory on the machine's one disk.
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
+markers = ["changes_reads: the test changes a payload a derivation read, on purpose (conftest.read_only_payloads)"]
+# exchange_calendars' own uses of pandas and NumPy features their makers have deprecated (harness.sessions)
+filterwarnings = [
+    "ignore::DeprecationWarning:exchange_calendars",
+    "ignore:DatetimeIndex.weekday is deprecated",
+    "ignore:Series.values returning an ndarray that drops timezone information",
+]
