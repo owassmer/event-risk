@@ -304,9 +304,3 @@ def returns(item: dict, load, sessions: list[str]) -> dict:
         dollar.append((i, j, (1.0 + local) * (1.0 + r_fx) - 1.0))
     return {"dollar": dollar, "own": own, "fx": fx}
 
-
-def first_close(item: dict, load, sessions: list[str]) -> str | None:
-    """The first session of the window a series has a close on."""
-    found = dollar_closes(item, load, sessions)
-    days = [d for d in sessions if d in found]
-    return days[0] if days else None

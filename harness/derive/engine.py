@@ -541,7 +541,9 @@ class Engine:
         answers as it did (_fresh), and every value it read gives what it gave (_same), each of those found current or
         worked out again first. So a value worked out again to the same output disturbs none that read it. Found
         current, it is marked so at this state, where its next check ends at once. A value that waits is current at
-        the state it was worked out at alone, and read again at the next: what it waits on can land unnamed."""
+        the state it was worked out at alone, and read again at the next: what it waits on can land unnamed. A value
+        it read that is held as last worked out, or was worked out around a wait, is no state's value, and vouches for
+        none: the page's read, which holds such values while the analyst works, never finds what read them current."""
         stamp = self.store.stamp()
         if v.verified == stamp:
             return v
@@ -557,7 +559,7 @@ class Engine:
                         u = found[1] if found is not None else None
                     else:
                         u = self.value(*dkey)
-                    if u is None or not self._same(then, u, how):
+                    if u is None or (u.waited and not u.waiting) or not self._same(then, u, how):
                         return None
             if self.store.stamp() != stamp:  # a value it read was worked out again and landed what it read
                 stamp = self.store.stamp()

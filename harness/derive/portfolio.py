@@ -40,7 +40,7 @@ from harness.derive.rows import (OCC, close_moment, coins, companies_of, establi
                                  option_symbol, option_underlying, reached,
                                  security_tickers, slope_reference, ticker_reference, with_exposure)
 from harness.derive.engine import Derivation, Inputs, Unavailable, Waiting, canonical
-from harness.derive.identity import (COMPANY_TYPES, FUND_TYPES, MAPPINGS, RECEIPTS, Lookup, abroad, cik_number,
+from harness.derive.identity import (COMPANY_TYPES, FUND_TYPES, MAPPINGS, RECEIPTS, Lookup, abroad,
                                      company_id, held_identifiers, own_ticker, resolve, row_key, unresolved, us_ticker)
 from harness.venues.yahoo import region_of
 from harness.observations import read_today

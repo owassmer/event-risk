@@ -801,3 +801,29 @@ def test_a_value_made_apart_that_no_reader_took_is_kept_by_its_content_when_anot
     with store.lock, store.engine.strict():
         assert store.engine.value("fit", "a").output == {"of": "a"}
     assert sorted(made).count("a") == 1  # taken by its hash, not made again
+
+
+def test_a_value_checked_while_the_page_holds_what_it_read_is_not_kept_as_current(make_store):
+    """A value read through another, which reads a price. A new price lands; the page, reading while the analyst works
+    (render.cache_only), gives the price's value as last worked out rather than work it out under the lock. Checked
+    against that held value, the value above it is not found current at the new state, so the next reader, a reply's
+    record among them, works it out from the price that landed: held, the value it read was of the state before, and
+    a value found current on it would stand as current with the price that landed unread (a record whose first row
+    was of the prices before a round landed, and every other row of the round's)."""
+    from harness import render
+    price = Derivation("price", 1, "Portfolio", lambda ctx, s: {"mark": ctx.data("snapshot", "AAA")},
+                       lambda m, load: {"price": load(m["mark"])["price"]})
+    above = Derivation("above", 1, "Portfolio", lambda ctx, s: {"price": ctx.value("price", s, ref=True)},
+                       lambda m, load: {"twice": 2 * load(m["price"])["price"]})
+    store = make_store(registry_=Registry([price, above]))
+    store.add("Portfolio", {"asof": "2026-11-04", "total": 1000.0})
+    store.put_data("snapshot", "AAA", {"price": 10.0}, {"endpoint": "/snapshot"}, retrieved_at=RETRIEVED)
+    with store.lock:
+        assert store.engine.value("above", "portfolio").output == {"twice": 20.0}
+    store.put_data("snapshot", "AAA", {"price": 11.0}, {"endpoint": "/snapshot"},
+                   retrieved_at="2026-11-05T21:00:00+00:00")
+    with store.lock, render.cache_only(store):
+        held = store.engine.value("above", "portfolio")  # the page, while the analyst works
+    assert held.output == {"twice": 20.0} and held.waited  # shown as last worked out until the new one is made
+    with store.lock:
+        assert store.engine.value("above", "portfolio").output == {"twice": 22.0}
