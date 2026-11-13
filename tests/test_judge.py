@@ -9,9 +9,13 @@ import urllib.error
 
 import pytest
 
-from breakdown import RETRIEVED, World
+from breakdown import World
 from harness.derive.checks import market_questions
-from harness.judge import ABOUT, MODEL, STATE_LIMIT, FixtureJudge, JudgeError, SystemOne, default_judge
+from harness.judge import MODEL, STATE_LIMIT, FixtureJudge, JudgeError, SystemOne, TooLong, default_judge, state
+from harness.tools import Tools
+
+TAIL = " could not be read just now. Nothing was written, and the call can be made again."  # the judge is the store's own: no reading is named
+from harness.world import World as Place
 from test_propagation import M1Q
 
 KEY = "bt-test-0123456789abcdefghij"
@@ -45,14 +49,13 @@ def system_one(**answers) -> dict:
 
 EVIDENCE = [
     {"ref": "portfolio", "content": {"date": "2026-11-04"}},
-    {"ref": "prop:1", "content": {"proposition": "R", "says": "The US raises tariffs", "window": "2026-11-04 to 2027-03-31",
-                                  "read": "at any time in the window"}},
-    {"ref": "market:polymarket:M1", "content": {"market": M1Q, "rules": "Resolves Yes...", "closes": "2027-03-31",
-                                                "still open": True}},
-    {"ref": "src:4", "content": {"page": "https://example.org/r", "dated": "2026-11-01",
-                                 "passage": "the rate is set to rise"}},
+    {"ref": "prop:1", "content": {"proposition": "R", "says": "The US raises tariffs", "judged": "at any time in its window",
+                                  "window ends": "2027-03-31",
+                                  "resolved by": "the Federal Register"}},
+    {"ref": "market:polymarket:M1", "content": {"venue": "Polymarket", "market": M1Q, "rules": "Resolves Yes...",
+                                                "closes": "2027-03-31", "still open": True}},
 ]
-FIT = market_questions("The US raises tariffs", M1Q, "identity")
+FIT = market_questions("yes")
 
 
 # ---------------------------------------------------------------- the request
@@ -66,11 +69,17 @@ def test_the_request_exactly_as_sent_and_the_key_only_in_its_header(monkeypatch)
     assert url == "https://inference.baseten.co/v1/systemone" and headers["Authorization"] == f"Bearer {KEY}"
     assert body == {
         "model": "decision-models/baseten-mammoth-27b-latest",
-        "state": {"about": ABOUT, "evidence": [e["content"] for e in EVIDENCE]},  # a page as the passage quoted
+        "state": state(EVIDENCE),
         "questions": {"market_forward": {"type": "noul", "instructions": FIT[0][1]},
                       "market_converse": {"type": "noul", "instructions": FIT[1][1]}}}
-    assert FIT[0][1] == "If \u201cThe US raises tariffs\u201d is true, does the market \u201cWill the US raise tariffs by " \
-                        "March 31?\u201d resolve Yes?"
+    assert body["state"] == (
+        "The texts below are a proposition, as an analyst wrote it, and a prediction market, as its venue words it."
+        "\n\nToday is November 4, 2026. The market is open and has not resolved."
+        "\n\nThe proposition, as an analyst wrote it:\nTitle: R\nText: The US raises tariffs"
+        "\nIt is true if this happens at any time through March 31, 2027.\nResolution source: the Federal Register"
+        "\n\nThe prediction market, as Polymarket words it:\nQuestion: Will the US raise tariffs by March 31?"
+        "\nRules: Resolves Yes...\nIt closes on March 31, 2027.")
+    assert FIT[0][1] == "Does the market resolve Yes, under its rules, in every outcome in which the proposition is true?"
     assert KEY.encode() not in data
     assert [(a.probability, a.model) for a in answers] == [(0.96, "baseten-mammoth-27b"), (0.94, "baseten-mammoth-27b")]
     assert json.loads(answers[0].raw) == opener.answers[0][1]  # raw is the response body
@@ -90,14 +99,39 @@ def test_429_is_retried_and_a_rejection_is_no_answer_with_the_apis_message():
     assert SystemOne(KEY, opener=opener, pause=0).answer_all([("implication", "If A, B?")], EVIDENCE)[0].probability == 0.4
     assert len(opener.sent) == 2
     rejected = Opener((422, {"error": "Prompt exceeds the context limit", "error_type": "Validation"}))
-    with pytest.raises(JudgeError, match="more than the judge reads at once"):
+    with pytest.raises(TooLong, match="more than the judge reads at once"):
         SystemOne(KEY, opener=rejected, pause=0).answer_all(FIT, EVIDENCE)
+
+
+def test_a_connection_dropped_while_the_answer_is_read_is_asked_again_and_one_never_answered_is_no_answer():
+    import http.client
+
+    class Dropping(Opener):
+        def __init__(self, drops, *answers):
+            super().__init__(*answers)
+            self.drops = list(drops)
+
+        def __call__(self, request, timeout=None):
+            if self.drops:
+                self.sent.append((request.full_url, {}, {}, b""))
+                raise self.drops.pop(0)
+            return super().__call__(request, timeout)
+
+    dropped = [http.client.RemoteDisconnected("closed"), ConnectionResetError("reset"),
+               http.client.IncompleteRead(b"{")]
+    opener = Dropping(dropped, (200, system_one(implication=0.4)))
+    assert SystemOne(KEY, opener=opener, pause=0, retries=3).answer_all([("implication", "If A, B?")],
+                                                                         EVIDENCE)[0].probability == 0.4
+    assert len(opener.sent) == 4
+    never = Dropping([ConnectionResetError("reset")] * 4, (200, system_one(implication=0.4)))
+    with pytest.raises(JudgeError, match="could not be reached"):
+        SystemOne(KEY, opener=never, pause=0, retries=3).answer_all([("implication", "If A, B?")], EVIDENCE)
 
 
 def test_evidence_over_the_limit_is_not_sent():
     opener = Opener((200, system_one(implication=0.5)))
-    long = [*EVIDENCE[:3], {**EVIDENCE[3], "content": {**EVIDENCE[3]["content"], "passage": "x" * STATE_LIMIT}}]
-    with pytest.raises(JudgeError, match="more than the judge reads at once"):
+    long = [EVIDENCE[0], {**EVIDENCE[1], "content": {**EVIDENCE[1]["content"], "says": "x" * STATE_LIMIT}}, EVIDENCE[2]]
+    with pytest.raises(TooLong, match="more than the judge reads at once"):
         SystemOne(KEY, opener=opener, pause=0).answer_all([("implication", "If A, B?")], long)
     assert opener.sent == []
 
@@ -111,7 +145,7 @@ def judged_world(tmp_path, monkeypatch, *answers):
     opener = Opener(*answers)
     w.store.engine.judge = SystemOne(KEY, opener=opener, pause=0)
     r = w.prop("R")
-    link = w.link(r, "quoted_by", w.market("M1", M1Q, 0.28, 0.33))
+    link = w.link(r, "asks", w.market("M1", M1Q, 0.28, 0.33))
     return w, opener, r, link
 
 
@@ -131,33 +165,49 @@ def test_a_market_check_is_one_request_and_two_judgments_and_a_second_read_asks_
     assert KEY.encode() not in stored  # the key is in no recorded byte
 
 
-def test_oversized_evidence_is_unavailable_with_its_reason_and_nothing_is_sent(tmp_path, monkeypatch):
+def test_oversized_evidence_is_no_check_and_nothing_is_sent(tmp_path, monkeypatch):
     monkeypatch.setenv("BASETEN_API_KEY", KEY)
     w = World(tmp_path / "scratch-judge")
     opener = Opener((200, system_one(market_forward=0.9, market_converse=0.9)))
     w.store.engine.judge = SystemOne(KEY, opener=opener, pause=0)
     r = w.prop("R")
-    page = w.store.put_page("https://example.org/long", "y" * STATE_LIMIT, retrieved_at=RETRIEVED)
-    w.link(r, "evidence", page, passages=["y" * STATE_LIMIT])  # a passage as long as the page
-    link = w.store.link(r, "quoted_by", w.market("M1", M1Q, 0.28, 0.33))
-    forward = link["derived"]["forward"]
-    assert forward["value"] is None and "more than the judge reads at once" in forward["reason"]
+    link = w.store.link(r, "asks", w.market("M1", M1Q, 0.28, 0.33, rules="y" * STATE_LIMIT))  # rules that long
+    assert "forward" not in link["derived"] and "converse" not in link["derived"]  # no judge here reads it
     assert opener.sent == [] and w.store.db.execute("SELECT count(*) FROM judgment").fetchone()[0] == 0
-    assert w.interval(r) == (0.28, 0.33)  # the check waits; the bound does not
+    assert w.interval(r) == (0.28, 0.33)  # the bound stands
 
 
-def test_a_question_left_unanswered_is_unavailable_and_asked_again(tmp_path, monkeypatch):
+def test_a_question_left_unanswered_fails_the_call_keeps_what_was_answered_and_is_asked_again(tmp_path, monkeypatch):
+    """The judge's reading is a read the link's result needs: a question it leaves unanswered fails the call with
+    nothing written and no reason, what it did answer is kept, and the call made again asks only the rest (TOOLS.md 5)."""
     monkeypatch.setenv("BASETEN_API_KEY", KEY)
     w = World(tmp_path / "scratch-judge")
     opener = Opener((200, system_one(market_converse=0.94)), (200, system_one(market_forward=0.9)))
     w.store.engine.judge = SystemOne(KEY, opener=opener, pause=0)
-    first = w.store.link(w.prop("R"), "quoted_by", w.market("M1", M1Q, 0.28, 0.33))
-    forward = first["derived"]["forward"]
-    assert forward["value"] is None and "no answer to this check" in forward["reason"]
-    assert first["derived"]["converse"]["value"] == 0.94
-    assert [tuple(x) for x in w.store.db.execute("SELECT kind FROM judgment")] == [("market_converse",)]
-    assert w.derived(first["id"], "forward") == 0.9 and len(opener.sent) == 2  # the next read asks again
-    assert list(opener.sent[1][2]["questions"]) == ["market_forward"]  # alone: the converse is cached
+    tools = Tools(Place(w.store, w.venues))
+    r, m = w.prop("R"), w.market("M1", M1Q, 0.28, 0.33)
+    ok, got = tools.call("link", {"from_id": r, "relation": "asks", "to_id": m})
+    assert not ok and got == {"error": "A reading this call needs" + TAIL, "dependents": []}
+    assert w.store.links_of(r, "asks") == [] and not w.store._market_kept(m)  # nothing written
+    assert [tuple(x) for x in w.store.db.execute("SELECT kind FROM judgment")] == [("market_converse",)]  # kept
+    ok, got = tools.call("link", {"from_id": r, "relation": "asks", "to_id": m})
+    held = w.store.get(got["id"])["derived"]  # the reading is the store's: the analyst's return carries none of it
+    assert ok and (held["forward"]["value"], held["converse"]["value"]) == (0.9, 0.94)
+    assert len(opener.sent) == 2 and list(opener.sent[1][2]["questions"]) == ["market_forward"]  # the rest alone
+
+
+def test_a_check_the_judge_could_not_answer_waits_with_no_reason(tmp_path, monkeypatch):
+    """Read outside a call, as the page reads, a check the judge did not answer is there as waiting and nothing more;
+    read by a call, it fails the call."""
+    monkeypatch.setenv("BASETEN_API_KEY", KEY)
+    w = World(tmp_path / "scratch-judge")
+    w.store.engine.judge = SystemOne(KEY, opener=Opener((500, {"error": "down"})), pause=0, retries=1)
+    r = w.prop("R")
+    link = w.store.link(r, "asks", w.market("M1", M1Q, 0.28, 0.33))
+    assert link["derived"]["forward"] == {"value": None, "waiting": True}
+    assert w.interval(r) == (0.28, 0.33)  # the bound does not wait on the check
+    ok, got = Tools(Place(w.store, w.venues)).call("get", {"id": link["id"]})
+    assert not ok and got == {"error": "A reading this call needs" + TAIL, "dependents": []}
 
 
 def test_which_judge_answers(monkeypatch):
@@ -170,7 +220,23 @@ def test_which_judge_answers(monkeypatch):
 
 
 def test_the_framing_is_part_of_every_key(monkeypatch):
+    from harness import judge
     from harness.derive import engine
     before = engine.judgment_hash("implication", "If A, B?", EVIDENCE, 1)
-    monkeypatch.setattr(engine, "FRAMING", engine.text_hash(ABOUT + " Another sentence."))
+    monkeypatch.setattr(judge, "ABOUT_MARKET", judge.ABOUT_MARKET + " Another sentence.")
     assert engine.judgment_hash("implication", "If A, B?", EVIDENCE, 1) != before  # asked again, with no version bumped
+
+
+@pytest.mark.parametrize("kind, start, said", [
+    ("hitting", "2026-11-04", "It is true if this happens at any time from November 4, 2026 to March 31, 2027."),
+    ("hitting", None, "It is true if this happens at any time through March 31, 2027."),
+    ("level_at_date", None, "It is true if this holds on March 31, 2027."),
+    ("scheduled_decision", None, "It is decided at the scheduled decision on March 31, 2027.")])
+def test_the_judge_reads_when_a_proposition_is_judged(kind, start, said):
+    """A level reached at any time in a window, a level on a date, and a decision then are three propositions on the
+    same dates: the judge reads which, from the one rendering of a proposition."""
+    from harness.derive.evidence import JUDGED
+    from harness.judge import proposition_text
+    content = {"proposition": "T", "says": "The rate reaches 25%", "judged": JUDGED[kind],
+               **({"window starts": start} if start else {}), "window ends": "2027-03-31"}
+    assert said in proposition_text(content, "The proposition:").split("\n")

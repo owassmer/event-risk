@@ -1,4 +1,4 @@
-"""The analyst's documents and runtime: ONTOLOGY.md's tables are the schema's, TOOLS.md gives every tool's signature; and a short conversation runs through
+"""The analyst's documents and runtime: TOOLS.md gives every tool's signature; and a short conversation runs through
 the SDK's tool runner against a scripted Messages API, every tool called, its trace the conversation, and
 every number in it re-derived from the store with no judge, no keys, and no network."""
 
@@ -11,37 +11,24 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import fixture_judge
-from harness import ontology, schema
+from conftest import paid, fixture_judge
 from harness.analyst import DOCUMENTS, MODEL, Analyst, system_prompt
 from harness.derive import default_registry
 from harness.ledger import ledger
 from harness.store import Store
 from harness.tools import SPECS, signature
 from harness.trace import Trace
-from harness.venues import Venues, hyperliquid, kalshi, polymarket
+from harness.venues import Venues
 from harness.web import Web
 from harness.world import World
 from massive_data import ASOF, KNOWLEDGE, closes_from, put_bars, put_market, put_reference, random_returns
-from test_markets import Opener, http, hyperliquid_route, kalshi_route, polymarket_route
+from test_markets import Opener, adapter, kalshi_route, polymarket_route
+from breakdown import stated
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------- the documents
-
-
-def test_the_ontologys_tables_are_the_schemas():
-    assert ontology.drift(KNOWLEDGE / "ONTOLOGY.md") == []
-
-
-def test_a_change_to_the_schema_shows_as_drift(monkeypatch):
-    t = schema.OBJECTS["Metric"]
-    monkeypatch.setitem(schema.OBJECTS, "Metric", type(t)(**{**t.__dict__, "derived": ("level",)}))
-    assert ontology.drift(KNOWLEDGE / "ONTOLOGY.md") == ["objects"]
-    r = schema.RELATIONS["then"]
-    monkeypatch.setitem(schema.RELATIONS, "then", type(r)(**{**r.__dict__, "derived": ()}))
-    assert ontology.drift(KNOWLEDGE / "ONTOLOGY.md") == ["objects", "links"]
 
 
 def test_tools_md_gives_each_tools_signature_once():
@@ -93,15 +80,16 @@ class Data:
 
     def fetcher(self, kind):
         def fetch(subject, covering):
-            self.calls.append((kind, subject))
-            r = self.source._one("SELECT id FROM data WHERE kind = ? AND subject = ? ORDER BY rowid DESC LIMIT 1",
-                                 kind, subject)
-            if r is None:
-                return {"payload": {"status": "NOT_FOUND"}, "request": {"kind": kind, "subject": subject},
-                        "retrieved_at": "2026-11-05T02:00:00+00:00", "range": tuple(covering or (ASOF, ASOF))}
-            row = self.source._data_row(r["id"])
-            return {"payload": self.source.data_payload(r["id"]), "request": row["request"],
-                    "retrieved_at": row["retrieved_at"], "range": (row["range_from"], row["range_to"])}
+            with self.source.lock:  # one connection, read from the store's reads started ahead too
+                self.calls.append((kind, subject))
+                r = self.source._one("SELECT id FROM data WHERE kind = ? AND subject = ? ORDER BY rowid DESC LIMIT 1",
+                                     kind, subject)
+                if r is None:
+                    return {"payload": {"status": "NOT_FOUND"}, "request": {"kind": kind, "subject": subject},
+                            "retrieved_at": "2026-11-05T02:00:00+00:00", "range": tuple(covering or (ASOF, ASOF))}
+                row = self.source._data_row(r["id"])
+                return {"payload": self.source.data_payload(r["id"]), "request": row["request"],
+                        "retrieved_at": row["retrieved_at"], "range": (row["range_from"], row["range_to"])}
         return fetch
 
     def fetchers(self):
@@ -119,7 +107,9 @@ def say(text):
 
 class Script:
     """The Messages API: each request answered by the script's next reply, written from the store as it
-    stands, as the model writes its calls from what it has read."""
+    stands, as the model writes its calls from what it has read. A reply is its content, which stops to call tools
+    where it holds a call and ends its turn otherwise; or {"content", "stop_reason", "stop_details"}, a response that
+    stops as it says, sent with its stop_details on the message_delta event as the API streams them."""
 
     def __init__(self, store, replies):
         self.store, self.replies, self.requests, self.headers = store, list(replies), [], []
@@ -130,7 +120,10 @@ class Script:
         self.requests.append(body)
         self.headers.append(dict(request.headers))
         content = self.replies.pop(0)(self.store)
-        stop = "tool_use" if any(b["type"] == "tool_use" for b in content) else "end_turn"
+        stop, details = None, None
+        if isinstance(content, dict):
+            content, stop, details = content["content"], content["stop_reason"], content.get("stop_details")
+        stop = stop or ("tool_use" if any(b["type"] == "tool_use" for b in content) else "end_turn")
         message = {"id": f"msg_{len(self.requests)}", "type": "message", "role": "assistant", "model": body["model"],
                    "content": [], "stop_reason": None, "stop_sequence": None,
                    "usage": {"input_tokens": 1000, "output_tokens": 1, "cache_read_input_tokens": 900}}
@@ -148,7 +141,8 @@ class Script:
                 deltas = [{"type": "input_json_delta", "partial_json": json.dumps(b["input"])}]
             events += [("content_block_delta", {"type": "content_block_delta", "index": i, "delta": d}) for d in deltas]
             events.append(("content_block_stop", {"type": "content_block_stop", "index": i}))
-        events.append(("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+        events.append(("message_delta", {"type": "message_delta", "delta": {
+            "stop_reason": stop, "stop_sequence": None, **({"stop_details": details} if details else {})},
                                          "usage": {"output_tokens": 50}}))
         events.append(("message_stop", {"type": "message_stop"}))
         sse = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events)
@@ -162,48 +156,49 @@ def page_id(store):
 
 
 T = {"title": "T", "text": "The US effective tariff rate reaches 25% by March 31, 2027",
-     "metric": "metric:us_effective_tariff_rate_pct", "relation": ">=", "value": 25.0,
-     "window_start": ASOF, "window_end": "2027-03-31", "kind": "hitting"}
+     "metric": "metric:us_effective_tariff_rate_pct", "comparison": ">=", "value": 25.0,
+     "window_start": ASOF, "window_end": "2027-03-31", "kind": "hitting", "baseline": "no"}
 N = {"title": "N", "text": "NVDA closes at or below $100 on March 31, 2027", "metric": "metric:price:NVDA",
-     "relation": "<=", "value": 100.0, "window_end": "2027-03-31", "kind": "level_at_date"}
+     "comparison": "<=", "value": 100.0, "window_end": "2027-03-31", "kind": "level_at_date"}
 
 TURN_1 = [
     lambda s: [{"type": "thinking", "thinking": "The person holds NVDA and cash; the store prices them.",
                 "signature": "c2lnbmF0dXJl"},
                say("I'll add the portfolio."), use("add", type="Portfolio", fields={
-        "asof": ASOF, "holdings": [{"ticker": "NVDA", "dollars": 60000.0}, {"ticker": "CASH", "dollars": 40000.0}]})],
+        "asof": ASOF, "holdings": [{"ticker": "NVDA", "dollars": 60000.0}, {"cash": 40000.0}]})],
     lambda s: [use("exposure"), use("search_web", text="US effective tariff rate 2027"),
                use("fetch_source", url="https://example.org/rate")],
     lambda s: [use("edit", id=page_id(s), field="dated", value="2026-10-30", source_id=page_id(s)),
                use("add", type="Metric", fields={
                    "id": "us_effective_tariff_rate_pct", "name": "the US effective tariff rate", "unit": "percent", "resolution_source": "Yale Budget Lab",
-                   "traded": False, "current_value": {"value": 22.0, "source_id": page_id(s)},
-                   "asof": {"value": "2026-10-30", "source_id": page_id(s)}})],
+                   "kind": "level", "level": {"value": 22.0, "source_id": page_id(s)},
+                   "asof": "2026-10-30"})],
     lambda s: [use("add", type="Proposition", fields=T), use("add", type="Proposition", fields=N),
-               use("link", from_id="prop:1", relation="quoted_by", to_id="market:polymarket:516710"),
+               use("link", from_id="prop:1", relation="asks", to_id="market:polymarket:516710"),
                use("link", from_id="prop:1", relation="evidence", to_id=page_id(s),
                    fields={"passages": ["The effective tariff rate is 22 percent"]}),
-               use("link", from_id="prop:1", relation="consequence", to_id="metric:price:NVDA",
-                   fields={"value": -20.0, "meaning": "gap"}),
+               use("link", from_id="prop:1", relation="consequence", to_id="name:NVDA",
+                   fields={"shock": stated(-0.2)}),
                use("note", text="The tariff rate is the largest risk to the semiconductor holding.",
                    about_ids=["prop:1"]),
                use("link", from_id="portfolio", relation="watches", to_id="prop:1"),
-               use("search_markets", venue="polymarket", endpoint="/public-search", params={"q": "tariff"},
+               use("search_markets", text="tariff",
                    proposition_id="prop:1")],
     lambda s: [use("ledger"), use("check"), use("window_returns", start="2026-10-01", end="2026-10-02"),
                use("query", type="Proposition", where={"title": "N"}),
-               use("neighbors", id="prop:1", relation="quoted_by")],
+               use("neighbors", id="prop:1", relation="asks")],
     lambda s: [say("The tariff rate reaching 25% is the event that matters most here.")],
 ]
 TURN_2 = [
-    lambda s: [use("get", id="prop:1"), use("remove", id="note:1"), use("get", id="prop:99")],
+    lambda s: [use("get", id="prop:1"), use("remove", id="note:2"), use("get", id="prop:99")],
     lambda s: [say("The chance comes from the market quoting the rate above 20%.")],
 ]
 
 
 @pytest.fixture
 def conversation(tmp_path, monkeypatch):
-    for key in ("ANTHROPIC_API_KEY", "BASETEN_API_KEY", "MASSIVE_API_KEY"):
+    from harness.credentials import SECRET_ENV
+    for key in SECRET_ENV:
         monkeypatch.delenv(key, raising=False)
     import anthropic
     import httpx2
@@ -216,18 +211,16 @@ def conversation(tmp_path, monkeypatch):
     data = Data(source)
     store = Store.create(tmp_path / "scratch-conversation", initial=KNOWLEDGE, registry=default_registry(),
                          judge=fixture_judge(), fetchers=data.fetchers())
-    (pm, pm_seen), (ks, ks_seen), (hl, hl_seen) = http(polymarket_route), http(kalshi_route), http(hyperliquid_route)
+    (pm, pm_seen), (ks, ks_seen) = adapter("polymarket", polymarket_route), adapter("kalshi", kalshi_route)
     web = Opener(web_route)
-    world = World(store, Venues({"polymarket": polymarket.Polymarket(pm), "kalshi": kalshi.Kalshi(ks),
-                                 "hyperliquid": hyperliquid.Hyperliquid(hl)}), Web(key="test", opener=web),
-                  today=lambda: ASOF)
+    world = World(store, Venues({"polymarket": pm, "kalshi": ks}, paid()), Web(key="test", opener=web), today=lambda: ASOF)
     script = Script(store, TURN_1 + TURN_2)
     client = anthropic.Anthropic(api_key="sk-test", http_client=httpx2.Client(transport=httpx2.MockTransport(script)))
     events = []
     analyst = Analyst(world, client=client, on_event=events.append)
     first = analyst.say("I hold NVDA $60,000 and $40,000 in cash. What could hit it?")
     second = analyst.say("Why that chance?")
-    seen = {"polymarket": pm_seen.seen, "kalshi": ks_seen.seen, "hyperliquid": hl_seen.seen, "web": web.seen,
+    seen = {"polymarket": pm_seen.seen, "kalshi": ks_seen.seen, "web": web.seen,
             "massive": data.calls}
     yield {"store": store, "analyst": analyst, "script": script, "turns": [first, second], "seen": seen,
            "tmp": tmp_path, "events": events}
@@ -240,18 +233,25 @@ def test_the_runner_sends_the_system_prompt_and_the_fifteen_tools_and_every_resu
     first = script.requests[0]
     assert first["model"] == MODEL and first["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert first["stream"] is True and first["max_tokens"] == 128_000
-    assert [b["text"] for b in first["system"]] == [b["text"] for b in system_prompt()] + \
-        ["Today is Wednesday, 2026-11-04, in New York."]  # the world's clock, the fixture's as-of
+    assert [b["text"] for b in first["system"]] == [b["text"] for b in system_prompt()]
+    # today's date leads the person's message (the world's clock, the fixture's as-of), so the system text is the same
+    # for the whole conversation
+    assert first["messages"][0]["content"][0] == {"type": "text", "text": "Today is Wednesday, 2026-11-04, in New York."}
+    assert all(request["system"] == first["system"] for request in script.requests)
     assert sorted(t["name"] for t in first["tools"]) == sorted(SPECS)
+    # both breakpoints cached for an hour: a turn can wait on one call, and a member on a reply, past five minutes, and
+    # the API refuses a request whose breakpoints differ in how long they keep
+    assert first["cache_control"] == first["system"][4]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert next(t for t in first["tools"] if t["name"] == "link")["input_schema"]["required"] == \
         ["from_id", "relation", "to_id"]
     for request in script.requests[1:]:
         last = request["messages"][-1]
-        if last["role"] == "user" and isinstance(last["content"], list):
+        if last["role"] == "user" and last["content"][0]["type"] == "tool_result":
             used = [b["id"] for b in request["messages"][-2]["content"] if b["type"] == "tool_use"]
             assert [b["tool_use_id"] for b in last["content"]] == used  # every call's result goes back
     final = script.requests[-1]["messages"]
-    results = [b for m in final if m["role"] == "user" and isinstance(m["content"], list) for b in m["content"]]
+    results = [b for m in final if m["role"] == "user" and isinstance(m["content"], list) for b in m["content"]
+               if b["type"] == "tool_result"]
     assert [b.get("is_error", False) for b in results] == [False] * 21 + [True]  # get("prop:99") is an error
     assert json.loads(results[-1]["content"][0]["text"] if isinstance(results[-1]["content"], list)
                       else results[-1]["content"])["error"] == "prop:99 is not in the store"
@@ -265,6 +265,11 @@ def test_every_tool_is_called_and_answers(conversation):
     assert first["text"].startswith("The tariff rate") and first["requests"] == 6 and second["requests"] == 2
     assert first["usage"]["input_tokens"] == 6000 and second["usage"]["output_tokens"] == 100
     store = conversation["store"]
+    # The as-of is past: Polymarket's history is a price a day, no quote, so the market reads the book the store kept on
+    # the as-of day (harness.derive.markets.past_price).
+    from test_markets import PM_BOOK
+    store.put_data("book", "market:polymarket:516710", PM_BOOK, {"method": "books"},
+                   retrieved_at=f"{ASOF}T20:00:00+00:00", range=(ASOF, ASOF))
     row = ledger(store)["rows"][0]
     assert row["id"] == "prop:1" and row["markets"][0]["market"] == "market:polymarket:516710"
     returned = [r["id"] for r in store.db.execute("SELECT id, results FROM search WHERE tool = 'search_markets'")
@@ -274,8 +279,8 @@ def test_every_tool_is_called_and_answers(conversation):
     recorded = [r["id"] for r in store.db.execute("SELECT id FROM search WHERE proposition_id = 'prop:1'")]
     assert [q["search"] for q in row["searches"]["queries"]] == returned == recorded
     assert row["searches"]["web_searches"] == 1 and row["searches"]["web_queries"][0]["proposition"] is None
-    assert row["searches"]["sources_linked"] == 1 and row["consequences"][0]["metric"] == "metric:price:NVDA"
-    assert row["consequences"][0]["figure"] == {"value": -20.0} and row["consequences"][0]["L_yes"] is not None
+    assert row["searches"]["sources_linked"] == 1 and row["consequences"][0]["target"] == "name:NVDA"
+    assert row["consequences"][0]["shock"]["value"] == -0.2 and row["consequences"][0]["levels"] is not None
     assert row["d"] and "name:NVDA" in row["d"]
 
 
@@ -320,9 +325,13 @@ def test_a_reader_replays_the_conversation_from_its_trace_and_every_number_re_de
     try:
         assert again.engine.judge is None and again.fetchers == {} and again.venues is None
         assert json.loads(json.dumps(ledger(again), default=str)) == before
+        from harness.ledger import event_read
         for e in calls.values():
             if e["tool"] == "get" and "result" in e:
-                assert again.get(e["input"]["id"])["derived"] == json.loads(json.dumps(e["result"]["derived"]))
+                oid = e["input"]["id"]  # a watched event is read as it now stands, as get read it
+                found = event_read(again, oid) if again.type_of(oid) == "Proposition" and again.watched(oid) \
+                    else again.get(oid)
+                assert found["derived"] == json.loads(json.dumps(e["result"]["derived"]))
     finally:
         again.close()
     assert {k: len(v) for k, v in conversation["seen"].items()} == seen  # nothing reached the world
