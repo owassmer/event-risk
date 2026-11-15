@@ -1,5 +1,6 @@
 // The page's browser code: our own small layer, no framework and no build step. It streams the
-// conversation, merges each updated panel into place, and opens every detail on the right.
+// conversation, merges each updated panel into place, and opens what the member opens beside the conversation, a
+// figure's working beside the view it came from.
 "use strict";
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -26,7 +27,8 @@ const S = {
   rows: "moves",         // the assumptions grid's lower rows: each price's move, or each price's level there
   tab: "outcomes",       // an opened event's view: its outcomes, its probability, or its assumptions
   weightBy: "company",   // which list of where the portfolio's weight is the portfolio panel shows
-  outcome: null,         // the outcome selected, {event, id}: marked in the picture, the tree and each grid
+  outcome: null,         // the outcome selected, {event, id}: marked in the picture, each grid and the history
+  stick: true,           // whether the conversation follows its newest line: it does while it is at its end
 };
 
 // ---------------------------------------------------------------- small helpers
@@ -563,7 +565,7 @@ function renderConversation() {
 function updateActions() {
   const idle = !S.state.busy && S.state.can_reply;
   const turns = $$("#conversation .turn");
-  turns.forEach((el, k) => {
+  turns.forEach((el) => {
     const t = el._turn;
     const can = idle && t && t.editable;
     for (const node of [$('[data-act="edit"]', el), $(".actions.after", el)]) if (node) node.hidden = !can;
@@ -1023,11 +1025,10 @@ function plot(el, spec) {
   const months = (RANGES.find(([r]) => r === el._range) || [])[1];
   let pts = months ? spec.points.filter((p) => p[0] >= monthsBefore(last, months)) : spec.points;
   if (pts.length < 2) pts = spec.points.slice(-2);
-  const band = spec.band && spec.band.every((v) => typeof v === "number") ? spec.band : null;
-  const vals = pts.map((p) => p[1]).concat(band || []);
+  const vals = pts.map((p) => p[1]);
   let lo = Math.min(...vals), hi = Math.max(...vals);
   if (hi - lo < 1e-9) { lo -= 0.5 * Math.abs(lo || 1) * 0.01; hi += 0.5 * Math.abs(hi || 1) * 0.01; }
-  const right = band ? 14 : 2, pad = 6;
+  const right = 2, pad = 6;
   const x = (i) => 2 + (i * (CW - 2 - right)) / (pts.length - 1);
   const y = (v) => pad + ((hi - v) / (hi - lo)) * (CH - 2 * pad);
   const d = pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
@@ -1039,10 +1040,9 @@ function plot(el, spec) {
     pts.forEach((p, i) => { if (p[0] <= spec.mark.to) b = i; });
     if (a >= 0 && b >= a) marked = `<rect class="ch-mark" x="${x(a).toFixed(1)}" y="0" width="${Math.max(2, x(b) - x(a)).toFixed(1)}" height="${CH}"><title>${esc(spec.mark.label || "")}</title></rect>`;
   }
-  const bandEl = band ? `<rect class="ch-band" x="${(CW - 8).toFixed(1)}" y="${y(band[1]).toFixed(1)}" width="6" height="${Math.max(2, y(band[0]) - y(band[1])).toFixed(1)}"><title>Implied range today</title></rect>` : "";
   const box = $(".ch-plot", el);
   box.className = `ch-plot ${tone}`;
-  box.innerHTML = `<svg viewBox="0 0 ${CW} ${CH}" preserveAspectRatio="none" aria-hidden="true">${marked}${bandEl}` +
+  box.innerHTML = `<svg viewBox="0 0 ${CW} ${CH}" preserveAspectRatio="none" aria-hidden="true">${marked}` +
     `<path d="${d}"/></svg><i class="ch-cursor" hidden></i><i class="ch-dot"></i>`;
   const [yHi, yLo] = $$(".ch-y span", el);
   yHi.textContent = chartValue(spec.kind, hi);
@@ -1164,9 +1164,9 @@ document.addEventListener("click", (e) => {
 
 // ---------------------------------------------------------------- a probability's history
 
-// How the probability got here: ours as it stood at each reply and now, each value standing until the next, drawn as
-// steps on a time axis; the selected outcome's in its place, ours faint behind it; beside them each market that
-// informs it, from its daily closes to now; and the range the markets imply today at the right edge.
+// How the forecast got here: as it stood at each reply and now (`spec.ours`), each value standing until the next,
+// drawn as steps on a time axis; the selected outcome's in its place, the forecast faint behind it; beside them each
+// market that informs it, from its daily closes to now; and the market-implied range today at the right edge.
 const HH = 120, HTOP = 8;
 
 function stamp(iso) {
@@ -1235,7 +1235,7 @@ function drawHistory(el) {
   el.innerHTML = `<div class="h-read"></div><svg class="dr" style="width:${w}px;height:${base + 22}px" viewBox="0 0 ${w} ${base + 22}">${svg}</svg>` +
     `<div class="h-key">${names.map((n, i) => i ? `<span class="k-mkt">${dashKey(i - 1)}${esc(n)}</span>` : `<span class="k-ours">${esc(n)}</span>`).join("")}` +
     `${picked ? '<span class="k-event">The event, at each reply</span>' : ""}</div>`;
-  // what stood at a moment: each line's value as it stood then, ours a step that holds until the next reply
+  // what stood at a moment: each line's value as it stood then, the forecast a step that holds until the next reply
   const at = (pts, t) => { let v = null; for (const p of pts) if (stamp(p[0]) <= t) v = p[1]; return v; };
   const read = $(".h-read", el), cursor = $("line.cursor", el), svgEl = $("svg", el);
   const show = (t, hover) => {
@@ -1259,8 +1259,8 @@ function drawHistory(el) {
   svgEl.onpointerleave = () => show(t1, false);
 }
 
-// One outcome is selected at a time, and shows as selected wherever it appears in the open event: its mark, its row
-// in the tree, its column in each grid, and its probability's history.
+// One outcome is selected at a time, and shows as selected wherever it appears in the open event: its row in the
+// picture, its column in each grid, and its probability's history.
 function applyOutcome() {
   const step = inspected() || S.trail[S.shown - 1];  // the event, kept in view while a figure of it is inspected
   const id = S.outcome && step && S.outcome.event === step.target ? S.outcome.id : null;
@@ -1315,9 +1315,7 @@ function morph(live, next, root = true) {
   if (!root) syncAttrs(live, next);
   if (!root && next.dataset.md !== undefined && live._md === next.dataset.md) return;  // a note, rendered as it stands
   if (!root && next.dataset.chart !== undefined && live._chart === next.dataset.chart) return;  // a chart, drawn as it stands
-  for (const k of ["dist"]) {  // a drawing whose spec is the same stays as it is drawn
-    if (!root && next.dataset[k] !== undefined && live["_" + k] === next.dataset[k]) return;
-  }
+  if (!root && next.dataset.dist !== undefined && live._dist === next.dataset.dist) return;  // a picture, drawn as it stands
   if (!root && next.dataset.history !== undefined && (live._history || "").startsWith(next.dataset.history + "|")) return;
   const lc = [...live.childNodes];
   const nc = [...next.childNodes];
@@ -1822,8 +1820,9 @@ document.addEventListener("keydown", (e) => { if (e.key === "Tab" || e.key === "
 // On a window narrower than a laptop's both panels fold into toggles (style.css, max-width 1100px). Where both panels
 // would leave the conversation narrower than a comfortable reading width, about 560px, the portfolio folds into its
 // toggle and the events stay docked: the panels and their padding take 788px, so below 1350px (`fold-left`).
-// While an event or a figure's working is open, the right panel is wider (a step says so: `wide`), and stays so while
-// the trail goes deeper from it; the portfolio then folds below 1580px, where both panels would crowd the conversation.
+// Whatever is opened takes the main area (`wide`, as every view says it is) and the conversation narrows beside it
+// (`examining`), the portfolio folded into its toggle; a figure's working opens beside the view it came from
+// (`inspecting`).
 const NARROW = matchMedia("(max-width: 1100px)");
 const narrow = () => NARROW.matches;
 const wideStep = () => S.shown > 0 && S.trail.slice(0, S.shown).some((s) => s.wide);
@@ -1995,7 +1994,6 @@ async function loadAll() {
   wantChips(true);
 }
 
-S.stick = true;
 $("#scroll").addEventListener("scroll", () => { S.stick = nearBottom(); });
 connect();
 start();

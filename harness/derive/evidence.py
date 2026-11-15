@@ -5,9 +5,9 @@ wrote them, each window as the analyst stated it, with no start filled in from t
 the metric's name, unit, and publisher, what the proposition is about, and not the metric's level today, which bears on
 how likely the threshold is and not on what the texts say; and a market as its venue words it, with the title of its event
 where that differs from its question, its question, rules, resolution source, close date, and whether it is open on
-that date. A Kalshi market names no source of its own; its rules do, or the settlement sources Kalshi lists for its event
-or else its series, which it carries under that name. judge.state words the items as the judge reads them. A Note is never serialized, so the judge
-reads the texts and not the analyst's argument; nor are passages, which define neither text, nor a search or its
+that date. A Kalshi market names no source of its own; its rules do, or the settlement sources Kalshi lists for its
+event or else its series, which it carries under that name. judge.state words the items as the judge reads them. A
+Note is never serialized, so the judge reads the texts and not the analyst's argument; nor are passages, which define neither text, nor a search or its
 results, which no function here reads. An item is {"ref": the id it was read from, "content": what it says}. A
 Judgment's key is taken over the state the judge reads, which names no store id, so the same check is the same
 Judgment in any store.

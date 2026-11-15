@@ -1091,11 +1091,7 @@ def same_worlds(m: dict, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
     of b is 0 at its highest and at its lowest, since a case where one holds without the other could carry it all.
     Links that cannot hold among themselves allow no case, and name no pair."""
     model = compile({**m, "chances": [], "books": []})
-    rows = Rows(model.n)
-    for r, lo, hi in model.base:
-        rows.add(r, lo, hi)
-    for c in model.conditions:
-        rows.add(_condition_row(model, c), 0.0, 0.0, c.tags)
+    rows = statements(model)
     prog = Program(rows)
     if not prog.solve(np.zeros(rows.n))[0]:
         return []
@@ -1109,13 +1105,10 @@ def same_worlds(m: dict, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 def decided(m: dict) -> dict:
     """Each proposition's range through the links alone with each settled market a book at 1 or 0, its bid and ask
-    met (the record's outcomes, MATH.md 3.1 of the record): {proposition: {lo, hi, lo_rests, hi_rests}}, or, where the
-    links and the settlements cannot hold together, {"cannot_hold": [statements]}."""
+    met (the record's outcomes): {proposition: {lo, hi, lo_rests, hi_rests}}, or, where the links and the settlements
+    cannot hold together, {"cannot_hold": [statements]}."""
     model = compile(m)
-    rows = Rows(model.n)
-    for r, lo, hi, t in zip(*(lambda b: (b.rows, b.lo, b.hi, b.tags))(statements(model))):
-        rows.add(r, lo, hi, t)
-    rows = with_books(model, rows)
+    rows = with_books(model, statements(model))
     prog = Program(rows)
     if not prog.solve(np.zeros(rows.n))[0]:
         return {"cannot_hold": _filter(rows, lambda q: q.solve(np.zeros(rows.n))[0], list(_groups(rows)))}

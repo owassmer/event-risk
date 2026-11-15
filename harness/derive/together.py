@@ -1,8 +1,22 @@
-"""Several events read as one economic state (MATH.md 1.9).
+"""Several events read as one set of worlds (MATH.md 1.9).
 
-The probability model preserves the direction of stated dependencies. In particular,
-two causes are not made dependent merely because a third proposition depends on both.
-Completed single-event price ratios are combined before the existing valuation is read.
+Probabilities. The events and what is stated between them form one structure, and each joint world's probability is
+read from it, every event and way keeping the probability it has alone (probabilities). Events depend on one another
+only as their statements say: each proposition is read given what its statements tie it to, so two events each read
+given a third are independent given it, and two that a third is read given stay independent of each other. Each
+probability assumed this way is marked (`assumptions`).
+
+What today's prices carry. Each joint world's weight is its joint probability times one factor for each event's world
+in it, set so that every event's worlds carry the weights its row has (price_weights).
+
+What each joint world does. A joint world the analyst states stands as stated, against the joint world in which every
+event is at its baseline. Every other stands where the rows put it: each price the store places moves so that, in
+each world of an event, its average over what the other events do there, at their joint probabilities, stands from its
+average at the event's baseline by the move the row gives it (joint_levels), and a name's response compounds the same
+way, so a company no row states has no move beyond its response. A holding the store does not place is valued as in
+any world: a fund by its terms there, times what each row's statement does to it, and a stated value at the
+corresponding world's. The joint worlds are then valued once, as one event's (impact.compute), and each event's
+average over them stands beside its row.
 """
 from __future__ import annotations
 
@@ -323,7 +337,10 @@ def probabilities(model: dict, points: dict[str, float | None], *, keep=None):
 
 
 def joint_levels(events, cells, p, targets):
-    """Multiplicative event effects whose conditional mean ratios reproduce each row."""
+    """A price's level in each joint world against the joint world in which every event is at its baseline (MATH.md
+    1.9): one factor for each event's world, multiplied, set so that in each world w of each event its mean over the
+    joint worlds within w, at their probabilities, stands at the row's ratio `targets` gives it from its mean within
+    the event's baseline. A world where a row puts the price at zero holds it at zero."""
     keys = [(i, w) for i, e in enumerate(events) for w in e["worlds"] if w != e["baseline"]]
     F = np.array([[float(c[i] == w) for i, w in keys] for c in cells])
     ratios = np.array([targets[i][w] for i, w in keys])
@@ -368,6 +385,9 @@ def joint_levels(events, cells, p, targets):
 
 
 def price_weights(cells, p, events, outputs):
+    """The weight today's prices carry on each joint world (MATH.md 1.9): its joint probability times one factor for each
+    event's world in it, the projection of the probabilities nearest them in relative entropy that gives every event's
+    worlds the weights its row has."""
     A, b = [np.ones(len(cells))], [1.0]
     for i, e in enumerate(events):
         for w in e["worlds"]:
@@ -381,7 +401,9 @@ def _world_case(event, outcome, node):
 
 
 def model_inputs(ctx, seeds):
-    """The existing closed probability structures, without requesting any valuation."""
+    """The structures the seeds are read in, joined as one (MATH.md 1.9): their propositions, links, books and lines,
+    each chance at the figure its structure read, and each proposition's probability as its structure reads it. No
+    valuation is read."""
     model = {"props": [], "links": [], "chances": [], "books": [], "lines": []}
     points, seen, resolved = {}, set(), {}
     for pid in seeds:
@@ -440,10 +462,6 @@ def _states(held, atoms, p, matching, ids):
         out[wid] = [{"p": chance, "payoffs": {h["holding"]: value for h, value in zip(held, values)}}
                     for values, chance in grouped.items() if chance > 0]
     return out
-
-
-def _contract_states(ctx, component, atoms, p, matching, ids):
-    return _states(_held(ctx, component), atoms, p, matching, ids)
 
 
 def _contract_propositions(ctx, component):
@@ -535,18 +553,6 @@ def _valued(model, points, held, atoms, masks) -> tuple[list[dict], dict | None]
 def contract_states(ctx, pid, tree, *, through=None, receipt=None):
     return contract_states_for_cases(ctx, {w: _world_case(pid, w, tree["nodes"][w]) for w in tree["worlds"]},
                                      through=through, receipt=receipt)
-
-
-def contract_probabilities(ctx, pid, tree):
-    """Conditional means of those same shared payoff states."""
-    states = contract_states(ctx, pid, tree)
-    out = {}
-    for w, found in states.items():
-        for outcome in found:
-            for hid, value in outcome["payoffs"].items():
-                values = out.setdefault(hid, {})
-                values[w] = values.get(w, 0.) + outcome["p"] * value
-    return out
 
 
 # ---------------------------------------------------------------- events read together, one derivation

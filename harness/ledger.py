@@ -26,7 +26,7 @@ from harness.derive.portfolio import NAME_TYPES, pseudo, reference_ticker, ticke
 from harness.derive.markets import taken
 from harness.derive.structure import bands, store_component, subject
 from harness.derive.oneform import same_worlds
-from harness.derive.worlds import in_its_terms, points, side_mean
+from harness.derive.worlds import in_its_terms, side_mean
 from harness.store import Store, StoreError
 from harness.trace import Trace
 from harness.venues.massive import answered
@@ -202,10 +202,9 @@ def _by_name(store: Store, shares: list[dict] | None) -> list[dict] | None:
 
 
 def _by_holding(shares: list[dict] | None) -> list[dict] | None:
-    """Each holding with the NAMED names of the largest shares through it, ranked in the impact Computation by the largest
-    of their full impact and their two outcomes, and
-    the rest as their count and summed share, in D and in each world, so the names with the remainders come to the
-    holding in each."""
+    """Each holding with the NAMED names of the largest shares through it, ranked in the impact Computation by the
+    largest of their full impact and their two outcomes, and the rest as their count and summed share, in D and in each
+    world, so the names with the remainders come to the holding in each."""
     if shares is None:
         return None
     out = []
@@ -237,7 +236,7 @@ def row(store: Store, pid: str) -> dict:
     out["outcomes"] = outcomes(store, pid, impact) if store.watched(pid) else None
     out["spread"] = impact.get("spread")  # each side's spread across its ways, the variance's part within it
     out["priced_in"] = impact.get("priced_in")  # each weight stated for the event or a way, where prices carry another
-    # each fund's remainder: what its own move comes to beyond what its rows reach moving as each does (MATH.md 1.2)
+    # each fund's remainder: what its own move comes to beyond what its rows reach moving as each does (MATH.md 1.7)
     out["remainders"] = impact.get("remainders")
     out["names"] = len(out["contributors"]) if out["contributors"] is not None else None
     out["contributors"] = _by_name(store, out["contributors"])
@@ -271,9 +270,6 @@ def market_beside(point: dict) -> dict | None:
         return None
     best = max(priced, key=lambda m: (m.get("depth") if m.get("depth") is not None else -1.0, -priced.index(m)))
     return {"market": best["market"], "link": best["link"], "probability": best["price"], "taken": best["taken"]}
-
-
-CONSEQUENCE_FIELDS = ("levels",)
 
 
 STEP_FIELDS = ("probability", "left_open", "range")  # what a step of a forecast between replies keeps
@@ -331,8 +327,8 @@ def watched(store: Store) -> dict[str, dict]:
     `worlds` is each world's probability, the weight today's prices put on it, and the portfolio's P&L there,
     `{id: {p, q, A}}` (MATH.md 1.1, 1.5), from the impact's Computation, which `basis["worlds"]` names by id: it is the whole
     portfolio's, and the store keeps a Computation while the record names it, so the record finds it by its id and
-    impact.placed places it again at other weights. `computations` holds the Computations behind p, lo and hi and every one they read, at any depth,
-    whole, so a step needs no second extraction and can be checked by recomputing it. `at` is the latest
+    impact.placed places it again at other weights. `computations` holds the Computations behind p, lo and hi and every
+    one they read, at any depth, whole, so a step needs no second extraction and can be checked by recomputing it. `at` is the latest
     `retrieved_at` among every row any of them read, the impact's included: when every figure the step holds stood.
     A field not yet derived is None, with no basis. Read through the engine's memo, so after a refresh that landed
     nothing it computes nothing."""
@@ -638,8 +634,8 @@ def _number(lid: str) -> int:
 
 def _full_impact_parts(store: Store, pid: str, cid: str, impact: dict) -> dict:
     """The full impact in its three parts (MATH.md 1.6): each factor's dollar beta times its move between the two sides, in
-    factor order; each stated company's own part on the portfolio's exposure to it, in the order its shocks and values
-    were stated, and each contract held by what it pays; and what compounding and a holding's terms add, the rest.
+    factor order; what each stated company does beyond its response, on the portfolio's exposure to it, in the order
+    its shocks and values were stated, and each contract held by what it pays; and what compounding and a holding's terms add, the rest.
     Each to the cent, as every figure is."""
     g = (store.computation(cid).get("inputs") or {}).get("g") or {}
     factors = []
@@ -851,15 +847,15 @@ def _components(store: Store) -> list[list[str]]:
 
 
 def yield_month(month: dict, duration: float) -> float:
-    """A factor quoted as a yield, its largest month read in that yield (MATH.md 3.2): its own part's compounded move over
+    """A factor quoted as a yield, its largest month read in that yield (MATH.md 3.2): its residual's compounded move over
     the month, a move net of the income its proxy paid (series.window_move), in points, -100 ln(1 + M) / duration, of
     the month's own sign."""
     return -100.0 * math.log1p(month["move"]) / duration
 
 
 def channel_reach(store: Store) -> dict:
-    """Each factor's dollar beta, g; the portfolio's beta to it, g over V; its largest month, M_c, the size of its own
-    part's largest move over a month; and that month applied to the dollar beta, abs(g) * M_c: what such a month would
+    """Each factor's dollar beta, g; the portfolio's beta to it, g over V; its largest month, M_c, the size of its
+    residual's largest move over a month; and that month applied to the dollar beta, abs(g) * M_c: what such a month would
     do to the portfolio, a measured fact (MATH.md 3.2; TOOLS.md 5). A factor quoted as the yield its proxy pays is read in that
     yield, as its shocks are stated (1.3): with its yield today, the dollars the portfolio gains or loses for each
     percentage point the yield rises, -g * duration / 100 (`per_point`), and its largest month as the yield's move over
@@ -886,7 +882,6 @@ def channel_reach(store: Store) -> dict:
     return {"value": value, "factors": out}
 
 
-NAMES_GIVEN = 25  # the largest names after look-through that adding the portfolio returns
 # A company at least this share of the portfolio's value, held directly and through its funds together, comes with
 # its latest news: the line diversification rules draw for one issuer (MATH.md 3.1).
 NEWS_LINE = 0.05
@@ -943,12 +938,11 @@ def _what_it_is(store: Store, nid: str, fund: dict | None, classified: dict | No
 def holdings(store: Store) -> dict:
     """What the portfolio owns, as of its as-of, and the end of the period the ledger looks over, the as-of plus its
     horizon's days, by which each event it watches is decided. The holdings as given, each with its value, weight, and
-    its price's session move, and
-    what it is: a company, with what it does and its industry, or a fund, with its largest holdings and how its
-    dollars divide by where its holdings are listed and by kind of asset; the portfolio's move, their sum; and the
-    largest names after look-through, each with what is held directly and through which funds; and the latest news
-    on each company that is at least NEWS_LINE of the portfolio's value. Nothing about the channels: exposure() gives the portfolio's exposure to
-    each. It reads the portfolio's stated fields alone, never what is derived from every name's prices: add returns it
+    its price's session move, and what it is: a company, with what it does and its industry, or a fund, with its
+    largest holdings and how its dollars divide by where its holdings are listed and by kind of asset; the portfolio's
+    move, their sum; and the largest names after look-through, each with what is held directly and through which
+    funds; and the latest news on each company that is at least NEWS_LINE of the portfolio's value. Nothing about the
+    factors: exposure() gives the portfolio's exposure to each. It reads the portfolio's stated fields alone, never what is derived from every name's prices: add returns it
     before the exposures are computed (harness.tools)."""
     stated = _stated(store)
     asof = stated["asof"]
@@ -1135,7 +1129,7 @@ FACTOR_REACH = ("dollar_beta", "beta", "per_point", "largest_month_applied")
 def factor(store: Store, cid: str) -> dict:
     """A factor as adding it returns it (TOOLS.md 5): its stated fields and its proxy's price metric; how it is built from
     the factors before it, its coefficient on each (`built_from`); the history every proxy shares, its first session and
-    how many (`history`); its largest month, the move of its own part with its first and last session, for a factor
+    how many (`history`); its largest month, the move of its residual with its first and last session, for a factor
     quoted as a yield the yield's move in points; and the portfolio's dollar beta to it, its beta, for a factor quoted
     as a yield its dollars for each point that yield rises, and that month applied to the dollar beta, as exposure()
     gives them (3.2). Each name's beta to it is one get away."""
@@ -1204,8 +1198,7 @@ def _sentence(relation: str, first: str, second: str, side: str, off: set[str]) 
 
 def differs(link: dict) -> str | None:
     """Where a link's two texts describe different outcomes, what differs, in one sentence (ONTOLOGY.md 2.2; TOOLS.md 6): an
-    `asks` link whose
-    market can resolve the other side where its proposition is true, or its own where the proposition is false; an
+    `asks` link whose market can resolve the other side where its proposition is true, or its own where the proposition is false; an
     `implies` link whose first proposition can be true where its second is false. None where they support it, or are
     not yet read."""
     fields = JUDGED.get(link.get("relation"))
@@ -1253,25 +1246,6 @@ def _differs(store: Store) -> list[dict]:
         side = (store.link_by_id(lid)["stated"] or {}).get("side") or "yes"
         out.append({"link": lid, "relation": item["relation"], "from": item["from"], "to": item["to"],
                     "differs": _sentence(item["relation"], item["from"], item["to"], side, off)})
-    return out
-
-
-def _disputes(store: Store) -> list[dict]:
-    """The judge's checks below one half on claims the analyst has neither changed nor answered, each with the
-    Judgment that gave it (link_states). Changing the claim asks again; a note about the Judgment, saying why the
-    reading is wrong, answers it, and a note about the link does not, being about the claim rather than the reading."""
-    states = link_states(store)
-    out = []
-    for relation in ("asks", "implies"):
-        for lid, item in states.items():
-            if item["relation"] != relation:
-                continue
-            for f, got in (item.get("checks") or {}).items():
-                if got["answer"] is None or not disputed(got["answer"]) or got["answered"]:
-                    continue
-                out.append({"link": lid, "relation": relation, "from": item["from"], "to": item["to"],
-                            "check": "implication" if f == "check" else f"market, {f}", "answer": got["answer"],
-                            "judgment": got["judgment"], "basis": got["basis"]})
     return out
 
 
@@ -1518,8 +1492,8 @@ def _fields_contradict(store: Store) -> list[dict]:
 def check(store: Store) -> dict:
     """What the analyst cannot see from the return of its own statement (TOOLS.md 6): what cannot hold together (1.10),
     with the figures involved; each claim between two propositions that their fields contradict, with the values
-    compared; and the judge's readings that do not allow a claim, until the claim changes or a note answers the
-    reading. What an event lacks, a probability or a shock that sets something, is in its row and in the return of
+    compared; and each link whose two texts describe different outcomes, with what differs, until the claim changes.
+    What an event lacks, a probability or a shock that sets something, is in its row and in the return of
     each statement about it. It gates nothing."""
     return {"fields_contradict": _fields_contradict(store), "differs": _differs(store), **_wrong(store)}
 

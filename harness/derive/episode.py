@@ -47,7 +47,7 @@ def _inputs(ctx: Inputs, key: str) -> dict:
 
 
 def _compute(m: dict, load) -> dict:
-    """The factors' covariance over the episode's sessions, by production's estimator (MATH.md 1.3, 3.2). An episode that
+    """The factors' covariance over the episode's sessions, measured as the ordinary one is (MATH.md 1.3, 3.2). An episode that
     a factor's proxy has no prices for, or over which the proxies share fewer than two sessions' returns, has no
     co-movement to give, and a statement naming it is refused with why."""
     start, end = m["window"]
@@ -101,8 +101,8 @@ def for_worlds(ctx: Inputs, event: str, tree: dict) -> dict:
             found = (event, stated[event]["episode"])
         if found:
             owner, window = found
-            # The schema stores the value of a basis-bearing field, as it does
-            # priced_in; accept the explicit value wrapper in pure fixtures too.
+            # The store keeps a stated episode with its basis, {"value": {start, end}, ...}, as it keeps
+            # priced_in (schema.based); a pure fixture can give the window itself.
             window = window.get("value", window)
             got = ctx.value("episode_covariance", subject(window["start"], window["end"]))
             out[world] = {"on": owner, "basis": got["basis"], **got["output"]}

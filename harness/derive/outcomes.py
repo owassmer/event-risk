@@ -17,8 +17,6 @@ import math
 from harness.derive import structure
 from harness.derive.engine import Derivation, Inputs
 
-SIDES = ("yes", "no")
-
 
 def parent_link(read_links, pid: str) -> dict | None:
     """The way link that makes pid one way its parent can turn out, or None where pid is no way."""

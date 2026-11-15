@@ -80,8 +80,8 @@ def covariance(ids: list[str], coefficients: dict, variances: dict) -> np.ndarra
 
 
 def orthogonal(ids: list[str], coefficients: dict, raw: dict[str, float]) -> dict[str, float]:
-    """The factors' moves in the orthogonalized basis, in factor order: each move less its regression on the earlier
-    factors' components (1.3)."""
+    """The factors' residuals, in factor order: each move less its regression on the earlier factors' residuals
+    (1.3)."""
     out: dict[str, float] = {}
     for c in ids:
         out[c] = raw[c] - sum(beta * out[j] for j, beta in coefficients[c].items())
@@ -92,15 +92,15 @@ def fill(ids: list[str], cov: np.ndarray, stated: dict[str, float], owned: dict[
          coefficients: dict | None = None) -> dict[str, float]:
     """Every factor's compounded move against the baseline, ln(1 + x), in one world (1.3): a set factor's as stated,
     and each other's as it ordinarily moves with the set ones, ln(1 + x_U) = cov(U, S) cov(S, S)^-1 ln(1 + x_S). The
-    inverse is the pseudo-inverse, so a set factor whose own part has no variance implies nothing for the others. A
+    inverse is the pseudo-inverse, so a set factor whose residual has no variance implies nothing for the others. A
     factor stated at -1 (-inf) has no compounded move to fill from: it stands at zero and the others are filled
     from the rest.
 
-    A factor whose own part is set (`owned`, its compounded own part beyond the factors before it, z_c) sets one more
+    A factor whose residual is set (`owned`, its compounded residual beyond the factors before it, z_c) sets one more
     condition on the same moves: z = T^-1 ln(1 + x), with T the orthogonalization's (`coefficients`). Every factor not
     set whole then takes its mean given all the conditions together, cov A' (A cov A')^-1 b, which with whole moves
     alone is the formula above; so a factor before it moves only as it ordinarily would with what is set, and one
-    after it by its coefficients on the own parts there."""
+    after it by its coefficients on the residuals there."""
     cov = np.asarray(cov, dtype=float)
     finite = [i for i, c in enumerate(ids) if c in stated and math.isfinite(stated[c])]
     unset = [i for i, c in enumerate(ids) if c not in stated]
@@ -128,8 +128,7 @@ def fill(ids: list[str], cov: np.ndarray, stated: dict[str, float], owned: dict[
 def place(ratios: dict[str, float], q: dict[str, float]) -> dict[str, float]:
     """A price's move against today in each world (1.5, 1.6). `ratios` are its levels in each world against any one
     level: never below zero there, they are scaled so that at the weights they come to today's price. For a price
-    whose shocks against the baseline are s_w, the ratios are 1 + s_w and this is L_base = c / sum q (1 + s); for a
-    price that moves in a straight line with the placed prices it changes nothing but where the floor holds. Raises
+    whose shocks against the baseline are s_w, the ratios are 1 + s_w and this is L_base = c / sum q (1 + s). Raises
     Unplaceable where the price is zero in every world today's prices carry."""
     held = {w: max(x, 0.0) for w, x in ratios.items()}
     total = sum(q[w] * held[w] for w in held)

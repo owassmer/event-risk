@@ -1,12 +1,13 @@
-"""Channels and betas (MATH.md 1.2, 1.3, 3.2): the channels' covariance and its orthogonalization, each name's response,
-g, the portfolio's volatility, each channel's largest month, and any window's returns.
+"""Factors and betas (MATH.md 1.3, 1.6, 3.2): the factors' covariance and its orthogonalization, each name's response,
+g, the portfolio's volatility, each factor's largest month, and any window's returns. The code calls a factor a
+channel.
 
-The channels (`factors`). The proxies' total returns on the sessions of the WINDOW ending at the as-of, the first
-channel's proxy's closes, and the common history, the sessions on which every proxy has a return (estimate.common):
+The factors (`factors`). The proxies' total returns on the sessions of the WINDOW ending at the as-of, the first
+factor's proxy's closes, and the common history, the sessions on which every proxy has a return (estimate.common):
 the factor covariance and the sensitivity fits read those, nothing being filled in for a session a proxy lacks.
 Omega, the covariance of completed moves (estimate.covariances), is what the fill reads (impact), and its LDL' in
-channel order is the orthogonalization (`orthogonalize`): channel 1 is its proxy's return, and channel k's own part is
-its proxy's return less its coefficients on the earlier channels' own parts.
+factor order is the orthogonalization (`orthogonalize`): factor 1 is its proxy's return, and factor k's residual is
+its proxy's return less its coefficients on the earlier factors' residuals.
 
 Each name's response (`betas`). Each holding, each name a fund reaches, and each currency a listing abroad is quoted
 in is fitted on its own returns over the common history, over the same and the previous session
@@ -25,16 +26,15 @@ response in dollars is b_a + b_FX, held directly or through a fund. Cash moves w
 
 g[c] = sum_h V_h b_h[c] over the holdings as given. The portfolio's volatility to the horizon's end (MATH.md 3.2) is the
 standard deviation of its move over the sessions to the horizon's end, from its variance of completed moves per
-session (estimate.covariances): the channels' part, s' Omega s over the common history, s = sum_h V_h (b0_h + b1_h) the
-holdings' full responses on the proxies' returns; and the holdings' own parts, each holding's residual e_h,t = r_h,t -
+session (estimate.covariances): the factors' part, s' Omega s over the common history, s = sum_h V_h (b0_h + b1_h) the
+holdings' full responses on the proxies' returns; and the holdings' residuals, each holding's residual e_h,t = r_h,t -
 b0_h . x_t - b1_h . x_{t-1} on each session its return covers alone (its intercept being a constant the estimator's
 centring removes), as its fit leaves it. The holdings join the total by the session their residuals begin, those
 beginning together as one part: each as it has moved with the total before it over the sessions both have, and by its
 own variability there, leaning as its fit does (estimate.joined), so a holding listed within the window takes nothing
-from the history the others have, and the holdings with the whole window are taken jointly with the channels. A
-channel's largest month, M_c, is the largest absolute return of its own part over MONTH consecutive
-market sessions of the common history, each window's proxy returns put through the orthogonalization as
-window_returns puts them.
+from the history the others have, and the holdings with the whole window are taken jointly with the factors. A
+factor's largest month, M_c, is the largest absolute move of its residual over MONTH consecutive market sessions of
+the common history, each window's proxy returns put through the orthogonalization as window_returns puts them.
 """
 
 from __future__ import annotations
@@ -53,8 +53,8 @@ from harness.derive.history import calendar_inputs, ordered_channels, window_ses
 from harness.derive.portfolio import (asof_of, closes, current_compute, current_inputs, held_name, is_today, name_id,
                                       no_price, pseudo, shocked_names, ticker_of)
 
-MONTH = 21  # M_c is the channel's largest move of its own part over this many consecutive sessions
-# A channel whose own part's standard deviation is below this share of its proxy's has none: its proxy is a combination
+MONTH = 21  # M_c is the factor's largest move of its residual over this many consecutive sessions
+# A factor whose residual's standard deviation is below this share of its proxy's has none: its proxy is a combination
 # of the earlier ones, to the precision the returns carry (the tolerance R's lm uses to drop a collinear column).
 COMBINED = 1e-7
 
@@ -176,7 +176,7 @@ def _orthogonalize_inputs(ctx: Inputs, cid: str) -> dict:
 
 
 def _orthogonalize_compute(m: dict, load) -> dict:
-    """The channel's coefficients on the earlier channels' own parts, its own part's variance, the common history it
+    """The factor's coefficients on the earlier factors' residuals, its residual's variance, the common history it
     is measured over, by its sessions and their first and last, and its largest month."""
     fm = load(m["factors"])
     sessions = fm["sessions"]
@@ -201,12 +201,12 @@ def _orthogonalize_compute(m: dict, load) -> dict:
 
 def _months(sessions: list[str], ok: np.ndarray, moves: series.Moves, coefficients: dict,
             earlier: list[dict]) -> dict[str, tuple[str, float]]:
-    """The channel's own part over every MONTH consecutive market sessions of the common history (`ok`, by the row of
+    """The factor's residual over every MONTH consecutive market sessions of the common history (`ok`, by the row of
     each session's return), or over as many as its longest run of them holds where that is fewer, by the session each
     ends on: the session it starts from, and the proxy's compounded move from that session's close to the end's, what
-    holding it earned less the income it accrued (series.Moves), less its coefficients on the earlier channels times their own parts over
-    the same sessions, as window_returns computes a window (MATH.md 3.2). A window the proxy has no close at an end of is
-    0."""
+    holding it earned less the income it accrued (series.Moves), less its coefficients on the earlier factors times
+    their residuals over the same sessions, as window_returns computes a window (MATH.md 3.2). A window the proxy has no
+    close at an end of is 0."""
     run, longest = 0, 0
     for good in ok:
         run = run + 1 if good else 0
@@ -218,8 +218,8 @@ def _months(sessions: list[str], ok: np.ndarray, moves: series.Moves, coefficien
             continue
         start, end = sessions[i], sessions[i + width]
         moved = moves(start, end)
-        # the own part, compounded (1.3): the window's compounded move less its coefficients on the earlier factors'
-        # own parts there
+        # the residual, compounded (1.3): the window's compounded move less its coefficients on the earlier factors'
+        # residuals there
         out[end] = (start, 0.0 if moved is None else
                     math.log1p(moved) - sum(coefficients[e["channel"]] * e["months"].get(end, 0.0) for e in earlier))
     return out
@@ -239,8 +239,7 @@ ORTHOGONALIZE = Derivation(
 
 def read_beside(lookthrough: dict, shocked: Iterable[str] = ()) -> dict[str, dict]:
     """The names whose prices the valuation reads beside those the look-through books (MATH.md 1.4, 1.6; ONTOLOGY.md 2.1): each
-    name a
-    consequence runs to, a company or a fund an event names, and each fund on one reference's reference, a company or
+    name a consequence runs to, a company or a fund an event names, and each fund on one reference's reference, a company or
     the fund that follows an index, where the portfolio reaches it through no row. Each is fitted on its own series, as
     a name is, priced through its own listing, and carries no exposure."""
     kinds = lookthrough.get("kinds") or {}
@@ -282,7 +281,7 @@ def _betas_inputs(ctx: Inputs, subject: str) -> dict:
 
 
 def _currency_fit(cur: str, ref: dict, fm: dict, mdl: Model, load) -> dict | None:
-    """A currency's full response in dollars: exactly a channel's, where the channel's proxy is its rate in dollars
+    """A currency's full response in dollars: exactly a factor's, where the factor's proxy is its rate in dollars
     either way round, matched by the base and quote currencies its source gives, with no uncertainty; otherwise fitted
     once, on its rate at each New York session's close, as any series is. None where its rate's source answered it
     has no rates for it: nothing is invented for it."""
@@ -318,7 +317,7 @@ def _underlying_fit(ticker: str, item: dict, mdl: Model, load) -> dict | None:
 
 def _rows_centre(fund: dict, posts: dict, currencies: dict, underlyings: dict, k: int, quoted: str | None = None
                  ) -> tuple[np.ndarray, np.ndarray, dict]:
-    """What a fund's rows say its full response is (MATH.md 1.2, 3.2): each row at the response of the asset it refers
+    """What a fund's rows say its full response is (MATH.md 3.2): each row at the response of the asset it refers
     to, by the fund's signed exposure to it per dollar of the fund: a company's or a fund's own, in dollars, where it
     has one; a currency's, for money held in it; an index's or a crypto pair's own, fitted once on its series, for a
     derivative on it; a share no series prices, the listed share's prior, the market's sensitivity; a dollar of cash,
@@ -366,7 +365,7 @@ def _rows_centre(fund: dict, posts: dict, currencies: dict, underlyings: dict, k
         riding[quoted] = riding.get(quoted, 0.0) - 1.0
     for c, x in riding.items():
         cov += x * x * currencies[c]["cov"]
-    centre[0] += shares  # the market's sensitivity, 1 on the first channel
+    centre[0] += shares  # the market's sensitivity, 1 on the first factor
     return centre, cov, {"parts": priced, "currencies": held, "underlyings": referred, "shares": shares,
                          "undetermined": undetermined, **({"quoted": quoted} if quoted else {})}
 
@@ -400,7 +399,7 @@ def _betas_compute(m: dict, load) -> dict:
         fit = mdl.fit(found, prior, early=early)
         full, session = fit["full"].copy(), fit["session"].copy()
         # where a prior of strength none leaves directions its returns do not span (fewer returns than one more than
-        # the channels), how many: the fit holds its prior's centre along them (estimate.fit_response)
+        # the factors), how many: the fit holds its prior's centre along them (estimate.fit_response)
         record = {"n": fit["n"], "prior": prior.source, "sigma2": fit["sigma2"], "alpha": fit["alpha"],
                   "lag_strength": mdl.settings.lag_strength_early if early else mdl.settings.lag_strength,
                   **({"undetermining": fit["undetermined"]} if fit.get("undetermined") else {})}
@@ -532,7 +531,7 @@ def _g_inputs(ctx: Inputs, subject: str) -> dict:
 
 
 def _g_compute(m: dict, load) -> dict:
-    """g = sum_h V_h b_h over the holdings as given (MATH.md 1.2): each holding's value at its own betas, a company's,
+    """g = sum_h V_h b_h over the holdings as given (MATH.md 1.6): each holding's value at its own betas, a company's,
     a fund's own response whether or not it is looked through, and cash at none; and each holding's part of it, with
     its betas."""
     holds = load(m["holdings"])["holds"]
@@ -562,7 +561,7 @@ G = Derivation("g", 4, "Portfolio", _g_inputs, _g_compute, fields=("dollar_beta"
 
 def _volatility_inputs(ctx: Inputs, subject: str) -> dict:
     """Each holding's own series, as the betas read it; with the holdings' dollars, each holding's session
-    coefficients, and the channels' returns and covariance of completed moves."""
+    coefficients, and the factors' returns and covariance of completed moves."""
     portfolio = ctx.object("portfolio")
     asof = portfolio["stated"]["asof"]
     end = (date.fromisoformat(asof) + timedelta(days=portfolio["stated"]["horizon_days"])).isoformat()
@@ -590,8 +589,8 @@ def _volatility_compute(m: dict, load) -> dict:
     whole on its own history and cash at nothing.
 
     Each holding's residual is its return less what its session coefficients give (estimate.residuals), and the
-    figure is the channels' part and the holdings' own parts taken together, a holding listed within the window
-    joining those before it (estimate.figure): the same two functions the evaluation's tooling calls."""
+    figure is the factors' part and the holdings' residuals taken together, a holding listed within the window
+    joining those before it (estimate.figure)."""
     mdl = model(load(m["factors"]))
     x, ok = mdl.x, mdl.ok
     rows, k = x.shape
@@ -704,7 +703,7 @@ PROXY_PRICE = Derivation(
     applies=lambda store, mid: mid.startswith("metric:price:"),
 )
 
-# ---------------------------------------------------------------- any window: how the channels moved
+# ---------------------------------------------------------------- any window: how the factors moved
 
 
 def window_subject(start: str, end: str) -> str:
@@ -734,7 +733,7 @@ def window_record(start: str, end: str, asof: str) -> tuple[str, str]:
 
 
 def _window_inputs(ctx: Inputs, subject: str) -> dict:
-    """Each channel's proxy series over the window, with its distributions from where the window's record begins
+    """Each factor's proxy series over the window, with its distributions from where the window's record begins
     (window_record), and the orthogonalization it goes through. Every proxy is read at once (moves_inputs_many), so a
     window the store holds none of is one round of reads."""
     _, start, end = subject.split(":")
@@ -757,9 +756,10 @@ def _window_inputs(ctx: Inputs, subject: str) -> dict:
 
 def _window_compute(m: dict, load) -> dict:
     """Each proxy's move from the close of start to the close of end, what holding it earned less the income it
-    accrued (series.window_move), and each factor's own part of it (MATH.md 1.3, 3.2): the compounded move, ln(1 + r), less
-    its coefficients on the earlier factors' own parts, given as a move, e^z - 1, so that the window stated back by its
-    own parts reproduces its moves. A proxy with no close at an end of the window has none, and an own part of 0."""
+    accrued (series.window_move), and each factor's residual over it (MATH.md 1.3, 3.2): the compounded move, ln(1 + r),
+    less its coefficients on the earlier factors' residuals, given as a move, e^z - 1 (`own_part`), so that the window
+    stated back by its residuals reproduces its moves. A proxy with no close at an end of the window has none, and a
+    residual of 0."""
     start, end = m["window"]
     found_closes, moves, orthogonalized = {}, {}, {}
     listed = next((c["series"] for c in m["channels"] if c["series"]["kind"] == "listing"), None)
@@ -789,7 +789,7 @@ def _window_compute(m: dict, load) -> dict:
             "proxies": {c["channel"]: c["series"]["ticker"] for c in m["channels"]}}
 
 
-# window_returns(start, end): how the channels moved over a past episode. It gives no object a field: the tool
+# window_returns(start, end): how the factors moved over a past window. It gives no object a field: the tool
 # reads its Computation by subject, window:{start}:{end}.
 WINDOW_RETURNS = Derivation("window_returns", 16, "Factor", _window_inputs, _window_compute,
                             applies=lambda store, entity: False)

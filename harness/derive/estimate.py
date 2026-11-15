@@ -1,37 +1,38 @@
-"""The estimation (MATH.md 1.2, 1.3, 3.2): the channels' covariance over completed moves, and each series' response to
-them. The store's derivations read it (harness.derive.channels); nothing here reads the store.
+"""The estimation (MATH.md 1.3, 3.2): the factors' covariance over completed moves, and each series' response to
+them. The store's derivations read it (harness.derive.channels); nothing here reads the store. The code calls a factor
+a channel.
 
 The common history. The factor covariance and the sensitivity fits read the market sessions of the window for which
-every channel's proxy has a return: nothing is filled in for a session a proxy lacks, so a proxy with a shorter history
-shortens the common history for every channel, and the channel's orthogonalization says how many sessions it holds and
+every factor's proxy has a return: nothing is filled in for a session a proxy lacks, so a proxy with a shorter history
+shortens the common history for every factor, and the factor's orthogonalization says how many sessions it holds and
 from when. Each lag is a market session: a session the common history leaves out contributes nothing, and never makes
 the session before it count as the one before the next.
 
-The channels' covariance. An event's shock is a completed move, so the channels' covariance is that of their completed
+The factors' covariance. An event's shock is a completed move, so the factors' covariance is that of their completed
 moves: the sample covariance of the proxies' returns over the common history, Gamma_0, with their covariances at lags
 of up to L market sessions added at Bartlett's declining weights (Newey and West, Econometrica 1987),
 Omega = Gamma_0 + sum_{h=1..L} (1 - h / (L + 1)) (Gamma_h + Gamma_h'), Gamma_h = sum_t c_t c_{t-h}' / N over the
 sessions t and t - h both in the common history, c the returns less their mean there, N its sessions: positive
-semi-definite by construction, and in no order of the channels. The fill of 1.3 reads it (impact), and so does the
-orthogonalization, Omega's LDL' in channel order (ldl): channel 1 is its proxy's return, and channel k's own part is its
-proxy's return less its coefficients on the earlier channels' own parts.
+semi-definite by construction, and in no order of the factors. The fill of 1.3 reads it (impact), and so does the
+orthogonalization, Omega's LDL' in factor order (ldl): factor 1 is its proxy's return, and factor k's residual is its
+proxy's return less its coefficients on the earlier factors' residuals.
 
 Each series' response. A holding, a currency, or a name a fund reaches is fitted on its own returns over the spans of
-the window's sessions it has (an untraded stretch one span) for which the channels' returns of each session of the span
+the window's sessions it has (an untraded stretch one span) for which the factors' returns of each session of the span
 and of the session before each exist: y = alpha n + s' X0 + b1' (X1 - X0) + e, Var(e) = n sigma^2, n the span's
-sessions, X0 the channels' raw proxy returns summed over the span's sessions and X1 over the sessions before each. Its
+sessions, X0 the factors' raw proxy returns summed over the span's sessions and X1 over the sessions before each. Its
 coefficients on the same session, b0 = s - b1, and on the session before, b1, are free in sign; their sum s is its full
 response, the beta g, D, and d_i read, in the proxies' raw basis (L' s in the orthogonalized one). The previous session
 carries delayed responses, where a market closes before New York's or a price lags, and what a factor's own
 continuation does to the series apart from the news: so s is the fitted model's cumulative response, which equals the
 completed-move ratio Cov_LR(y, F) Omega^-1 only as L grows, and the two are scored together where L is chosen.
 
-The priors, in the unit-information metric at the market's variance sigma_m^2, the first channel's same-session
+The priors, in the unit-information metric at the market's variance sigma_m^2, the first factor's same-session
 variance over the common history: the full response s ~ N(centre, (sigma_m^2 / kappa) Omega^-1) and the previous
 session's coefficient b1 ~ N(0, (sigma_m^2 / lambda) Gamma_0^-1), the intercept flat (Kass and Wasserman, JASA 1995).
 Each strength counts in sessions of a series as variable as the market, so a series noisier than the market leans
-more, by its own precision (Vasicek, J. Finance 1973), and one kappa holds whatever channels the analyst adds. A listed
-share's centre is the market's sensitivity, 1 on the first channel and 0 on the others (raw and orthogonalized alike,
+more, by its own precision (Vasicek, J. Finance 1973), and one kappa holds whatever factors the analyst adds. A listed
+share's centre is the market's sensitivity, 1 on the first factor and 0 on the others (raw and orthogonalized alike,
 since the first row of the LDL' factor is (1, 0, ..., 0)); a currency or crypto pair's is no response, a pair being no
 listed share (`no_response_prior`); a fund whose rows are read is centred on what its rows say (`rows_prior`): each
 row at the response of what it refers to, a share no series prices at the listed share's prior, and what the rows leave
@@ -70,11 +71,10 @@ class Settings:
     lag_strength_early: float = 16.0
     # kappa_fund: a young fund's pull toward what its rows say, its spread about their sum. On a fresh draw of 182
     # first-year equity fund fits, no pull was measurably worse than 16 (by 10% at 5 sessions, 11 to 13% at 21),
-    # and 16 and 64 were indistinguishable. On 415 first-year fund-as-ofs read through production's rows, 64
-    # against 16 differed measurably only for funds not of equity at 63 sessions (better by 0.65% of the loss), and
-    # that rested on the 80 fund-as-ofs whose options, named only in their rows' names, production read as holdings at
-    # their market value: without them (eval's 6774e3a), 64 against 16 is not measurable in either direction for any
-    # class at any horizon. 64 is unmeasured against 16, and is read again once those rows are read as what they are.
+    # and 16 and 64 were indistinguishable. On 415 first-year fund-as-ofs, 64 against 16 differed measurably only for
+    # funds not of equity at 63 sessions (better by 0.65% of the loss), and that rested on the 80 fund-as-ofs whose
+    # options, named only in their rows' names, were read as holdings at their market value: without them, 64 against
+    # 16 is not measurable in either direction for any class at any horizon.
     kappa_fund: float = 16.0
     # kappa_undetermined: what each dollar of a young fund's exposure its rows leave undetermined (a bond, a rate or
     # credit derivative, a commodity or coin with no series, a swap whose underlying is not identified) adds to the
@@ -84,22 +84,22 @@ class Settings:
     # fund-as-ofs, strengths from none to 4 were indistinguishable for funds mostly and partly undetermined alike,
     # once the one fund in each group that carried its differences was set aside, so the evidence does not decide it.
     kappa_undetermined: float = 1.0
-    # L: the market sessions of lagged co-movement the channels' covariance adds, at Bartlett's weights. Five was the
+    # L: the market sessions of lagged co-movement the factors' covariance adds, at Bartlett's weights. Five was the
     # one length measurably worse than no other construction: the same session and two missed co-movement across
     # asset classes, and ten added noise.
     memory: int = 5
     # own_lean: how many sessions' worth a holding's own variability leans toward the market's, in the portfolio's
     # volatility (MATH.md 3.2), as its fit's own risk does (one session at the market's variance); its co-movement with
     # the holdings before it leans toward none as its fit's response does, at kappa. Stronger leans toward the market's
-    # variance, 16 and 64, were worse on held-out years for holdings in their first year (evaluation's 47o): a new
-    # listing's own variability is far above the market's.
+    # variance, 16 and 64, were worse on held-out years for holdings in their first year: a new listing's own
+    # variability is far above the market's.
     own_lean: float = 1.0
 
     def as_dict(self) -> dict:
         return asdict(self)
 
 
-SETTINGS = Settings()  # read at each computation, so eval measures another setting by replacing it
+SETTINGS = Settings()  # read at each computation, so another setting is measured by replacing it
 EPS = 1e-12
 
 
@@ -115,8 +115,8 @@ def inv_pd(m: np.ndarray) -> np.ndarray:
 
 
 def ldl(omega: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Omega = L diag(d) L', L unit lower triangular: row k holds channel k's coefficients on the earlier channels'
-    own parts, and d[k] is channel k's own part's variance."""
+    """Omega = L diag(d) L', L unit lower triangular: row k holds factor k's coefficients on the earlier factors'
+    residuals, and d[k] is factor k's residual's variance."""
     c = np.linalg.cholesky(sym(omega))
     d = np.diag(c) ** 2
     return c / np.diag(c), d
@@ -128,16 +128,16 @@ def pack(a: np.ndarray) -> list:
         else np.asarray(a).tolist()
 
 
-# ---------------------------------------------------------------- the channels' covariance
+# ---------------------------------------------------------------- the factors' covariance
 
 
 def common(x: np.ndarray) -> np.ndarray:
-    """The sessions of the common history: those on which every channel's proxy has a return."""
+    """The sessions of the common history: those on which every factor's proxy has a return."""
     return ~np.isnan(x).any(axis=1)
 
 
 def covariances(x: np.ndarray, ok: np.ndarray, memory: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The channels' mean, their same-session covariance Gamma_0, and their covariance of completed moves Omega, over
+    """The factors' mean, their same-session covariance Gamma_0, and their covariance of completed moves Omega, over
     the sessions `ok` of `x` (sessions by proxies): each lag a market session, a session outside `ok` contributing
     nothing, so Omega is the Bartlett-weighted sum of the biased autocovariances of the returns less their mean, each
     left out at none, and positive semi-definite."""
@@ -213,7 +213,7 @@ def joined(before: float, total: np.ndarray, part: np.ndarray, memory: int, prio
     m = m / centring(both, memory)
     a, c, d = float(m[0, 0]), float(m[0, 1]), float(m[1, 1])  # the total's variance, their covariance, the part's
     # the co-movement's prior, in the unit-information form at the total's variance over its window (`before`), as a
-    # response's prior is at the channels' over theirs: kappa sessions of a series as variable as the market
+    # response's prior is at the factors' over theirs: kappa sessions of a series as variable as the market
     pinned = kappa * before / prior
 
     def fit(sigma2: float) -> tuple[float, float, float]:
@@ -239,7 +239,7 @@ def joined(before: float, total: np.ndarray, part: np.ndarray, memory: int, prio
 
 
 def residuals(x: np.ndarray, ok: np.ndarray, session: np.ndarray, spans: list[tuple[int, int, float]]) -> np.ndarray:
-    """A holding's own part on each row of the channels' returns `x` (MATH.md 3.2): its return less what its session
+    """A holding's residual on each row of the factors' returns `x` (MATH.md 3.2): its return less what its session
     coefficients give, r - b0 . x_t - b1 . x_{t-1}, on each span (i, i + 1] of its returns (history.returns) that
     covers one session, row i, where that row and the one before are in the common history `ok`; none (NaN) on every
     other row. `session` is its fit's two rows of coefficients, a listing abroad's in dollars (its local response
@@ -255,19 +255,20 @@ def residuals(x: np.ndarray, ok: np.ndarray, session: np.ndarray, spans: list[tu
 
 def figure(x: np.ndarray, ok: np.ndarray, omega: np.ndarray, holdings: dict, *, memory: int, lean: float,
            kappa: float) -> dict:
-    """The portfolio's variance of completed moves per session (MATH.md 3.2), from the channels' returns `x` over the
+    """The portfolio's variance of completed moves per session (MATH.md 3.2), from the factors' returns `x` over the
     common history `ok`, their covariance of completed moves `omega`, and the holdings, each `(dollars, session, e)`:
-    its dollars, its fit's session coefficients (2 by the channels), and its residuals on the rows (`residuals`).
+    its dollars, its fit's session coefficients (2 by the factors), and its residuals on the rows (`residuals`).
 
-    The channels' part is s' omega s, s the holdings' full responses in dollars. The holdings join the total, s . x_t,
+    The factors' part is s' omega s, s the holdings' full responses in dollars. The holdings join the total, s . x_t,
     by the row their residuals begin, those beginning together as one part, the sum of their dollars times their
     residuals, each as `joined` takes it: its own variability leaning `lean` sessions toward the market's (each
     holding's own at the market's variance), its co-movement with those before it toward none as its fit's response
     leans, `kappa` sessions of a series as variable as the market; a holding with no residual row joins last, its
     prior alone. Every covariance of completed moves the figure reads, `omega`'s over the common history `ok` as each
     part's over its own sessions, is taken as the sessions say it, divided by what its centring keeps (`centring`):
-    the figure reads a variance's level, where the fill and the orthogonalization read only ratios. The variance is the sum of three terms: the channels' part; the holdings' own parts taken together
-    by the same rule with nothing under them; and what the two share, the rest. Returns them, the square root of the
+    the figure reads a variance's level, where the fill and the orthogonalization read only ratios. The variance is the
+    sum of three terms: the factors' part (`channels`); the holdings' residuals taken together by the same rule with
+    nothing under them (`own`); and what the two share, the rest. Returns them, the square root of the
     whole, and each part: the row it begins on (`start`, the number of rows where none), its holdings, its sessions,
     its co-movement with the total before it (`beta`, `with`), and its own variability beyond that (`own`)."""
     rows, k = x.shape
@@ -276,7 +277,7 @@ def figure(x: np.ndarray, ok: np.ndarray, omega: np.ndarray, holdings: dict, *, 
         s += dollars * np.asarray(session, dtype=float).sum(axis=0)
     omega = omega / centring(ok, memory)
     channels = float(s @ omega @ s)
-    total = np.where(ok, np.nan_to_num(x) @ s, np.nan)  # the total's moves so far: the channels' part
+    total = np.where(ok, np.nan_to_num(x) @ s, np.nan)  # the total's moves so far: the factors' part
     variance, owns, own_variance = channels, np.zeros(rows), 0.0
     starts = {h: (int(np.flatnonzero(~np.isnan(e))[0]) if (~np.isnan(e)).any() else rows)
               for h, (_, _, e) in holdings.items()}
@@ -309,7 +310,7 @@ class Prior:
 
 
 def market_prior(omega: np.ndarray, market_variance: float, kappa: float) -> Prior:
-    """The market's sensitivity, 1 on the first channel and 0 on the others, at kappa sessions of the unit-information
+    """The market's sensitivity, 1 on the first factor and 0 on the others, at kappa sessions of the unit-information
     form: what a series leans on where nothing else speaks for it."""
     centre = np.zeros(len(omega))
     centre[0] = 1.0
@@ -317,7 +318,7 @@ def market_prior(omega: np.ndarray, market_variance: float, kappa: float) -> Pri
 
 
 def no_response_prior(omega: np.ndarray, market_variance: float, kappa: float) -> Prior:
-    """No response to any channel, at kappa sessions of the unit-information form: what a currency or crypto pair
+    """No response to any factor, at kappa sessions of the unit-information form: what a currency or crypto pair
     leans on, the market's sensitivity being what a listed share has, and a pair not being one."""
     return Prior(np.zeros(len(omega)), kappa * omega / market_variance, {"from": "none"})
 
@@ -346,14 +347,14 @@ def fit_response(y: np.ndarray, spans: list[tuple[int, int]], x: np.ndarray, pri
                  market_variance: float, lag_strength: float, omega: np.ndarray | None = None, max_iter: int = 200,
                  tol: float = 1e-12) -> dict:
     """A series' posterior: its returns `y`, each over its span (i, j] of closes of the window's sessions, the
-    channels' returns on session t being row t - 1 of `x`, under `prior` on its full response and the lag's prior at
+    factors' returns on session t being row t - 1 of `x`, under `prior` on its full response and the lag's prior at
     `lag_strength` sessions; its own risk with one session's prior at the market's variance. Returns its intercept,
     full response s with its covariance, previous session's coefficient b1, session coefficients (b0, b1), own risk,
     how many returns it had, and how many directions of its coefficients they leave undetermined.
 
     A part whose prior has a strength of none (the intercept always, the full response where its prior pulls nothing,
     the lag where it is free) is determined by the returns alone, and they determine it only where they span it: a
-    full response no prior pins, with fewer returns than one more than the channels, is not determined. There the fit
+    full response no prior pins, with fewer returns than one more than the factors, is not determined. There the fit
     is the limit of its prior's strength going to none: the returns' posterior in every direction they determine, and
     the prior's centre, at no certainty, in each direction they leave open, the directions measured in the form the
     prior's precision takes at any strength, `omega` (the unit-information form every prior here takes; `gamma0` where
@@ -438,9 +439,9 @@ def _open(z: np.ndarray, precision: np.ndarray, k: int, width: int) -> np.ndarra
 
 @dataclass
 class Model:
-    """The channels as the factors' Computation keeps them: `sessions`, the window's closes, the first the base; row t
-    of `x` the proxies' returns on sessions[t + 1], none where a proxy has none; the common history's mean, Gamma_0 and
-    Omega; Omega's LDL' in channel order; and the settings it was estimated at."""
+    """The factors as their Computation keeps them: `sessions`, the window's closes, the first the base; row t of `x`
+    the proxies' returns on sessions[t + 1], none where a proxy has none; the common history's mean, Gamma_0 and
+    Omega; Omega's LDL' in factor order; and the settings it was estimated at."""
     sessions: list[str]
     channels: list[str]
     x: np.ndarray
@@ -498,18 +499,6 @@ class Model:
                             lag_strength=lag, omega=self.omega)
 
     def orthogonal(self, full: np.ndarray) -> np.ndarray:
-        """A full response on the proxies' raw returns as one on the orthogonalized channels: L' s, since the proxies'
-        returns are L times the channels' own parts."""
+        """A full response on the proxies' raw returns as one on the factors' residuals: L' s, since the proxies'
+        returns are L times the factors' residuals."""
         return self.lower.T @ full
-
-    def expected(self) -> np.ndarray:
-        """Each session's channel returns, where a proxy has none, at its expectation given the returns the session
-        has, by the same-session covariance over the common history: what a series rebuilt on a session before a
-        young proxy's history moves with. The first channel's proxy, whose closes are the sessions, has every one."""
-        out = self.x.copy()
-        for t in np.flatnonzero(np.isnan(out).any(axis=1)):
-            miss = np.isnan(out[t])
-            have = ~miss
-            given = np.linalg.solve(self.gamma0[np.ix_(have, have)], out[t, have] - self.mean[have])
-            out[t, miss] = self.mean[miss] + self.gamma0[np.ix_(miss, have)] @ given
-        return out

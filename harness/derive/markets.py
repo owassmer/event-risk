@@ -12,8 +12,9 @@ levels: how much money stands at the quotes. `last_trade` is the market's latest
 read with its book: history, not a quote. `open` is whether the market trades on the as-of date. What a large order
 pays, walking its side of the book, is never the price: it is not what the market believes.
 
-For an as-of before the market was read, the price is the history price at the as-of, its bid and ask that price
-less and plus WIDEN, and depth is unknown.
+For an as-of before the market was read, it stands as it did at the end of that day (past_price): the latest reading
+of its book the store kept by then, whole, or the day's closing quotes its venue's history gives, with no depth; where
+the history gives a price alone, the market has no quote and no price, and that price stands beside it with its date.
 
 `risk_neutral` is the range of risk-neutral probabilities a market's price allows (MATH.md 1.2), in YES terms. Each side
 of a contract is paid for in full until the close, and the venue pays on a position's marked value, so a position is a
@@ -113,7 +114,7 @@ def past_price(venue: str, history: dict | None, asof: str, reading: tuple[str, 
     the venue's history is its midpoint alone, the market has no quote, and so no price (3.3: the midpoint of its bid and
     ask): the day's price stands as its history gives it (`history_price`), and the market bounds nothing. `quoted_at`
     is the moment of what it rests on."""
-    forms, end = FORMS[venue], as_of_end(asof)
+    forms = FORMS[venue]
     quotes = {d: q for d, q in forms.daily_quotes(history or {}).items() if d <= asof}
     day = max(quotes) if quotes else None
     closing = quotes[day] if day else None
@@ -152,8 +153,7 @@ def terms_at(asof: str | None, retrieved_at: str) -> str:
     """The moment a market's terms are read at: the moment its record was read, or for an as-of before that day, the
     end of the as-of day in New York."""
     if asof is not None and asof < read_date(retrieved_at):
-        end = datetime.combine(date.fromisoformat(asof) + timedelta(days=1), datetime.min.time(), NY)
-        return end.astimezone(timezone.utc).isoformat(timespec="seconds")
+        return as_of_end(asof).astimezone(timezone.utc).isoformat(timespec="seconds")
     return retrieved_at
 
 
@@ -382,8 +382,6 @@ def _range_compute(m: dict, load) -> dict:
 
 
 RANGE = Derivation("market_range", 1, "Market", _range_inputs, _range_compute, fields=("risk_neutral",))
-
-
 
 
 # ---------------------------------------------------------------- a market as the proposition that asks it reads it
