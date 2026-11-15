@@ -12,6 +12,7 @@ and after a rewind."""
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from decimal import Decimal
 
@@ -73,6 +74,8 @@ def _write(w, k: float) -> dict:
 # figure is canonical JSON, its keys sorted, so the figure's text names `against` first; the same text stands in a
 # link's stated fields and in each reverse the undo log holds.
 FOLLOWED_TEXT = f'"shock":{{"against":"{schema.FOLLOWS}",'
+# A figure a reverse restores, read from its stated JSON: a shock's value or a return, a number, never a time.
+FIGURE = re.compile(r'"(?:value|return)":(-?\d[\d.eE+-]*)')
 
 
 def _older_store(tmp_path, schema_version: str, k: float, name: str) -> tuple:
@@ -157,8 +160,9 @@ def test_a_store_of_the_schema_before_this_one_is_brought_to_it_on_opening(tmp_p
             assert '"own_part":{' not in undo[n] and FOLLOWED_TEXT in undo[n]
         percents = changed - owned
         assert len(percents) == 3  # the shock's edit, the return's edit, and the removed consequence's row
-        for n in percents:
-            assert ("0.2" in undo[n] or "0.12" in undo[n] or "0.08" in undo[n]) and "20.0" not in undo[n]
+        # each reverse's one figure, the fraction it was written as: the shock's 20, the return's 12, the removed 8
+        assert sorted(float(x) for n in percents for x in FIGURE.findall(undo_before[n])) == [8.0, 12.0, 20.0]
+        assert sorted(float(x) for n in percents for x in FIGURE.findall(undo[n])) == [0.08, 0.12, 0.2]
         when = store.meta("schema_converted")
     finally:
         store.close()

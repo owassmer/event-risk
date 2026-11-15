@@ -18,7 +18,7 @@ from harness.derive.engine import (
 
 
 def default_registry() -> Registry:
-    """The store's derivations: the portfolio and where its weight is, the channels and betas, the markets, the judge's
+    """The store's derivations: the portfolio and where its weight is, the factors and betas, the markets, the judge's
     checks, each structure's probabilities, an event's outcomes, and the impact."""
     from harness.derive import channels, checks, distribution, episode, impact, markets, outcomes, owned, portfolio, structure, together, valuation, worth_follow
 

@@ -8,10 +8,10 @@
 
 Each asks one question comparing what the two texts say, in every outcome; the answer is the probability the claim
 holds. Passages are not read: news linked to a proposition defines neither text. An answer below one half disputes
-the claim. The claim stands, because it is the analyst's, and check() lists the dispute
-until the analyst changes the claim, which asks again, or writes a note about the link.
+the claim. The claim stands, because it is the analyst's, and check() lists what differs between its two texts until
+the analyst changes the claim, which asks again.
 
-What the fields decide (MATH.md 1.4). A proposition's fields count its outcomes as stated, so two propositions on one
+What the fields decide (MATH.md 1.2). A proposition's fields count its outcomes as stated, so two propositions on one
 metric and resolution source are compared by their fields both ways: A implies B when every value A's threshold allows,
 B's allows, strict and non-strict kept distinct (x >= 25 implies x >= 20 and x > 20, not x > 25), and A's time lies
 within B's (a level on a date, or a decision on it, within that date and within any window of hitting containing it; a
@@ -145,11 +145,6 @@ def interval(r: dict) -> tuple[float, bool, float, bool]:
 
 def _equal(a: float, b: float) -> bool:
     return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
-
-
-def _holds(x: float, relation: str, v: float) -> bool:
-    return {">=": x >= v or _equal(x, v), ">": x > v and not _equal(x, v), "<=": x <= v or _equal(x, v),
-            "<": x < v and not _equal(x, v), "==": _equal(x, v)}[relation]
 
 
 def within(a: dict, b: dict) -> bool:

@@ -1,41 +1,41 @@
 """Impact: what an event's worlds do to the portfolio (MATH.md 1.1, 1.3 to 1.7).
 
-The worlds. An event's worlds are its Yes and its No side, each one world until ways are given (1.1). Each has its
-probability, p and 1 - p from the event's, and the weight today's prices put on it: its probability, or the weight
-the analyst states for the event (`priced_in`), a figure or a market read live, shared within each side as the
-probabilities divide it (1.5). One world is the baseline, which the analyst names on the event.
+The worlds. An event's worlds are its outcomes left whole: its Yes and No sides, or the ways the analyst gives them
+(1.1). Each has its probability, read from its structure (1.2), and the weight today's prices put on it: its
+probability, or the weight the analyst states on the event or a way (`priced_in`), a figure or a market read live, the
+worlds beneath it sharing it as our probabilities divide them (1.5). One world is the baseline, which the analyst names
+on the event.
 
-The four steps (worlds.py does the arithmetic):
-- which shock applies in a world: a consequence on the event gives its shock to every world on the other side from the
-  baseline (1.3);
-- each factor's move against the baseline: a shock is a fraction of its price in the baseline; on a factor quoted as
-  the yield its proxy pays, in points of that yield, which move it by -duration/100 per point, its compounded move
-  (1.3); a factor no consequence sets
-  takes ln(1 + x_U) = cov(U, S) cov(S, S)^-1 ln(1 + x_S) from the set ones (1.3), and a factor stated at -1 is set
-  at zero and fills nothing;
-- each named company's whole move against the baseline: its stated shock where one sets it, and where none does in a
-  world, its betas' compounded move there (1.4);
-- where each price stands against today (1.5): every price placed once by L_base = c / sum q (1 + s), from its move
-  against the baseline: each factor's, a factor quoted as a yield by the price its yield gives; and each name's.
-  The factors' placed moves in the orthogonalized basis are the world's u~.
+Which shock applies in a world: a consequence on the event gives its shock to every world on the other side from the
+baseline, and one on a way to that way and the ways under it, the one nearest above a world applying there (1.3).
+The three steps after the probabilities then read them (worlds.py does the arithmetic):
+- each factor's compounded move against the baseline: a shock states its whole move or its residual, in points of its
+  yield for a factor quoted as one; each factor whose whole move is not stated takes its mean given every condition
+  stated, ln(1 + x_U) = cov(U, S) cov(S, S)^-1 ln(1 + x_S) for whole moves, over a named episode's covariance where
+  the world has one; a factor stated at -1 stands at zero (1.3). The factors' compounded residuals are the world's z_w;
+- each stated name's whole move against the baseline (1.4): the shock where it states the whole move, and where it
+  states the residual, the name's response compounded with it, 1 + s = (1 + r)(1 + a);
+- where each price stands against today (1.5): every price the store places is placed once, L_base = c / sum q (1 + s).
+  The factors' placed moves, each less its regression on the earlier factors' residuals, are the world's u~.
 
 Each holding is then valued in each world (1.6). A price left unstated stands against the baseline at its response,
-exp(b . z_w), the same relation at every level of the price; a stated name at its shock; a name quoted in another
-currency at its local price times its rate, each against the baseline, the rate read from the factor whose proxy it is
-or else the currency's own response; a fund the look-through expands at its own response with the own parts of the
-companies a shock sets on the exposure through it; a fund whose price a shock sets, by that price. Each price is then
-placed once, so every holding's worlds average to its value today at the weights. A fund that pays a multiple of its
-reference each session stands at that multiple of its reference's placed move, at zero below it, and is not placed
-again: where it stands at zero its worlds come to more than its value today, the difference its expected value. A
-company's price is placed once, and every exposure to it moves by it; a fund's own value moves by its own price, and its
-remainder takes the difference. Each world's P&L reads as each factor's dollar beta times its placed move, each stated
-company's own part (its placed move less its placed response's), and what compounding adds beyond those, the curve.
+exp(b . z_w); a name quoted in another currency at its local price times its rate, the rate the level of the factor
+whose proxy it is, or else the currency's own response; a fund the look-through expands at its response, with what each
+stated company it carries does beyond its response on the dollars it carries of it. A fund valued by its terms, a
+multiple of one reference or its contracts, is worth what its terms give in each world, and is not placed: where it
+stands at zero, its worlds come to more than its value today at the weights, and the difference is its expected value.
+A statement on a fund valued from where it stands unstated sets each world's value from there: a whole move from the
+baseline's, times 1 + s, and a residual from that world's, times 1 + a. A holding the analyst values world by world is
+worth what its stated values give there (valuation.py). Read with other events (1.9), each name the rows move stands in
+each joint world at the move they give it (`joint_prices`, `joint_responses`; together.py).
 
-A world's P&L is the holdings' changes in value summed (1.1). Each name's share there is its exposure times its whole
-move there, and each fund's remainder its contribution less what the companies and the funds it holds contribute, so
-the names' shares and the remainders come to the holdings', and the holdings' to the world's P&L (1.7). The row's
-figures are read from the worlds (worlds.row). A price at zero in every world today's prices carry has no placing:
-the event then has no figures, and check() lists it (1.10).
+A world's P&L is the holdings' changes in value summed (1.1), read in three parts: each factor's dollar beta times its
+placed move, g . u~_w; what each stated company does beyond its response, on every dollar of exposure to it; and the
+curve, what compounding and a holding's terms add beyond those (1.6). Each name's share is its exposure times its placed
+move, and each fund's remainder its contribution less what the companies and the funds it holds contribute, so the
+names' shares and the remainders come to the holdings', and the holdings' to the world's P&L (1.7). The row's figures
+are read from the worlds (worlds.row). A price at zero in every world today's prices carry cannot be placed: the event
+then has no figures, and check() lists it (1.10).
 """
 
 from __future__ import annotations
@@ -253,25 +253,21 @@ def _applies(m: dict) -> dict[str, dict]:
             x = parent.get(x)
         if side[w] != side[base]:
             path.append(m["event"])
-        for node in path:
-            for c in on.get(node, []):
+        for above in path:
+            for c in on.get(above, []):
                 if c["target"] in out[w]:
                     continue
-                own = node == w or (node == m["event"] and w in ("yes", "no"))
+                own = above == w or (above == m["event"] and w in ("yes", "no"))
                 out[w][c["target"]] = {"link": c["link"], "shock": c["shock"],
                                        schema.AGAINST: c.get(schema.AGAINST, schema.BASELINE),
-                                       "on": node, "by": "own" if own else "parent"}
+                                       "on": above, "by": "own" if own else "parent"}
     return out
-
-
-def _impact_compute(m: dict, load) -> dict:
-    return compute(m, load)
 
 
 class Moves:
     """Steps 2 and 3 for an event's worlds (MATH.md 1.3, 1.4), which no probability or weight enters: which shock applies
-    in each world; every factor's compounded move against the baseline, set or filled (`logs`, `x`), and its own part
-    (`z`); each name a shock sets, its whole move against the baseline (`whole`); each currency's rate against the
+    in each world; every factor's compounded move against the baseline, set or filled (`logs`, `x`), and its compounded
+    residual (`z`); each name a shock sets, its whole move against the baseline (`whole`); each currency's rate against the
     baseline (`rate_base`); and any name's move against the baseline (`against`), by its stated shock or its response.
     The impact places them at the weights; a chance that follows a holding's price places them at its own."""
 
@@ -296,7 +292,7 @@ class Moves:
                     continue
                 if a[schema.AGAINST] == schema.FOLLOWS and (t in yields or a["shock"] > -1.0):
                     # against what it follows: its move beyond the factors before it, in its compounded terms, a
-                    # condition on its own part; at -1 it stands at zero wherever they put it, as at -1 against the
+                    # condition on its residual; at -1 it stands at zero wherever they put it, as at -1 against the
                     # baseline
                     owned[t] = (-yields[t]["duration"] * a["shock"] / 100.0 if t in yields
                                 else math.log1p(a["shock"]))
@@ -312,8 +308,8 @@ class Moves:
                                        owned, self.coef)
         logs = self.logs
         self.x = {w: {c: math.expm1(logs[w][c]) for c in ids} for w in W}  # each factor's move against the baseline
-        # each world's z_w (1.3): every factor's own part, its compounded move less its regression on the earlier
-        # factors' own parts; a factor at zero there has no compounded move, and no own part after it has one either
+        # each world's z_w (1.3): every factor's compounded residual, its compounded move less its regression on the
+        # earlier factors' residuals; a factor at zero there has no compounded move, and no residual after it has one
         self.z = {w: worlds.orthogonal(ids, self.coef, logs[w]) if all(math.isfinite(v) for v in logs[w].values())
                   else {c: None for c in ids} for w in W}
         self.columns = {c: worlds.orthogonal(ids, self.coef, {k: float(k == c) for k in ids}) for c in ids}
@@ -369,9 +365,10 @@ class Moves:
         return math.exp(live) * dead
 
     def against(self, n: str, *, responding: bool = False) -> dict[str, float]:
-        """A name's price in each world against its price in the baseline (1.6): its stated shock where one sets it,
-        else its response, exp(b . z_w); for a name quoted in another currency, times its rate against the baseline.
-        `responding` gives the response alone, as a stated name's own part reads it."""
+        """A name's price in each world against its price in the baseline (1.6): the whole move a shock settles where
+        one sets it (`whole`), else its response, exp(b . z_w); for a name quoted in another currency, times its rate
+        against the baseline. `responding` gives the response alone, which what a stated name does beyond its response
+        is measured from."""
         if n in self.whole and not responding:
             local = {w: 1.0 + self.whole[n][w] for w in self.W}
         else:
@@ -437,7 +434,8 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
         return {w: joint[w] if w in joint else own[w] for w in W}
 
     def own_price(n: str, *, responding: bool = False) -> dict[str, float]:
-        """A name's observed price placed by its stated shock or fitted response, before contractual replacements."""
+        """A name's price in each world against today: its move against the baseline (against_baseline), placed once
+        (1.5)."""
         got = place(n, against_baseline(n, responding=responding))
         return {w: 1.0 + v for w, v in (got or {w: 0.0 for w in W}).items()}
 
@@ -445,17 +443,13 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
     # are fitted beside the portfolio's names (channels.read_beside); one whose reference has none moves by its own price
     multiples = valuation.on_one_reference(looked, b_of)
     R: dict[str, dict[str, float]] = {}
-    ref_prices: dict[str, dict[str, float]] = {}
     normal: dict[str, dict[str, float]] = {}
     components = valuation.fund_components(looked, load(m["fund_rows"])["rows"])
     worth_values, worth_terms, evaluating = {}, {}, set()
     worth_targets = {item["target"] for item in m.get("worth") or []}
     option_specs = m.get("option_funds") or {}
     remainder_ratios = {}
-    # a fund stated against what it follows, and against the baseline nowhere, whose own valuation is not its
-    # response alone: it is valued from where it stands unstated, by its response with the companies it holds, its
-    # multiple of its reference, or its contracts, and the statement scales its worlds by 1 + a, keeping their average
-    # at the weights where it stood unstated (MATH.md 1.6)
+    # each stated name, the statement that sets it in each world it applies in
     against_of = {n: {w: applies[w][n] for w in W if n in applies[w]} for n in shocked}
     joint_prices = m.get("joint_prices") or {}
     base_world = m["baseline"]
@@ -465,7 +459,7 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
         expands, on one reference, or of contracts, whatever its worlds state. Every other stated price is its whole
         moves settled from its response (Moves.whole), placed once (own_price)."""
         return n in option_specs or n in multiples or n in components
-    unstated: dict[str, dict[str, float]] = {}  # a scaled fund's worlds where it stands unstated
+    unstated: dict[str, dict[str, float]] = {}  # a stated fund valued from where it stands unstated: its worlds there
 
     def responding(n):
         if n not in normal:
@@ -502,10 +496,11 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
         return responding(n) if n in named else own_price(n)
 
     def completed(n):
-        """One actual security price, reused by holdings, consideration, references and funds above it: a holding
-        valued by what it is worth, at that; a price a shock sets against the baseline, at it; one a shock sets against
-        what it follows, from where it stands unstated scaled by 1 + a, its worlds' average at the weights kept (1.6);
-        any other where it stands unstated."""
+        """A security's price in each world against today, worked out once and read wherever it is held, paid or
+        referred to (1.6): a holding the analyst values world by world, at its stated values; a stated price valued
+        from where it stands unstated (from_unstated), at that value times what its statement gives in each world,
+        then placed once unless its terms value it; any other stated price, at its whole moves, placed once
+        (own_price); and a price left unstated, where it stands unstated (as_unstated)."""
         if n in R:
             return R[n]
         if n in evaluating:
@@ -544,10 +539,6 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
         responding(n)
         return result
 
-    def reference_price(n):
-        ref_prices[n] = completed(n)
-        return ref_prices[n]
-
     def factor_reference(ticker):
         # A listed security's completed price includes the companies and contracts it holds.
         # An index's own values, with no security identity, can coincide with a factor proxy.
@@ -562,9 +553,8 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
                       *(n for n in m["holds"].values() if n.startswith("name:") and n not in unpriced)})
     for n in priced_:
         completed(n)
-    option_terms, option_prices = option_book.terms, option_book.prices
-    # each stated company's own part: against the baseline, its stated move less its response's (1.4); against today,
-    # its placed move less its response's placed move (1.6)
+    option_terms = option_book.terms
+    # what each stated name does beyond its response, d~ (`own`): its placed move less its response's placed move (1.6)
     own = {n: (lambda resp: {w: R[n][w] - resp[w] for w in W})(responding(n)) for n in named if n in R}
     # a fund scaled from where it stands unstated has its move against the baseline from its worlds as valued (1.4)
     base = m["baseline"]
@@ -583,15 +573,14 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
     d = {n: {w: (1.0 + whole[n][w]) / followed(n, w) - 1.0 if followed(n, w) > TOL else None for w in W}
          for n in shocked}
 
-    by_holding, shares, remainders = _shares(m, looked, W, R, own, named, multiples, completed, reference_price, along, b_of,
-                                             unpriced, term_funds=set(option_prices) - set(named))
+    by_holding, shares, remainders = _shares(m, looked, W, R, own, named, completed, along, b_of, unpriced)
     if unplaceable:
         return {"unplaceable": list(unplaceable.values()), "at_zero": sorted(at_zero), "p": m["p"], "baseline": m["baseline"]}
     reach = _reach(m, looked, named)
     g = m["g"]
     # each world's P&L is the holdings' changes in value there, summed (1.1, 1.6); its parts for the inspector are the
-    # holdings at their betas on the placed factors, g . u~, each named company's own part on every dollar of exposure
-    # to it, and what scaling adds to a holding beyond those, at a floor or a rate
+    # holdings at their betas on the placed factors, g . u~, what each stated company does beyond its response on every
+    # dollar of exposure to it, and the curve, what compounding and a holding's terms add beyond those
     A = {w: sum(h["worlds"][w] for h in by_holding) for w in W}
     figures = worlds.row(ws, A)
     tree = worlds.tree(ws, m.get("tree") or {}, A, q)
@@ -631,7 +620,7 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
             "consequences": shown, "consequence_set": sorted({t for w in W for t in applies[w]
                                                              if not t.startswith("name:")}),
             "names_set": named, "whole": whole, "d": d, "at_zero": sorted(at_zero), "reach": reach,
-            "name_ratios": R, "unstated": unstated, "reference_ratios": ref_prices, "rate_base": rate_base,
+            "name_ratios": R, "unstated": unstated, "reference_ratios": {}, "rate_base": rate_base,
             "holding_ratios": {h["holding"]: {w: 1 + h["worlds"][w] / m["values"][h["holding"]]
                                                 if m["values"][h["holding"]] else 1.0 for w in W} for h in by_holding},
             "valuation_terms": {"worth": worth_terms, "options": option_terms, "contracts": m.get("contracts", [])},
@@ -649,8 +638,8 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
 
 def _parts(W: list[str], ids: list[str], g: dict, ut: dict, by_holding: list[dict], A: dict) -> dict[str, dict]:
     """Each world's P&L in its three parts (MATH.md 1.6, "What moved it"), for the inspector: each factor's dollar beta
-    times its placed move there, g[c] * u~_w[c]; each stated company's own part on every dollar of exposure to it, as
-    the holdings carry it; and what is left, curve_w. Read from the holdings, so they add to the world's P&L."""
+    times its placed move there, g[c] * u~_w[c]; what each stated company does beyond its response on every dollar of
+    exposure to it, as the holdings carry it; and what is left, curve_w. Read from the holdings, so they add to the world's P&L."""
     out = {}
     for w in W:
         factors = {c: g.get(c, 0.0) * ut[w][c] for c in ids}
@@ -663,8 +652,9 @@ def _parts(W: list[str], ids: list[str], g: dict, ut: dict, by_holding: list[dic
 
 
 def _reach(m: dict, looked: dict, named: list[str]) -> dict[str, float]:
-    """The dollars each named name's own part reaches in the full impact: its exposure, less what it has through a fund
-    whose own price a shock sets (whose move already holds it), and for such a fund, its holding."""
+    """The dollars on which what each stated name does beyond its response reaches the full impact: its exposure, less
+    what it has through a fund whose own price a shock sets (whose move already holds it), and for such a fund, its
+    holding."""
     held: dict[str, list[str]] = {}  # each name's holdings: a company can be held by several of its securities
     for hid, nid in m["holds"].items():
         held.setdefault(nid, []).append(hid)
@@ -683,10 +673,10 @@ def _reach(m: dict, looked: dict, named: list[str]) -> dict[str, float]:
 
 def _levels(m: dict, whole: dict, q: dict, W: list[str], moves: dict, valued: dict | None = None) -> dict[str, dict]:
     """The level in each world of each price a consequence sets, where it has a price today (MATH.md 1.5; TOOLS.md 5): a
-    factor's,
-    its proxy's price at the factor's placed move; with, for a factor quoted as a yield, the yield its placed price
-    implies, y - 100 ln(1 + m_w) / duration; a name's, its own price, in its own currency, placed from its whole move
-    in each world, stated or by its response. So the levels shown and the dollars are one calculation."""
+    factor's, its proxy's price at the factor's placed move; with, for a factor quoted as a yield, the yield its placed
+    price implies, y - 100 ln(1 + m_w) / duration; a name's, its own price, in its own currency, placed from its whole
+    move in each world, stated or by its response, or, for a fund valued from where it stands unstated (`valued`), at
+    its worlds as valued. So the levels shown and the dollars are one calculation."""
     yields = m.get("yields") or {}
     out: dict[str, dict] = {}
     for c in m["consequences"]:
@@ -695,7 +685,7 @@ def _levels(m: dict, whole: dict, q: dict, W: list[str], moves: dict, valued: di
             continue
         got: dict = {}
         if t.startswith("name:"):
-            if t in (valued or {}):  # valued from where it stands unstated, its worlds' average kept (1.6)
+            if t in (valued or {}):  # valued from where it stands unstated: at its worlds as valued (1.6)
                 placed_ = {w: valued[t][w] - 1.0 for w in W}
             else:
                 try:
@@ -718,10 +708,9 @@ def _shown(m: dict, applies: dict, x: dict, logs: dict, z: dict, whole: dict, d:
            abroad: dict, rate: dict, rate_by: dict, levels: dict) -> dict[str, dict]:
     """What each consequence sets, by its link, in each world it applies in, against the baseline (MATH.md 1.3, 1.4): a
     factor's move as stated (`raw`), its compounded move, ln(1 + x) (`compounded`), the part of it the earlier
-    factors' own parts give (`implied`), and its own part in z_w (`own_part`), so that the compounded move is the last
-    two summed; a name's whole move, its response's move
-    (`betas`), and its own part, with its currency's rate against today where it is quoted in another; and the price's
-    level today and in each world."""
+    factors' residuals give (`implied`), and its compounded residual in z_w (`own_part`), so that the compounded move
+    is the last two summed; a name's whole move, its response's move (`betas`), and its residual (`d`), with its
+    currency's rate against today where it is quoted in another; and the price's level today and in each world."""
     out: dict[str, dict] = {}
     for c in m["consequences"]:
         t = c["target"]
@@ -744,17 +733,17 @@ def _shown(m: dict, applies: dict, x: dict, logs: dict, z: dict, whole: dict, d:
     return out
 
 
-def _shares(m: dict, looked: dict, W: list[str], R: dict, own: dict, named: list[str], multiples: dict, ratio,
-            reference_price, along, b_of, unpriced: set[str], term_funds: set[str] | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+def _shares(m: dict, looked: dict, W: list[str], R: dict, own: dict, named: list[str], completed, along, b_of,
+            unpriced: set[str]) -> tuple[list[dict], list[dict], list[dict]]:
     """Each holding's change in value in each world, each name's share, and each fund's remainder (MATH.md 1.6, 1.7).
 
-    A holding of a company, or of a fund booked whole, moves by its name's price (`R`); a fund the look-through expands
-    by its own price, its response placed once with the placed own parts of the companies a shock sets on the exposure
-    through it, or by its own placed price where a shock sets it. Each fund on a path contributes its dollars there at its own
+    A holding moves by its security's price (`R`, as `completed` values it): a fund the look-through expands by its
+    response, placed once, with what each stated company it carries does beyond its response on the dollars it carries
+    of it, or at its own statement where one sets it. Each fund on a path contributes its dollars there at its own
     price, and its remainder is that less what the names and the funds it holds at the next level contribute. A name's
     share is its exposure times its placed move, R - 1, in each world. Each share keeps its parts: its dollar beta times
-    the placed factors' moves, its own part, and what compounding adds beyond them (`curve`); a share is kept wherever
-    it shows anything (_shows)."""
+    the placed factors' moves, what it does beyond its response (`own`), and the curve, what compounding and its terms
+    add beyond them; a share is kept wherever it shows anything (_shows)."""
     funds = looked.get("funds") or {}
     reaches = looked.get("reaches") or {}
     held_set = {nid for nid in m["holds"].values() if nid in named and (funds.get(ticker_of(nid)) or {}).get("expanded")}
@@ -762,13 +751,6 @@ def _shares(m: dict, looked: dict, W: list[str], R: dict, own: dict, named: list
     def sides(vals: dict[str, float]) -> dict:
         ys, ns = (worlds.side_mean(m["worlds"], vals, s) for s in ("yes", "no"))
         return {"full_impact": ys - ns, "yes": ys, "no": ns, "worlds": vals}
-
-    def fund_price(fid: str, dollars: float, beneath: list[dict]) -> dict[str, float]:
-        """A fund's price on a path against today: its own placed price where a shock sets it; else its response,
-        placed once, with each stated company's placed own part on the dollars it carries of it, so every exposure to
-        the company moves by the company's price (1.6). A fund that pays a multiple of its reference each session takes
-        its reference's placed move with those own parts in it, at its multiple and at zero below."""
-        return R.get(fid) or ratio(fid)
 
     by_holding: list[dict] = []
     remainders: dict[str, dict] = {}
@@ -792,13 +774,13 @@ def _shares(m: dict, looked: dict, W: list[str], R: dict, own: dict, named: list
         reaching = [x for x in (looked.get("paths") or {}).get(hid, []) if x["name"] not in unpriced]
         top = next((f for f in reaches.get(hid, []) if not f["funds"]), None)  # the held fund, where it is expanded
         if top is not None:
-            price = fund_price(nid, value, reaching) if nid not in held_set else R[nid]
+            price = completed(nid)
         else:
             price = R.get(nid) or {w: 1.0 for w in W}
         change = {w: value * (price[w] - 1.0) for w in W}
         at_betas = {w: value * along(b_of(nid), w) for w in W}
-        # the own parts the holding carries: its own where a shock sets its price, or, for a fund the look-through
-        # expands, those of the companies a shock sets on the exposure through it
+        # what the holding carries of stated names beyond their responses: its own where a shock sets its price, or, for
+        # a fund the look-through expands, that of each stated company on the exposure through it
         if nid in own and (top is None or nid in held_set):
             own_of = {nid: value}
         elif top is not None:
@@ -828,8 +810,7 @@ def _shares(m: dict, looked: dict, W: list[str], R: dict, own: dict, named: list
         for f in reaches.get(hid, []):
             path = [*f["funds"], f["fund"]]
             fid = schema.name_id(f["fund"])
-            beneath = [x for x in reaching if x["funds"][:len(path)] == path]
-            fp = price if not f["funds"] else fund_price(fid, f["dollars"], beneath)
+            fp = price if not f["funds"] else completed(fid)
             contribution = {w: f["dollars"] * (fp[w] - 1.0) for w in W}
             names_next = {w: sum(x["dollars"] * (R[x["name"]][w] - 1.0) for x in reaching
                                  if x["funds"] == path and x["name"] in R) for w in W}
@@ -837,9 +818,7 @@ def _shares(m: dict, looked: dict, W: list[str], R: dict, own: dict, named: list
             for y in reaches[hid]:
                 if y["funds"] != path:
                     continue
-                ypath = [*y["funds"], y["fund"]]
-                yp = fund_price(schema.name_id(y["fund"]), y["dollars"],
-                                [x for x in reaching if x["funds"][:len(ypath)] == ypath])
+                yp = completed(schema.name_id(y["fund"]))
                 for w in W:
                     funds_next[w] += y["dollars"] * (yp[w] - 1.0)
             r = {w: contribution[w] - names_next[w] - funds_next[w] for w in W}
@@ -898,7 +877,7 @@ IMPACT_FIELDS = ("u_E", "full_impact", "contributors", "by_holding", "yes", "no"
                  "worlds")
 
 
-IMPACT = Derivation("impact", 42, "Proposition", _impact_inputs, _impact_compute, fields=IMPACT_FIELDS,
+IMPACT = Derivation("impact", 42, "Proposition", _impact_inputs, compute, fields=IMPACT_FIELDS,
                     applies=lambda store, pid: store.watched(pid))
 
 # The first version of the impact whose manifest holds what the analyst states of a price as a fraction of it: a shock,
@@ -988,7 +967,7 @@ def _against_inputs(ctx: Inputs, pid: str) -> dict:
 
 def _against_compute(m: dict, load) -> dict:
     """Each world of an event against its baseline, whatever its probability's state (MATH.md 1.3, 1.4, 1.6): each
-    factor's move there and its own part, each stated name's whole move and its own part, each holding's value there
+    factor's move there and its residual, each stated name's whole move and its residual, each holding's value there
     less its value in the baseline, and the portfolio's, its holdings summed.
 
     It is the impact's own valuation with today's price standing at the baseline: all the weight on the baseline, so
@@ -1111,6 +1090,7 @@ def _quotes_compute(m: dict, load) -> dict:
 
 
 QUOTES = Derivation("quotes", 1, "quotes", _quotes_inputs, _quotes_compute, fields=("levels",))
+
 
 def _worth_inputs(ctx: Inputs, lid: str) -> dict:
     link = ctx.link(lid)

@@ -1,16 +1,10 @@
-"""The page's one renderer: the portfolio panel, the ledger, an opened event, a holding, a factor, the inspector, the
-id chips, and the ledger as markdown, each read from the store, in the reader's terms: probability, priced in, beta and
-dollar beta, shock, full impact, contributors, depth, look-through exposure.
+"""The page's one renderer: the portfolio panel, the ledger, an opened event, a holding, a factor, a market, a
+figure's working, the conversation's id chips, and the ledger as markdown, each read from the store and named in the
+words its reader uses.
 
 Every figure is a derived field, or an output or input of the Computation or Judgment that is its basis; nothing here
-computes a number of its own. Its arithmetic is rounding, each kind of figure in one form wherever it appears, whatever
-its size: money a statement shows (a holding's value, the total, a price, a day's change) to the cent; money the
-system computes in whole dollars, a figure that is nothing as shown reading "–", and parts shown together apportioned
-so that they add to their whole as shown; a probability, a market's price among them, a percent to one decimal; a
-move, and an event's share of the portfolio, a percent to two; a weight a percent to one; a beta two decimals; a level
-two decimals in its unit. The inspector's working is to the cent, each fraction in it a percent to four decimals; the
-full details keep every value exact. A chart's points are a stored series: a price's daily closes to its latest mark,
-or the history of the market that prices an event, one minus it where the event is the market's opposite.
+computes a number of its own. Its arithmetic is rounding, each kind of figure in one form wherever it appears (the
+section on numbers, below), and apportioning, so that parts shown together add to their whole as shown.
 
 A render reads the store under its lock. While the analyst works, the page renders from what the store already holds
 (`cache_only`): a value that waits on the judge or a data client shows as a quiet placeholder where it will sit, and
@@ -56,7 +50,7 @@ MINUS = "\u2212"
 LISTS_SHOWN = 5  # each list of where the portfolio's weight is, as the portfolio panel shows it before it opens
 DOWNLOAD_SHOWN = 10  # each of those lists in the download
 CONSTITUENTS_SHOWN = 12  # a fund's constituents shown before "all of them"
-LISTED = 15  # the rows an inspector table lists before "and N more"
+LISTED = 15  # the rows a list of where the portfolio's weight is shows before "Show N more"
 EVENTS_SHOWN = 5  # the events a holding's page lists, those that move it most
 SMALL = 0.005  # a holding carrying under half a percent of a factor's exposure is not listed by name
 ZERO = 1e-12  # a bound this near 0 or 1 is there: no market sets that end of the range
@@ -84,9 +78,6 @@ def money(x: float | None, *, sign: bool = False) -> str:
     return f"{_lead(x, r == 0, sign)}${r:,.2f}"
 
 
-dollars = money  # every dollar figure on the page, a fact or an estimate, is exact to the cent
-
-
 def apportion(parts: list[float], whole: float | None = None) -> list[int]:
     """Parts to whole units that add to the whole, itself rounded: each part rounded down, and the units still short
     of the whole given to the parts with the largest remainders. The whole is the parts' sum unless given."""
@@ -110,8 +101,12 @@ def to_cents(parts: list[float], whole: float | None = None) -> list[float]:
 # holding's value, the total, a price, a day's change) is exact to the cent (`money`); money the system computes from
 # them (what an event or a factor would do, a volatility, a dollar beta, what the look-through puts in a company, a
 # depth) is in whole dollars (`amount`), and is exact to the cent in the inspector's working, where it is checked. A
-# figure that is nothing as shown reads "–". A probability is a percent to one decimal, a move a percent to two, a
-# weight a percent to one, a beta two decimals. A chart's axis marks its places in thousands or millions ("−$40k").
+# figure that is nothing as shown reads "–". A probability is a percent to one decimal (`chance`); a market's bid,
+# ask and midpoint are in cents, as its venue quotes them (`cents`, `quotes`); a move, and an event's share of the
+# portfolio, a percent to two (`move`, `share`); a yield's change in percentage points of the yield (`points`); a weight
+# a percent to one; a beta two decimals; a level two decimals in its unit. The inspector's working is to the cent, each
+# fraction in it a percent to four decimals (`operand`); the full details keep every value exact. A chart's axis marks
+# its places in thousands or millions ("−$40k").
 
 NIL = "\u2013"  # a figure that is nothing as shown
 
@@ -278,28 +273,14 @@ def level(x: float | None, unit: str | None) -> str:
     return f"{lead}{r:,.2f} {escape(unit)}" if unit else f"{lead}{r:,.2f}"
 
 
-def difference(x: float | None, unit: str | None) -> str:
-    """A difference between two levels of a metric, in its unit, to two decimals: for a metric measured in percent, the
-    change of the percent it is quoted in, −0.40% from 4.95% to 4.55%."""
-    return level(x, unit)
-
-
 def stated_shock(store: Store, target: str, x: float | None) -> str:
-    """A shock as the analyst states it (MATH.md 1.3), a percent to two decimals: on a factor quoted as a yield, the
-    yield's own change, which the analyst states in percentage points of it, −0.60 pp; otherwise a move, the fraction
-    of the price in the baseline it states, as every move reads."""
+    """A shock as the analyst states it (MATH.md 1.3): on a factor quoted as a yield, in percentage points of the yield,
+    −0.60 pp; on any other price, a move, a percent to two decimals, −4.35%."""
     if x is None:
         return ""
     if quoted_as_yield(store, target):
         return points(x)
     return move(x)
-
-
-def shock(x: float | None, unit: str | None) -> str:
-    """A shock, the gap between where a metric ends with an event and without it: a difference with its sign,
-    +$20.57, −0.25%."""
-    text = difference(x, unit)
-    return f"+{text}" if x is not None and x > 0 and text[:1] != "+" else text
 
 
 def moment(iso: str | None) -> str:
@@ -320,14 +301,6 @@ def day(iso: str | None, *, year: bool = True) -> str:
     except ValueError:
         return escape(iso)
     return f"{d.strftime('%b')} {d.day}, {d.year}" if year else f"{d.strftime('%b')} {d.day}"
-
-
-def added(xs: list[float]) -> str:
-    """Dollar figures added, each sign written as the operation: −$8,219.37 + $42.20."""
-    out = money(xs[0])
-    for x in xs[1:]:
-        out += f" − {money(abs(x))}" if x < 0 else f" + {money(x)}"
-    return out
 
 
 # ---------------------------------------------------------------- reading the store
@@ -527,8 +500,8 @@ def pill(text: str, tone: str = "") -> str:
 
 
 def hero(kicker: str, *, figure: str = "", title: str = "", context: str = "", pills: Iterable[str] = ()) -> str:
-    """The head of a page on the right: what it is; its figure, or its title; what it belongs to; and how it was
-    set."""
+    """The head of a view: what it is; its figure, or its title; what it belongs to; and, as text, the state it is in
+    (open or closed, the baseline)."""
     shown = "".join(x for x in pills if x)
     parts = [f'<p class="kicker">{kicker}</p>']
     if figure:
@@ -896,13 +869,13 @@ def portfolio_panel(reader: Reader) -> str:
     view_ = portfolio_view(reader)
     if view_ is None:
         return ""
-    holdings, lt, shown = view_["holdings"], view_["lookthrough"], view_["shown"]
+    holdings, shown = view_["holdings"], view_["shown"]
     if holdings and shown.total is not None:
         moved = ""
         if shown.total_moved is not None:
-            moved = (f'<div class="dmove {_sign_tone(shown.total_moved)}">{num(dollars(shown.total_moved, sign=True))} '
+            moved = (f'<div class="dmove {_sign_tone(shown.total_moved)}">{num(money(shown.total_moved, sign=True))} '
                      f'({num(move(holdings.get("session_move")))})<span class="when">{_session(holdings)}</span></div>')
-        head = (f'<div class="total">{num(dollars(shown.total))}</div>{moved}{_volatility_line(reader)}'
+        head = (f'<div class="total">{num(money(shown.total))}</div>{moved}{_volatility_line(reader)}'
                 f'<div class="asof">{_when(reader.store, holdings)}</div>')
     else:
         head = f'<div class="total">{WAIT}</div><div class="asof">{_when(reader.store, holdings)}</div>'
@@ -911,10 +884,10 @@ def portfolio_panel(reader: Reader) -> str:
     for h in view_["holds"]:
         nid, hid = h["to"], h["id"]
         got = (holdings or {}).get("holds", {}).get(hid) or {}
-        value = num(dollars(shown.value[hid])) if hid in shown.value else WAIT
+        value = num(money(shown.value[hid])) if hid in shown.value else WAIT
         moved = ""
         if hid in shown.moved and _has_move(h):
-            moved = (f'<span class="mv n {_sign_tone(shown.moved[hid])}">{dollars(shown.moved[hid], sign=True)} '
+            moved = (f'<span class="mv n {_sign_tone(shown.moved[hid])}">{money(shown.moved[hid], sign=True)} '
                      f'({move(got.get("session_move"))})</span>')
         share = shown.value.get(hid)
         bar = (f'<span class="bar" aria-hidden="true"><i style="width:{100 * abs(share) / widest:.1f}%"></i></span>'
@@ -1366,7 +1339,8 @@ def _market_words(reader: Reader, r: dict) -> str:
 def _line(reader: Reader, r: dict, i: int, j: int, axis: dict | None) -> str:
     """An event's row: its title; its forecast, Yes, No and volatility under the ledger's heads, and beneath them,
     under the heads' second line, the market-implied range beneath the forecast and Yes's share of the portfolio
-    beneath Yes; the market's own price on a line of its own where it differs; its bar on the ledger's axis; and, where
+    beneath Yes; the event's own market's bid and ask on a line of its own where its midpoint and the forecast
+    differ; its bar on the ledger's axis; and, where
     its worst outcome is a way, that way. In the worst-outcome order, the worst outcome is marked where it stands.
     Each figure is the event's where it has it: its probability, or the range its statements leave it; and while the
     analyst works, a figure being worked out shows its place; a figure it does not have is not there."""
@@ -1442,24 +1416,7 @@ def _tone_whole(x: float | None) -> str:
     return "nil" if nothing(x) else "loss" if x < 0 else "gain"
 
 
-# ---------------------------------------------------------------- charts: the series each one draws
-
-
-def chart(points: list, *, kind: str, label: str, ranges: bool = False, mark: dict | None = None,
-          band: list | None = None, spark: bool = False, shown: str | None = None) -> str:
-    """A chart the page draws (app.js): its points, [date, value], of a price ("price") or a chance ("chance"), with
-    range buttons where it is long, opening on `shown` or else on all of it, a stretch to mark, and an interval at its
-    last point."""
-    if len(points) < 2:
-        return ""
-    # a price's points are to the cent, rounded once as the page rounds a price; a probability's keep their decimals
-    spec = {"kind": kind, "points": [[d, float(_half_up(v, "0.01")) if kind == "price" else round(v, 6)]
-                                     for d, v in points]}
-    spec.update({k: v for k, v in (("ranges", ranges), ("range", shown), ("mark", mark), ("band", band)) if v})
-    data = e(json.dumps(spec, separators=(",", ":")))
-    if spark:
-        return f'<span class="spark" data-chart="{data}" title="{e(label)}" role="img" aria-label="{e(label)}"></span>'
-    return f'<figure class="chart" data-k="chart" data-chart="{data}" role="img" aria-label="{e(label)}"></figure>'
+# ---------------------------------------------------------------- a probability in its place, or the range it lies in
 
 
 def _span(o: dict | None) -> str:
@@ -1495,13 +1452,15 @@ WAITING = ("wait",)
 
 
 def sentences(reader: Reader, r: dict) -> list[list]:
-    """A row's figures, each under its label and rounded where it is read: Forecast, with the market-implied range;
-    Yes, with its share of the portfolio; No; Full impact; Volatility; Largest contributors, with the funds they
-    are held through. Each row is a list of parts, its label first, ("b", label), then text, ("go", text, target),
+    """A row's figures, each under its label and rounded where it is read: Forecast, with the market-implied range and
+    the event's own market's bid and ask where its midpoint differs; Yes, with its share of the portfolio; No; Full
+    impact; Volatility; Worst outcome, with its outcome and its probability; Expected value, where it is not zero as
+    shown; Largest
+    contributors, with the funds they are held through. Each row is a list of parts, its label first, ("b", label), then text, ("go", text, target),
     ("aside", parts) for what reads beside the figure, or WAITING where a value is being worked out. A row with no
     consequence gives its probability only."""
     pid = r["id"]
-    p, lo, hi = r["probability"], _range(r)[0], _range(r)[1]
+    lo, hi = _range(r)
     out: list[list] = []
     # its figure, or the range its statements leave it, or its place while it is worked out; else nothing in its place
     P = [("go", _figure_p(r), f"x:p:{pid}")] if _figure_p(r) else [WAITING] if reader.reading_waits(pid) else []
@@ -1655,36 +1614,35 @@ def _passage_target(sid: str, passage: str) -> str:
     return f"x:passage:{sid}:{hashlib.sha256(passage.encode()).hexdigest()[:12]}"
 
 
-def _to_note(note: str, where: str = "above") -> str:
+def _to_note(note: str) -> str:
     """A link to the note the analyst gave its reasoning in, where the event's header holds it: its Rationale."""
     return f'<a class="to" data-to="{e(note)}" href="#">Rationale</a>'
 
 
-def _stated_basis(reader: Reader, value: dict, owner: str, *, below: Iterable[str] = (),
-                  where: str = "above") -> str:
-    """A stated assumption's basis, as a card: the page it cites, with each passage quoted; and the analyst's reasoning,
+def _stated_basis(reader: Reader, value: dict, owner: str, *, below: Iterable[str] = ()) -> str:
+    """A stated assumption's basis: the page it cites, with each passage quoted; and the analyst's reasoning,
     the note it was stated with, and, where what states it is a link, a statement of its own such as a consequence, any
     other note about that link; each note its first lines shown and the rest a click away, or, where it shows in the
-    event's notes, a pointer to it. A note about a proposition is about the proposition, which states several chances,
-    each with its own note, so it is the basis of none of them: the event's notes show it."""
+    event's Rationale, a link to it there. A note about a proposition is about the proposition, which states several
+    chances, each with its own note, so it is the basis of none of them: the event's Rationale shows it."""
     store = reader.store
     out = ""
     if value.get("source_id"):
         sid = value["source_id"]
         src = store.source_row(sid) or {}
-        quotes = "".join(f'<blockquote class="q" data-k="q{i}">{go(_passage_target(sid, passage), e(as_written(passage)), "go quote")}'
+        quoted = "".join(f'<blockquote class="q" data-k="q{i}">{go(_passage_target(sid, passage), e(as_written(passage)), "go quote")}'
                          f'</blockquote>' for i, passage in enumerate(value.get("passages") or []))
         dated = f" · {day(src.get('dated'))}" if src.get("dated") else ""
         head = (f'<p class="src"><a href="{e(src.get("url"))}" target="_blank" rel="noopener">{e(host(src.get("url")))}'
                 f'</a>{dated}</p>')
-        out += f'<div class="basis">{head}{quotes}</div>'
+        out += f'<div class="basis">{head}{quoted}</div>'
     notes = [value["note"]] if value.get("note") and store.type_of(value["note"]) == "Note" else []
     if store.type_of(owner) == "link":
         notes += [n["from"] for n in store.links_of(owner, "about", "in") if n["from"] not in notes]
     here = [n for n in notes if n not in below]
     if here:
         out += f'<div class="basis note">{fold("".join(note_html(store.stated_of(n).get("text")) for n in here))}</div>'
-    return out + "".join(f'<p class="ptr">{_to_note(n, where)}</p>' for n in notes if n in below)
+    return out + "".join(f'<p class="ptr">{_to_note(n)}</p>' for n in notes if n in below)
 
 
 def _stated_chance(store: Store, key: str) -> dict:
@@ -1744,30 +1702,10 @@ def _rests(reader: Reader, tags: Iterable[str], side: str, stretched: dict | Non
     return [x for x in out if x]
 
 
-def _how_chance(reader: Reader, r: dict) -> str:
-    """How the event's probability is worked out, where the markets below do not say it: total probability over the
-    cases its chances are given, or our estimate with its basis."""
-    pid, point = r["id"], r["point"]
-    rule = point.get("rule")
-    if r["probability"] is None:
-        return ""
-    if rule == "chance":
-        own = next((c for c in point.get("chances") or [] if not c["given"] and not c["given_not"]), None)
-        basis = _stated_basis(reader, _stated_chance(reader.store, own["key"]), pid, below=r["below"],
-                              where="below") if own else ""
-        return (f'<div class="how" data-k="how"><p class="lead">Analyst input, '
-                f'{gonum("x:p:" + pid, chance(r["probability"]))}</p>{basis}</div>')
-    if rule != "derived" or not point.get("terms"):
-        return ""
-    worked = _derivation(reader, pid, point, r["probability"], below=r["below"], where="below")
-    return f'<div class="how" data-k="how">{worked}</div>'
-
-
 LETTERS = "ABCDFGHJKLMNPQRSTUVWXYZ"  # each proposition a chance is given, E the one it is the chance of
 
 
-def _derivation(reader: Reader, pid: str, point: dict, p: float, *, below: Iterable[str] = (),
-                where: str = "above") -> str:
+def _derivation(reader: Reader, pid: str, point: dict, p: float) -> str:
     """A probability its chances fix, as a receipt (MATH.md 1.2): each proposition its chances are given; each case of
     them with its probability and the share of it in which E is true, stated by a chance or set by a link; E's
     probability beneath them, their sum, P(E) = sum of P(case) x P(E | case); then the basis of each chance."""
@@ -1795,7 +1733,7 @@ def _derivation(reader: Reader, pid: str, point: dict, p: float, *, below: Itera
                    eqn("= " + " + ".join(filled(t) for t in terms) + f" = {operand(p)}")])
     for t in terms:
         if t.get("chance"):
-            basis = _stated_basis(reader, _stated_chance(store, t["chance"]), pid, below=below, where=where)
+            basis = _stated_basis(reader, _stated_chance(store, t["chance"]), pid)
             if basis:
                 out += f'<h3 class="sub">Basis for {eqn(f"P(E | {case(t)})")}</h3>{basis}'
     return out
@@ -1813,34 +1751,29 @@ HOW_SET = {"market": "Midpoint", "read": "Read from the markets", "chance": "Ana
 
 
 def _how_set(reader: Reader, pid: str) -> str:
-    """How a proposition's probability is set, in a few words: a market's price; read from the markets, where its
-    market's price is read with the markets on related propositions; derived; or our estimate."""
+    """How a proposition's forecast is set, in the working's words: Midpoint, its own market's midpoint; Read from the
+    markets, that market read with the markets on related propositions; Analyst input, a chance the analyst states
+    on its own; and nothing where its conditional probabilities give it, whose own calculation opens from its name."""
     return HOW_SET.get(_reading_of(reader, pid).get("rule"), "")
 
 
-def _tree(store: Store, pid: str) -> tuple[dict[str, list[dict]], list[str]]:
-    """The event's structure, each proposition reached once from the event, by the first link or chance that reaches it:
-    a chance ties the proposition it is the chance of to each it is given."""
+def _reached(store: Store, pid: str) -> list[str]:
+    """The propositions the event's structure reaches, the event first, each once, in the order a walk from the event
+    meets them: by a link of the breakdown, and by a chance, which ties the proposition it is the chance of to each it
+    is given."""
     seen, queue, order = {pid}, deque([pid]), [pid]
-    nodes: dict[str, list[dict]] = {pid: []}
     while queue:
         here = queue.popleft()
-        ties = [link for link in store.links_of(here, direction="both") if link["relation"] in STRUCTURE]
-        ties += [{"id": f"{here}.chances[{i}]", "relation": "given", "from": here, "to": x, "stated": {}}
-                 for i, c in enumerate(store.stated_of(here).get("chances") or [])
-                 for x in (*c["given"], *c["given_not"])]
-        ties += [{"id": f"{q}.chances[{i}]", "relation": "given", "from": q, "to": here, "stated": {}}
-                 for q, i in store.given_by(here)]
-        for link in ties:
-            other = link["to"] if link["from"] == here else link["from"]
-            if other in seen:
-                continue
-            seen.add(other)
-            order.append(other)
-            nodes[here].append({"link": link, "id": other, "out": link["from"] == here})
-            nodes[other] = []
-            queue.append(other)
-    return nodes, order
+        near = [link["to"] if link["from"] == here else link["from"]
+                for link in store.links_of(here, direction="both") if link["relation"] in STRUCTURE]
+        near += [x for c in store.stated_of(here).get("chances") or [] for x in (*c["given"], *c["given_not"])]
+        near += [q for q, _ in store.given_by(here)]
+        for other in near:
+            if other not in seen:
+                seen.add(other)
+                order.append(other)
+                queue.append(other)
+    return order
 
 
 def _faint(store: Store, order: list[str]) -> dict[str, list[tuple[str, str]]]:
@@ -1904,7 +1837,7 @@ def _asks_sides(reader: Reader, lid: str) -> str:
 
 
 def _market_item(reader: Reader, link: dict) -> str:
-    """A market under the proposition it asks, as a card: its question and its midpoint, through the side it asks; its
+    """A market under the proposition it asks, as a row: its question and its midpoint, through the side it asks; its
     venue, whether it is open, its book as observed through that side, its depth, and where its price is not taken,
     that it is not used; who won, once it has settled (MATH.md 3.3)."""
     mid, lid = link["to"], link["id"]
@@ -2088,12 +2021,12 @@ def _probability_drawing(reader: Reader, r: dict) -> str:
         plot += (f'<a class="pt-band" data-go="{e("x:interval:" + pid)}" title="Market-implied range {e(_implied(r))}" '
                  f'style="left:{_pt_x(lo, dom)};width:calc({_pt_x(hi, dom)} - {_pt_x(lo, dom)})"></a>')
     if p is not None:
-        plot += (f'<a class="pt-dot pt-ours" data-go="{e("x:p:" + pid)}" style="left:{_pt_x(p, dom)}"></a>'
-                 + _pt_label(p, dom, gonum("x:p:" + pid, chance(p)), "pt-ourv"))
+        plot += (f'<a class="pt-dot pt-fc" data-go="{e("x:p:" + pid)}" style="left:{_pt_x(p, dom)}"></a>'
+                 + _pt_label(p, dom, gonum("x:p:" + pid, chance(p)), "pt-fcv"))
     elif left_open and _span(left_open):
         plot += (f'<a class="pt-open" data-go="{e("x:p:" + pid)}" style="left:{_pt_x(left_open["lo"], dom)};'
                  f'width:calc({_pt_x(left_open["hi"], dom)} - {_pt_x(left_open["lo"], dom)})"></a>'
-                 + _pt_label(left_open["hi"], dom, gonum("x:p:" + pid, _span(left_open)), "pt-ourv"))
+                 + _pt_label(left_open["hi"], dom, gonum("x:p:" + pid, _span(left_open)), "pt-fcv"))
     direct = (r.get("point") or {}).get("rule") == "chance"
     rows.append(f'<div class="pt-row pt-fore"><div class="pt-lab"><span class="pt-name">Forecast</span>'
                 f'<span class="pt-sub">{"Market-implied range " + f"<span class=nw>{e(_implied(r))}</span>" if bounded else "Analyst input" if direct else ""}</span></div>'
@@ -2124,13 +2057,11 @@ def _market_section(reader: Reader, r: dict) -> str:
     pid = r["id"]
     point = r.get("point") or {}
     basis = ""
-    if point.get("rule") == "chance":  # our estimate, stated on its own: its basis under it
+    if point.get("rule") == "chance":  # the analyst's input, stated on its own: its basis under it
         own = next((c for c in point.get("chances") or [] if not c["given"] and not c["given_not"]), None)
-        basis = _stated_basis(reader, _stated_chance(reader.store, own["key"]), pid, below=r["below"],
-                              where="below") if own else ""
-    open_ = _how_chance(reader, r) if r.get("probability") is None else ""
+        basis = _stated_basis(reader, _stated_chance(reader.store, own["key"]), pid, below=r["below"]) if own else ""
     store = reader.store
-    nodes, order = _tree(store, pid)
+    order = _reached(store, pid)
     faint = _faint(store, order)
     unused = "".join(f'<li>{go(mid, e(market_question(reader, mid) or mid), "go name")}'
                      f'<span class="pt-sub">{e(VENUES.get(split(mid)[0], split(mid)[0]))}</span>'
@@ -2138,14 +2069,15 @@ def _market_section(reader: Reader, r: dict) -> str:
     markets = any(store.links_of(q, "asks") for q in order) or any(schema.MARKET_ID_RE.match(q) for q in order)
     words = "" if markets else '<p class="none" data-k="none">No market bears on it.</p>'
     return (_probability_drawing(reader, r) + words + (f'<div class="how" data-k="how">{basis}</div>' if basis else "")
-            + open_ + _following(reader, point) + _history(reader, r)
+            + _following(reader, point) + _history(reader, r)
             + (f'<div class="pt-unused" data-k="unused"><span class="glab">Not used</span><ul>{unused}</ul></div>'
                if unused else "")
             + _searches(r, open_=not markets))
 
 
 def _following(reader: Reader, point: dict) -> str:
-    """The observed source of a moving estimate, including an implied weight that its worlds leave open."""
+    """A forecast that follows a market, or the weight a holding's price implies (MATH.md 1.2): the forecast and what it
+    follows, as stated and now, and how far it follows."""
     parts = []
     for chance_ in point.get("chances") or []:
         follow = chance_.get("follow") or {}
@@ -2340,8 +2272,8 @@ def _worth_values(reader: Reader, r: dict) -> str:
     for nid, value in stated.items():
         links = value.get("considerations") or {w: item["link"] for w, item in
                 ((out.get("valuation_terms") or {}).get("worth") or {}).get(nid, {}).items()}
-        rows = [(e(titles.get(wid, wid)), "", gonum(links[wid], money(amount)) if links.get(wid) else num(money(amount)))
-                for wid, amount in (value.get("levels") or {}).items()]
+        rows = [(e(titles.get(wid, wid)), "", gonum(links[wid], money(v)) if links.get(wid) else num(money(v)))
+                for wid, v in (value.get("levels") or {}).items()]
         implied = _implied_words(value.get("implied"))
         bases = []
         for lid in dict.fromkeys(links.values()):  # each basis under the world it is the basis of
@@ -2387,7 +2319,7 @@ def _worth_view(reader: Reader, lid: str) -> dict:
     if "return" in value:
         rows.append(("Its return since its price on", e(day(value["date"])), num(move(value["return"]))))
     out = reader.output("worth", lid) or {}
-    values = [(_world_label(reader.store, w), "", num(money(amount))) for w, amount in (out.get("levels") or {}).items()]
+    values = [(_world_label(reader.store, w), "", num(money(v))) for w, v in (out.get("levels") or {}).items()]
     body = receipt(rows)
     if values:
         body += '<h3 class="sub">Value today in each world</h3>' + receipt(values)
@@ -2436,8 +2368,9 @@ def event_view(reader: Reader, pid: str) -> dict:
 
 
 def _ws_strip(reader: Reader, r: dict) -> str:
-    """The event's figures in one strip, each under its label (TOOLS.md 9): the forecast, the range the markets imply and
-    a market's own price where it differs; then Yes, with its share of the portfolio, No, the full impact, the
+    """The event's figures in one strip, each under its label (TOOLS.md 9): the forecast, with its Calculation; the range
+    the markets imply; and the event's own market's bid and ask, with its midpoint, where the midpoint and the forecast
+    differ; then Yes, with its share of the portfolio, No, the full impact, the
     volatility, the worst outcome where it is a way, and the expected value where it is not zero as shown. Each opens
     its calculation."""
     pid, yes = r["id"], r.get("yes")
@@ -2527,7 +2460,7 @@ def _distribution_of(reader: Reader, r: dict) -> tuple[dict, str | None, bool]:
     with reader.engine.placeholders():
         found = reader.value("distribution", r["id"])
     if found is None:  # on a reply's turn, a distribution this read could not give is being worked out
-        return {}, None, bool(getattr(reader, "pending", False) and _worlds_of(r))
+        return {}, None, bool(reader.pending and _worlds_of(r))
     if found.waiting:
         return {}, None, True
     return found.output or {}, working(reader, found.basis), False
@@ -2654,7 +2587,7 @@ def _outcome_grid(reader: Reader, r: dict, only: tuple[str, ...] = ("moves", "le
     else:
         dist, opens, waiting = _distribution_of(reader, r)
         rows = [f'<tr><th>Probability</th>{cells(p_of)}</tr>',
-                f'<tr><th>P&amp;L</th>' + cells(lambda w: gonum(f"x:outcome:{pid}:{w['id']}", amount(w["A"]),
+                '<tr><th>P&amp;L</th>' + cells(lambda w: gonum(f"x:outcome:{pid}:{w['id']}", amount(w["A"]),
                                                                  _tone_whole(w["A"]))) + '</tr>']
         horizon = "".join(_horizon_rows(dist, opens, worlds)) if not waiting else "".join(
             f'<tr class="g2"><th>{k}, {e(day(reader.store.horizon_end(), year=False))}</th>'
@@ -2738,11 +2671,11 @@ def _moves_rows(reader: Reader, r: dict, worlds: list[dict], n: int) -> str:
                 if w["id"] == base:  # every move is against it: it has none of its own to show
                     tds.append(f'<td data-outcome="{e(w["id"])}" class="n base"></td>')
                 elif own and (how.get("consequence") or how.get("worth")):  # it opens what states it, with its basis
-                    target = "x:consequence:" + how["consequence"] if how.get("consequence") else how["worth"]
-                    stated = how.get("stated") or {}
-                    residual = (f'<span class="st-as">residual {e(factor_move(item, stated["value"]))}</span>'
-                                if schema.against(stated) == schema.FOLLOWS and stated.get("value") is not None else "")
-                    tds.append(f'<td data-outcome="{e(w["id"])}" class="n st">{gonum(target, figure, tone)}{residual}</td>')
+                    opens = "x:consequence:" + how["consequence"] if how.get("consequence") else how["worth"]
+                    said = how.get("stated") or {}
+                    residual = (f'<span class="st-as">residual {e(factor_move(item, said["value"]))}</span>'
+                                if schema.against(said) == schema.FOLLOWS and said.get("value") is not None else "")
+                    tds.append(f'<td data-outcome="{e(w["id"])}" class="n st">{gonum(opens, figure, tone)}{residual}</td>')
                     kinds.add("st")
                 else:
                     tds.append(f'<td data-outcome="{e(w["id"])}" class="n {"st" if own else "im"}">'
@@ -2817,8 +2750,8 @@ def _holdings_rows(reader: Reader, r: dict, worlds: list[dict], n: int) -> str:
     to its P&L as shown; largest first; each opening its working, with the names it reaches through a
     fund. A holding the event moves in no outcome, as shown, is not listed."""
     pid = r["id"]
-    working = (reader.computation((r.get("basis") or {}).get("by_holding")).get("output") or {}).get("by_holding")
-    hs = sorted(working or r.get("by_holding") or [], key=lambda h: -abs(h.get("full_impact") or 0.0))
+    found = (reader.computation((r.get("basis") or {}).get("by_holding")).get("output") or {}).get("by_holding")
+    hs = sorted(found or r.get("by_holding") or [], key=lambda h: -abs(h.get("full_impact") or 0.0))
     if not hs:
         return ""
     shown = {w["id"]: whole_parts([(h.get("worlds") or {}).get(w["id"], 0.0) for h in hs], w["A"]) for w in worlds}
@@ -2847,9 +2780,9 @@ def _neg(text: str, x: float | None) -> str:
 
 
 def _inspect_point(reader: Reader, pid: str) -> dict:
-    """The probability: the price of the market that asks it, total probability over the cases its chances are given,
-    or the analyst's estimate, each with its basis; or the range its statements leave it, with what each end rests
-    on."""
+    """A forecast's Calculation: the midpoint of the market that asks it, or that market read with the markets on
+    related propositions; the analyst's input, with its basis; or its conditional probabilities over the cases they are
+    given; or, where its statements leave it open, the range they leave, with what each end rests on."""
     store = reader.store
     d = reader.derived(pid, "Proposition", READING)
     p = _value(d, "probability")
@@ -3032,6 +2965,7 @@ def _inspect_price(reader: Reader, mid: str) -> dict:
         body.append(f'<h3 class="sub">Book</h3>{_book_table(out["book"])}')
     return {"title": f"Market: {q}", "html": head + "".join(body) + full(reader, v.basis if v else None)}
 
+
 def _today(reader: Reader, mid: str, unit: str | None) -> str:
     """Today's level and where it comes from: a holding's or a proxy's latest price, or the analyst's level from a
     page."""
@@ -3079,7 +3013,7 @@ def _inspect_consequence(reader: Reader, lid: str) -> dict:
     cid = _basis(d, "levels")
     out = reader.computation(cid).get("output") or {}
     what = target_label(store, moved)
-    kind, said = _stated(link)
+    _, said = _stated(link)
     x, against = said["value"], _against(link)
     c = out.get("c")
     title = f"Shock to {what}"
@@ -3187,25 +3121,25 @@ def _inspect_swing(reader: Reader, pid: str) -> dict:
     head = hero("Full impact", figure=e(money(D, sign=True)), context=go(pid, e(title)),
                 pills=[pill(f"Forecast {chance(p)}")])
     entries = []  # each line's label, what it multiplies, and its dollars
-    for c, amount in sorted(out["contributions"].items(), key=lambda kv: -abs(kv[1])):
+    for c, x in sorted(out["contributions"].items(), key=lambda kv: -abs(kv[1])):
         if not out["u_E"].get(c):
             continue
         moved = gonum(f"x:consequence:{setter[c]}", operand(out["u_E"][c], sign=True)) if c in setter else \
             num(operand(out["u_E"][c], sign=True))
-        entries.append((go(c, e(heading(names.get(c, c)))), f'{gonum(c, money(g.get(c)))} × {moved}', amount))
+        entries.append((go(c, e(heading(names.get(c, c)))), f'{gonum(c, money(g.get(c)))} × {moved}', x))
     own = out.get("own") or {}
     reach = out.get("reach") or {}
-    for n, amount in sorted(own.items(), key=lambda kv: -abs(kv[1])):
+    for n, x in sorted(own.items(), key=lambda kv: -abs(kv[1])):
         contracts = [h for h in out.get("by_holding") or [] if h["name"] == n and h.get("contract")]
         if contracts:
             entries.append((go(n, e(market_question(reader, n) or n)),
-                            " + ".join(_contract_operand(reader, pid, out, h) for h in contracts), amount))
+                            " + ".join(_contract_operand(reader, pid, out, h) for h in contracts), x))
             continue
         per = (out.get("own_moves") or {}).get(n, {}).get("E")
         moved = gonum(f"x:consequence:{setter[n]}", operand(per, sign=True)) if n in setter else \
             num(operand(per, sign=True))
         entries.append((f"{go(n, e(name_of(reader.store, n)))}, beyond its response",
-                        f"{gonum(n, dollars(reach.get(n)))} × {moved}", amount))
+                        f"{gonum(n, money(reach.get(n)))} × {moved}", x))
     curve = sum(((h.get("curve") or {}).get("full_impact") or 0.0) for h in out.get("by_holding") or [])
     if abs(curve) >= 0.005:
         entries.append(("The rest", "", curve))
@@ -3269,7 +3203,7 @@ def _sides(reader: Reader, pid: str, out: dict) -> list[tuple[str, str, str]]:
     rows.append(("Full impact", eqn("Yes − No"), num(money(out["full_impact"], sign=True))))
     if out.get("share_yes") is not None:
         rows.append(("Share of portfolio", worked("Yes / value", f"{_neg(money(out['yes']), out['yes'])} / "
-                                                                 f"{dollars(out['V'])}"), num(share(out["share_yes"]))))
+                                                                 f"{money(out['V'])}"), num(share(out["share_yes"]))))
     return rows
 
 
@@ -3340,14 +3274,15 @@ def _inspect_portfolio_volatility(reader: Reader, _: str) -> dict:
 
 
 def _inspect_holding(reader: Reader, rest: str) -> dict:
-    """What a holding does if the event happens: its dollars at the betas they move with, and each company's own shock
-    on its dollars there, which together are its contribution; then what is priced in. A fund with under a year of
-    prices moves as its holdings do, so its names are listed, each at its own move."""
+    """A holding's full impact: its P&L on Yes and on No; its dollars times its move at its betas, each stated
+    company's dollars in it times its move beyond its response, and the rest, adding to it; then its P&L in each
+    outcome, and the values of an option book it holds. A contract the portfolio holds is its quantity times its
+    discounted payoff times its win probability, less its value today."""
     store = reader.store
     pid, hid = rest[:rest.index(":", rest.index(":") + 1)], rest[rest.index(":", rest.index(":") + 1) + 1:]
     cid = _basis(reader.derived(pid, "Proposition", ("full_impact",)), "full_impact")
     rec = reader.computation(cid)
-    out, inputs = rec.get("output") or {}, rec.get("inputs") or {}
+    out = rec.get("output") or {}
     h = next((x for x in out.get("by_holding") or [] if x["holding"] == hid), None)
     if h is None:
         return _missing()
@@ -3357,7 +3292,6 @@ def _inspect_holding(reader: Reader, rest: str) -> dict:
     outcomes = stats([("Yes", num(money(h["yes"], sign=True), _tone(h["yes"])), ""),
                       ("No", num(money(h["no"], sign=True), _tone(h["no"])), "")])
     if h.get("contract"):
-        contract = h["contract"]
         rows = [("Full impact", _contract_operand(reader, pid, out, h), num(money(h["full_impact"], sign=True)))]
         each = [(e(o["title"]), _contract_operand(reader, pid, out, h, o["id"]),
                  num(money(h["worlds"][o["id"]], sign=True))) for o in _outcomes(reader, pid, out) if o["world"]]
@@ -3365,30 +3299,20 @@ def _inspect_holding(reader: Reader, rest: str) -> dict:
                 '<h3 class="sub">In each outcome</h3><p class="aside">Quantity × discounted payoff × win probability, '
                 'less its value today.</p>' + receipt(each))
         return {"title": f"{ticker}, full impact", "html": head + body + full(reader, cid)}
-    sensitivity = (((reader.output("g", "portfolio") or {}).get("by_holding") or {}).get(hid) or {}).get("sensitivity")
     at, own = h.get("at_betas") or {}, h.get("own") or []
     entries = []  # each line's label, what it multiplies, and its contribution
     if at.get("dollars") and abs(at.get("full_impact") or 0.0) >= 0.005:
-        how = "at its holdings' betas" if sensitivity == "holdings" else "at its betas"
-        entries.append((f"{e(ticker)}, {how}", f'{num(dollars(at["dollars"]))} × {num(operand(at.get("move"), sign=True))}',
+        entries.append((f"{e(ticker)}, at its betas", f'{num(money(at["dollars"]))} × {num(operand(at.get("move"), sign=True))}',
                         at["full_impact"]))
     for x in own:
         entries.append((f'{go(x["name"], e(name_of(reader.store, x["name"])))}, beyond its response',
-                        f'{num(dollars(x["dollars"]))} × {num(operand((out.get("own_moves") or {}).get(x["name"], {}).get("E"), sign=True))}', x["full_impact"]))
+                        f'{num(money(x["dollars"]))} × {num(operand((out.get("own_moves") or {}).get(x["name"], {}).get("E"), sign=True))}', x["full_impact"]))
     if abs(((h.get("curve") or {}).get("full_impact") or 0.0)) >= 0.005:
         entries.append((f"{e(ticker)}, the rest", "", h["curve"]["full_impact"]))
     terms = to_cents([x[2] for x in entries], h["full_impact"])  # to the cent, adding to the contribution as shown
     rows = [(label_, what, num(money(t, sign=True))) for (label_, what, _), t in zip(entries, terms)]
     body = [outcomes, ('<h3 class="sub">Exposure × move</h3>' + receipt(rows, ("Full impact", "", num(money(h["full_impact"], sign=True)))))
             if rows else '<p class="aside">Nothing it holds moves with the event.</p>']
-    if sensitivity == "holdings" and h["names"]:
-        reached = ((reader.computation((inputs.get("lookthrough") or {}).get("basis")).get("output") or {})
-                   .get("by_holding") or {}).get(hid) or {}
-        listed = [(go(n["name"], e(name_of(reader.store, n["name"]))),
-                   f'{num(dollars(reached.get(n["name"])))} × {num(operand(n.get("move"), sign=True))}',
-                   num(money(n["full_impact"], sign=True))) for n in h["names"][:LISTED]]
-        more = f'<p class="aside">{len(h["names"]) - LISTED} more.</p>' if len(h["names"]) > LISTED else ""
-        body.append(f'<h3 class="sub">By name</h3>{receipt(listed)}{more}')
     body.append(f'<h3 class="sub">In each outcome</h3>{receipt(_holding_in_each(reader, pid, out, h))}')
     body.append(_option_values(reader, pid, out, h["name"]))
     return {"title": f"{ticker}, full impact", "html": head + "".join(body) + full(reader, cid)}
@@ -3403,7 +3327,7 @@ def _option_values(reader: Reader, pid: str, out: dict, nid: str) -> str:
         name = ref.get("ticker") or ref.get("name") or ""
         heading_ = f'{name} {contract["kind"]} {contract["strike"]:g} · {day(contract["expiry"])}'
         rows = [("Observed price", "per underlying unit", num(money(contract["value_today"]))),
-                ("Initial pricing volatility", "annual", num(percent(contract["volatility"]))) ]
+                ("Initial pricing volatility", "annual", num(percent(contract["volatility"])))]
         for world, value in (contract.get("values") or {}).items():
             volatility = (contract.get("world_volatility") or {}).get(world)
             calibration = (contract.get("world_calibration") or {}).get(world) or {}
@@ -3463,7 +3387,7 @@ def _quote_lines(prices: dict) -> str:
     change, moved = prices.get("session_change"), prices.get("session_move")
     head = f'<div class="quote"><span class="px">{num(level(prices.get("price"), "USD"))}</span>'
     if change is not None and moved is not None:
-        head += f'<span class="chg {_sign_tone(change)}">{num(_signed_usd(change))} ({num(move(moved))})</span>'
+        head += f'<span class="chg {_sign_tone(change)}">{num(money(change, sign=True))} ({num(move(moved))})</span>'
     head += "</div>"
     what = {"last trade": "Last trade", "latest minute bar": "Latest minute's close",
             "latest hourly bar": "Latest hourly price", "close": "Close"}.get(prices.get("from"), "Price")
@@ -3471,14 +3395,18 @@ def _quote_lines(prices: dict) -> str:
     return head + f'<p class="aside">{when}</p>'
 
 
-def _signed_usd(x: float) -> str:
-    r = _half_up(abs(x), "0.01")
-    return f"{_lead(x, r == 0, True)}${r:,.2f}"
-
-
 def _price_chart(points: list, label: str, mark: dict | None = None, shown: str = "1Y") -> str:
-    """A price over time, opening on `shown`, a year, unless the series is shorter."""
-    return chart(points, kind="price", ranges=True, mark=mark, label=label, shown=shown)
+    """A price over time, as the page draws it (app.js drawChart): its points, [date, price], each to the cent as the
+    page rounds a price, with a button for each range the series covers, opening on `shown`, a year, or on all of it
+    where the series is shorter; and a stretch to mark."""
+    if len(points) < 2:
+        return ""
+    spec = {"kind": "price", "points": [[d, float(_half_up(v, "0.01"))] for d, v in points], "ranges": True,
+            "range": shown}
+    if mark:
+        spec["mark"] = mark
+    data = e(json.dumps(spec, separators=(",", ":")))
+    return f'<figure class="chart" data-k="chart" data-chart="{data}" role="img" aria-label="{e(label)}"></figure>'
 
 
 def _events_moving(reader: Reader, *, holding: str | None, nid: str) -> str:
@@ -3510,13 +3438,14 @@ def _events_moving(reader: Reader, *, holding: str | None, nid: str) -> str:
 
 def _sensitivities(reader: Reader, b: dict, fit: dict) -> str:
     """A name's betas, one to each factor in order, each factor below the first net of the factors above it: fitted on
-    its own daily returns, a fund's on the fund's, or, for a fund with too few, weighted from its holdings."""
+    its own daily returns, a fund's on the fund's, leaning where they say little on the market's response, or, for a
+    fund, on what its rows hold."""
     store = reader.store
     names = channel_names(store)
     order = [c["id"] for c in sorted(store.query("Factor"), key=lambda c: c["stated"]["order"])]
     shown = [c for c in order if c in b]
     rows_ = "".join(f'<tr><td>{go(c, e(heading(names.get(c, c))))}</td><td>{num(sens(b[c]))}</td></tr>' for c in shown)
-    leans = {"population": "its comparables", "rows": "its holdings", "market": "the market's"}.get(
+    leans = {"rows": "its holdings", "market": "the market's"}.get(
         (fit.get("prior") or {}).get("from"))
     how = (f"{fit['n']} daily returns, leaning on {leans} where they say little" if leans else
            f"{fit['n']} daily returns") if fit.get("n") is not None else ""
@@ -3534,8 +3463,7 @@ def _rows_of(entries: list[tuple[str, float, float]], rest: tuple[str, float, fl
     every = entries + ([rest] if rest else [])
     tenths = apportion([w * 1000 for _, w, _ in every])
     amounts = whole_parts([d for _, _, d in every], sum(d for _, _, d in every))
-    tenth = lambda t: f"{MINUS if t < 0 else ''}{abs(t) / 10:.1f}%"  # noqa: E731
-    row = lambda label, t, n, cls="": (f'<tr class="{cls}"><td>{label}</td><td>{num(tenth(t))}</td>'  # noqa: E731
+    row = lambda label, t, n, cls="": (f'<tr class="{cls}"><td>{label}</td><td>{num(_tenth(t))}</td>'  # noqa: E731
                                        f'<td>{num(amount(n, sign=False))}</td></tr>')
     kept = [(label, t, n) for (label, _, _), t, n in zip(entries, tenths, amounts) if t or n]  # nothing shown, no row
     rows_ = [row(label, t, n, "more" if i >= first else "") for i, (label, t, n) in enumerate(kept)]
@@ -3544,7 +3472,7 @@ def _rows_of(entries: list[tuple[str, float, float]], rest: tuple[str, float, fl
                      f'{len(kept) - first} more</button></td></tr>')
     if rest:
         rows_.append(row(rest[0], tenths[-1], amounts[-1], "rest"))
-    rows_.append(f'<tr class="sum"><td>Total</td><td>{num(tenth(sum(tenths)))}</td>'
+    rows_.append(f'<tr class="sum"><td>Total</td><td>{num(_tenth(sum(tenths)))}</td>'
                  f'<td>{num(amount(sum(amounts), sign=False))}</td></tr>')
     return rows_
 
@@ -3591,7 +3519,7 @@ def _fund_holdings(reader: Reader, nid: str, fund: dict) -> str:
         if rest_["count"] else None
     out = [f'<h3 class="sub">Holdings</h3><p class="aside">{count(holds["count"])} as of '
            f'{day(holds.get("holdings_asof"))}</p>{_table("Holding", _rows_of(entries, rest))}']
-    if dollars(holds["weights_sum"] * holds["dollars"]) != dollars(holds["dollars"]):
+    if money(holds["weights_sum"] * holds["dollars"]) != money(holds["dollars"]):
         out.append(f'<p class="aside">Published weights sum to {_sum_percent(holds["weights_sum"])}.</p>')
     priced = sum(1 for h in holds["named"] if h.get("priced_as"))
     if fund.get("expanded"):
@@ -3660,12 +3588,12 @@ def _name_view(reader: Reader, nid: str) -> dict:
     facts = []
     if holding and holding["id"] in shown.value:
         got = rows.get(holding["id"]) or {}
-        facts += [("Value", num(dollars(shown.value[holding["id"]])), ""),
+        facts += [("Value", num(money(shown.value[holding["id"]])), ""),
                   ("Weight", num(shown.weights.get(holding["id"], "")), "")]
         if got.get("quantity") is not None and not kind:
             facts.append(("Quantity", num(count(got["quantity"])), "shares"))
         if holding["id"] in shown.moved and not kind and got.get("session"):
-            facts.append(("Day change", num(dollars(shown.moved[holding["id"]], sign=True),
+            facts.append(("Day change", num(money(shown.moved[holding["id"]], sign=True),
                                             _sign_tone(shown.moved[holding["id"]])), ""))
     if through:
         if not direct and len(through) == 1:
@@ -3712,10 +3640,10 @@ def _cash_view(reader: Reader, cid: str) -> dict:
             body.append(_quote_lines(prices))
             body.append(_price_chart(price_points(reader, "price", pair), f"{title}: its rate in dollars"))
     if holding and holding["id"] in shown.value:
-        facts += [("Value", num(dollars(shown.value[holding["id"]])), ""),
+        facts += [("Value", num(money(shown.value[holding["id"]])), ""),
                   ("Weight", num(shown.weights.get(holding["id"], "")), "")]
         if moves and holding["id"] in shown.moved:
-            facts.append(("Day change", num(dollars(shown.moved[holding["id"]], sign=True),
+            facts.append(("Day change", num(money(shown.moved[holding["id"]], sign=True),
                                             _sign_tone(shown.moved[holding["id"]])), ""))
     if facts:
         body.append(f'<h3 class="sub">Position</h3>{stats(facts)}')
@@ -3740,7 +3668,7 @@ def _carriers(reader: Reader, view_: dict, cid: str) -> str:
     scale = sum(abs(x[0]) for x in found) or 1.0
     kept = [x for x in found if abs(x[0]) >= SMALL * scale]
     rows_ = "".join(f'<tr><td>{go(h["to"], e(heading(held_as(h))), "go name")}</td>'
-                    f'<td>{num(dollars(shown.value[h["id"]]))}</td><td>{num(sens(b))}</td>'
+                    f'<td>{num(money(shown.value[h["id"]]))}</td><td>{num(sens(b))}</td>'
                     f'<td>{num(amount(part, sign=False))}</td></tr>' for part, b, h in kept)
     rest = len(found) - len(kept)
     more = f'<p class="aside">{rest} smaller holding{"s" if rest != 1 else ""} not shown.</p>' if rest else ""
@@ -3917,30 +3845,29 @@ def _inspect_outcome(reader: Reader, rest: str) -> dict:
     got = (out.get("parts") or {}).get(w)
     if got:  # the engine's receipt of the outcome's P&L (MATH.md 1.6): g . u~_w, each company beyond its response, the rest
         factors, moved = channel_names(store), (out.get("components") or {}).get(w) or {}
-        setter = {c["target"]: c["link"] for c in r["consequences"]}
         entries = [(go(c, e(heading(factors.get(c, c)))), f'{gonum(c, money(g.get(c)))} × '
-                    f'{num(operand(moved.get(c), sign=True))}', amount)
-                   for c, amount in sorted(got["factors"].items(), key=lambda kv: -abs(kv[1])) if money(amount) != "$0.00"]
+                    f'{num(operand(moved.get(c), sign=True))}', x)
+                   for c, x in sorted(got["factors"].items(), key=lambda kv: -abs(kv[1])) if money(x) != "$0.00"]
         reach = out.get("reach") or {}
-        for n, amount in sorted(got["own"].items(), key=lambda kv: -abs(kv[1])):
-            if money(amount) == "$0.00":
+        for n, x in sorted(got["own"].items(), key=lambda kv: -abs(kv[1])):
+            if money(x) == "$0.00":
                 continue
             contracts = [h for h in out.get("by_holding") or [] if h["name"] == n and h.get("contract")]
             if contracts:
                 entries.append((go(n, e(market_question(reader, n) or n)),
-                                " + ".join(_contract_operand(reader, pid, out, h, w) for h in contracts), amount))
+                                " + ".join(_contract_operand(reader, pid, out, h, w) for h in contracts), x))
             else:
                 entries.append((f"{go(n, e(name_of(store, n)))}, beyond its response",
-                                f'{gonum(n, dollars(reach.get(n)))} × '
-                                f'{num(operand((out.get("own_moves") or {}).get(n, {}).get(w), sign=True))}', amount))
+                                f'{gonum(n, money(reach.get(n)))} × '
+                                f'{num(operand((out.get("own_moves") or {}).get(n, {}).get(w), sign=True))}', x))
         if money(got.get("curve") or 0.0) != "$0.00":
             entries.append(("The rest", "", got["curve"]))
         terms = to_cents([x[2] for x in entries], o["A"])  # to the cent, adding to the outcome's P&L as shown
         rows = [(label_, what, num(money(t, sign=True))) for (label_, what, _), t in zip(entries, terms)]
         body.append('<h3 class="sub">Dollar beta × move</h3>' + receipt(rows, ("P&amp;L", "", num(money(o["A"], sign=True)))))
-    working = (reader.computation((r.get("basis") or {}).get("by_holding")).get("output") or {}).get("by_holding") \
+    found = (reader.computation((r.get("basis") or {}).get("by_holding")).get("output") or {}).get("by_holding") \
         or r.get("by_holding") or []
-    held = [h for h in working if money((h.get("worlds") or {}).get(w) or 0.0) != "$0.00"]
+    held = [h for h in found if money((h.get("worlds") or {}).get(w) or 0.0) != "$0.00"]
     shown = to_cents([h["worlds"][w] for h in held], o["A"])  # to the cent, adding to the outcome's P&L as shown
     rows = [(go(f"x:holding:{pid}:{h['holding']}", e(_holding_label(reader, h)), "go name"), "",
              num(money(v, sign=True), _tone(v))) for h, v in zip(held, shown)]
@@ -3958,8 +3885,8 @@ INSPECT = {"outcome": _inspect_outcome, "p": _inspect_point, "interval": _inspec
 
 
 def _market_view(reader: Reader, mid: str) -> dict:
-    """A market: its question, its quote, when it closes and what settles it, the propositions it is matched to, the
-    notes about it, and its rules."""
+    """A market: its question; its book, midpoint and depth; when it closes and what settles it; the contracts of it
+    the portfolio holds; the propositions it asks; the analyst's rationale about it; and its rules."""
     store = reader.store
     listing = reader.output("market_listing", mid) or {}
     price = reader.output("market_price", mid) or {}
@@ -3988,7 +3915,7 @@ def _market_view(reader: Reader, mid: str) -> dict:
         items = "".join(f'<li>{go(link["from"], e(title_of(store, link["from"])))}'
                         f'{" · through its No side" if link["stated"].get("side") == "no" else ""}</li>'
                         for link in asks)
-        body.append(f'<h3 class="sub">Asks</h3><ul class="plainlist matched">{items}</ul>')
+        body.append(f'<h3 class="sub">Asks</h3><ul class="plainlist asks">{items}</ul>')
     notes = [store.stated_of(a["from"]).get("text") for a in store.links_of(mid, "about", "in")]
     if notes:
         body.append('<h3 class="sub">Rationale</h3>' + "".join(f'<div class="basis note">{fold(note_html(t))}</div>' for t in notes))
@@ -4126,7 +4053,7 @@ def _view(store: Store, target: str, *, pending: bool = False) -> dict:
             return INSPECT["consequence"](reader, target)  # a consequence opens its explanation
         if kind == "link" and (store.link_by_id(target) or {}).get("relation") == "worth":
             return _worth_view(reader, target)
-        if kind == "Judgment":  # the judge's readings are kept for us, in the store and the record; the page shows none
+        if kind == "Judgment":  # the judge's readings are kept in the store and the record; the page shows none
             return _missing()
         if kind == "Cash":
             return _cash_view(reader, target)
@@ -4143,7 +4070,7 @@ def _figure_short(reader: Reader, link: dict) -> str:
     """A consequence as its chip shows it: the shock the analyst states, with its sign, and, where it is measured
     against what the price follows, that."""
     try:
-        kind, said = _stated(link)
+        _, said = _stated(link)
     except (KeyError, StopIteration, TypeError):
         return ""
     x = said.get("value") if isinstance(said, dict) else said
@@ -4202,7 +4129,7 @@ def chips(store: Store, ids: list[str]) -> dict[str, dict]:
             held = {h["to"]: h["id"] for h in view_.get("holds") or []}
             shown = view_.get("shown")
             if shown and held.get(oid) in shown.value:  # a holding: its value, as the portfolio panel shows it
-                value = dollars(shown.value[held[oid]])
+                value = money(shown.value[held[oid]])
             elif shown and view_.get("lookthrough"):  # a name the funds hold: your exposure, as its page shows it
                 total = held_of(view_, oid)[0]
                 value = amount(total, sign=False) if total else ""
@@ -4252,18 +4179,18 @@ def ledger_markdown(store: Store) -> str:
     holdings, shown = view_["holdings"] or {}, view_["shown"]
     lines += [f"As of {day(asof)}. {_when(store, holdings)}.", ""]
     if holdings and shown.total is not None:
-        moved = f", {dollars(shown.total_moved, sign=True)} ({move(holdings.get('session_move'))}){_session(holdings)}" \
+        moved = f", {money(shown.total_moved, sign=True)} ({move(holdings.get('session_move'))}){_session(holdings)}" \
             if shown.total_moved is not None else ""
-        lines += [f"## Portfolio: {dollars(shown.total)}{moved}", ""]
+        lines += [f"## Portfolio: {money(shown.total)}{moved}", ""]
         vol = (reader.derived("portfolio", "Portfolio", ("volatility",)).get("volatility") or {}).get("value")
         if vol is not None:
             lines += [f"Horizon volatility {either(vol)}", ""]
         lines += ["| Holding | Value | Weight | Day change |", "|---|---:|---:|---:|"]
         for h in view_["holds"]:
             got = holdings.get("holds", {}).get(h["id"]) or {}
-            mv = f"{dollars(shown.moved[h['id']], sign=True)} ({move(got.get('session_move'))})" \
+            mv = f"{money(shown.moved[h['id']], sign=True)} ({move(got.get('session_move'))})" \
                 if h["id"] in shown.moved and _has_move(h) else ""
-            lines.append(f"| {_holding_label(reader, h)} | {dollars(shown.value.get(h['id']))} | "
+            lines.append(f"| {_holding_label(reader, h)} | {money(shown.value.get(h['id']))} | "
                          f"{shown.weights.get(h['id'], '')} | {mv} |")
         lines.append("")
     groups = _groups_of(reader, shown.total)

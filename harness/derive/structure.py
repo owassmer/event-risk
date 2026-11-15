@@ -9,9 +9,12 @@ One derivation reads each structure whole, through `oneform.read`, and gives eve
 - `left_open`, where they leave it open: the range they leave, with each priced proposition at its probability, and
   the chances that would settle it.
 
-A market's book enters where its price is taken and no chance follows it: a chance that follows a market takes the
-market's place, carrying it forward from its price when the chance was stated (MATH.md 1.2). The structure's Computation
-also holds, for each proposition, every market that asks it and every chance it states, and for the structure, what
+A market a proposition asks stands as that proposition, true, or false through the link's No side; a market no
+proposition asks stands as itself, the proposition its question and rules define, and its price is taken (MATH.md 1.2).
+A book enters where its price is taken and no chance on what it asks follows it: a chance that follows a market takes
+the market's place, carrying it forward from its price when the chance was stated. A deadline reading places its rungs
+around the proposition, the earlier implying it and it the later (_rungs), and gives the share between them. The
+structure's Computation also holds, for each proposition, every market that asks it and every chance it states, and for the structure, what
 cannot hold together and each stretched book, which check() lists (MATH.md 1.10).
 """
 
@@ -373,7 +376,7 @@ def _structure_inputs(ctx: Inputs, first: str) -> dict:
     for p in props:
         if p in placed:
             by_line.setdefault(placed[p][0], {})[p] = placed[p][1]
-    on_lines = [{"members": members} for members in by_line.values() if len(members) > 1]
+    on_lines = [{"members": line} for line in by_line.values() if len(line) > 1]
     return {"props": [*props, *nodes], "links": links, "chances": chances, "books": books, "markets": listed,
             **({"lines": on_lines} if on_lines else {}), **({"standing": stands} if stands else {})}
 
@@ -406,6 +409,7 @@ def _rungs(stands: dict[str, tuple[str, bool]], got: dict, c: dict) -> list[dict
     earlier = got["given_not"][0] if got["given_not"] else None
     pairs = [(got["of"], later)] + ([(earlier, got["of"]), (earlier, later)] if earlier else [])
     return [{"id": f"{got['key']}.rungs", "relation": "implies", "from": a, "to": b} for a, b in pairs]
+
 
 def _now(c: dict) -> float | None:
     """A chance's figure now: as stated, or, following a market, carried forward with it."""
@@ -454,8 +458,10 @@ def _figure(m: dict, statement: str) -> dict:
 
 
 def _structure_compute(m: dict, load) -> dict:
-    """The structure read whole. Where the solver cannot finish it, the statement that made it so is refused with
-    why, naming the structure's propositions (TOOLS.md 5)."""
+    """The structure read whole (oneform.read). A chance whose figure reads the probabilities it helps set, a
+    constant hazard's share or a chance that follows a holding's price, is read with them until every figure holds
+    still. Where the solver cannot finish it, or no figures hold them all, the statement that made it so is refused
+    with why, naming the structure's propositions (TOOLS.md 5)."""
     chances = [{**c, **({"follow": dict(c["follow"])} if c.get("follow") else {})} for c in m["chances"]]
 
     def read() -> dict:
@@ -511,8 +517,8 @@ def _structure_compute(m: dict, load) -> dict:
             raise Refused(f"{m['props'][0]}'s structure could not be read: {dependent} each take their value from the "
                           f"probabilities they help set, a constant hazard's or a holding's price, and no set of "
                           f"probabilities holds them all", m["props"])
-        # The shown chances, source weights and propositions all describe the same final reading.
-        found = read()
+        if hazards or names:  # the chances shown and the probabilities read from the same, last, figures
+            found = read()
     except oneform.Unfinished as e:
         raise Refused(f"{m['props'][0]}'s structure could not be read: {e}", m["props"]) from None
     props = {}

@@ -24,8 +24,7 @@ more than the strike for an American put (discounted at the rate for a European 
 highest volatility searched (VOLATILITY) gives, a contract takes the delta at that volatility: a deep in-the-money
 contract's value climbs from its value at none toward that ceiling so slowly that a mark a few cents off its model,
 struck at another moment or on another dividend assumption, reads as a volatility of thousands of percent, while its
-delta is near e^(-qu) at every volatility (FNOV's call at strike 6.59, 99% of the fund, marked at 746.04 against 745.97
-at a volatility of ten, read on ETF Global's holdings of 2026-11-09).
+delta is near e^(-qu) at every volatility.
 
 The rate is the continuously compounded rate to the option's remaining life that the Treasury's par yield curve then
 gives (harness.derive.rates, which reads the curve as the price today of a dollar paid on each date). The dividend yield is what the payer paid over the 365 days to the

@@ -241,9 +241,9 @@ class _Book:
 def prepare(specs: dict, load, q: dict, W: list[str], name_ratio, factor_ratio=None) -> _Book:
     """Pin a common observation convention without asking for any security's world price yet.
 
-Valuing a fund then asks the shared completed-security callback for its reference. Each contract is valued in each
-world at its own volatility (MATH.md 1.6), once across funds, independently of their position quantities.
-"""
+    Valuing a fund then asks the shared completed-security callback for its reference. Each contract is valued in each
+    world at its own volatility (MATH.md 1.6), once across funds, independently of their position quantities.
+    """
     values, terms, prepared, groups, observations, fund_groups = {}, {}, {}, {}, {}, {}
     for fund, spec in specs.items():
         for item in spec["contracts"]:

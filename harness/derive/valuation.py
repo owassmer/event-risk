@@ -1,8 +1,17 @@
-"""Holding terms read once and valued at a world's centre or a horizon state.
+"""What values a holding beyond its price's response (MATH.md 1.6): its terms, read once and valued at a world's centre
+for the row or at a draw for the chart (value_state), as one valuation read twice.
 
-Amounts are per share and in today's dollars. A cash payment keeps its present value;
-shares received keep the receiving security's price in the same state. None of these
-values is normalized back to today's quote: the difference is economic information.
+- A value the analyst states in a world (`worth`), per share in today's dollars: an amount; cash paid on a date,
+  discounted at its currency's government yield and converted at that world's rate; shares of another name at that
+  name's price there; or the company on its own, its price on an earlier date carried by its fit up to then
+  (fit_before) and moved by those betas in each world. None of these is placed back to today's price: where the
+  values and today's price differ, the row carries the difference as its expected value. The weight the holding's
+  price implies is read from them (implied_from_values).
+- A contract the portfolio holds, by what it pays in each world, discounted to its close (contract_inputs).
+- A fund on one reference, by its multiple of the reference's move (on_one_reference, multiple_extras); a fund holding
+  contracts, by what they are worth, its remainder fitted on its history less theirs (remainder_fit).
+- A name over a past window (name_window): its move, its response at its fit up to the window's start, and its
+  residual.
 """
 from __future__ import annotations
 
@@ -98,10 +107,6 @@ def curve_inputs(ctx: Inputs, asof: str, currency: str = "USD") -> dict:
     key = (lambda y: str(y)) if currency == "USD" else (lambda y: f"{currency}:{y}")  # noqa: E731
     return {key(y): ctx.data("yield_curve", key(y), covering=(asof, asof))
             for y in (int(asof[:4]) - 1, int(asof[:4]))}
-
-
-def curve_at(readings: dict, load, asof: str) -> list:
-    return _latest(readings, load, asof)["curve"]
 
 
 def _latest(readings: dict, load, asof: str) -> dict:
@@ -231,7 +236,7 @@ def on_one_reference(looked: dict, responds: Callable[[str], Any]) -> dict[str, 
 
 def _fit_before_inputs(ctx: Inputs, subject: str) -> dict:
     """What a price on an earlier date is carried to today by (MATH.md 1.6, 3.1): that day's close, with the history its
-    betas are fitted on up to that date as every fit is (3.8): the factors' series then, with the currency pairs a
+    betas are fitted on up to that date as every fit is: the factors' series then, with the currency pairs a
     proxy quotes; the security's own; and for a listing abroad, its currency's rates, whose response it shares with
     every listing quoted in that currency; and each factor's proxy then and as of today."""
     ticker, day = subject.rsplit("@", 1)
@@ -265,9 +270,10 @@ def _fit_before_compute(a: dict, load) -> dict:
     mdl = channels.model(fm)
     found = history.returns(a["name"], load, mdl.sessions)["dollar"]
     early = history.struck_early(a["name"], load, mdl.sessions)
-    # a listed share leans on the market's sensitivity; a currency or crypto pair, being none, on no response (3.8)
+    # a listing leans on the market's sensitivity, a fund's as a share's; a currency or crypto pair, being none, on no
+    # response
     prior = mdl.no_response_prior() if a["name"].get("kind") == "pair" else mdl.market_prior()
-    if a.get("currency"):  # abroad: its local return fitted, and its currency's response added, as every fit is (3.8)
+    if a.get("currency"):  # abroad: its local return fitted, and its currency's response added, as every fit is
         local = mdl.fit(history.returns(a["name"], load, mdl.sessions)["own"], prior, early=early)
         fx = channels._currency_fit(a["currency"], a["rates"], fm, mdl, load)
         if fx is None:
@@ -479,6 +485,9 @@ def worth_values(m: dict, load, ratios, factors: dict[str, dict[str, float]]) ->
 
 
 def implied_from_values(values: dict[str, float], current: float, ws: list[dict], q: dict) -> float | None:
+    """The weight a holding's price implies on the event (MATH.md 1.6): (c - N) / (Y - N), with Y and N its stated
+    values' means over the Yes and the No side, each world at its share of the weight today's prices carry on its
+    side, or of its probability where they carry none there. None where the two sides' values are the same."""
     def mean(side):
         selected = [w["id"] for w in ws if w["side"] == side]
         weight = sum(q[w] for w in selected)
@@ -495,7 +504,8 @@ def implied_from_values(values: dict[str, float], current: float, ws: list[dict]
 
 
 def remainder_inputs(ctx: Inputs, specs: dict) -> dict:
-    """Only a partial live option sleeve needs the dated fund history it is removed from."""
+    """What the remainder of a fund whose contracts are part of its payoff is fitted on (MATH.md 1.7): the contracts it
+    held on each day, its own series, and the factors. A fund whose contracts are its whole payoff has none."""
     asof = portfolio.asof_of(ctx)
     return {n: {"history": spec["history"], "event_days": (date.fromisoformat(spec["event_date"][:10]) - date.fromisoformat(asof)).days,
                 "series": history.series_inputs(ctx, portfolio.ticker_of(n), asof),
@@ -504,6 +514,8 @@ def remainder_inputs(ctx: Inputs, specs: dict) -> dict:
 
 
 def remainder_fit(m: dict, load) -> dict:
+    """The remainder's betas (MATH.md 1.7): fitted on the fund's returns less what the contracts it held on each day did,
+    so the contracts are counted once, with no prior response."""
     mdl = channels.model(load(m["factors"]))
     observed = channels.option_remainder_returns(rows.contracts_by_day(load(m["history"])),
                                                  history.returns(m["series"], load, mdl.sessions)["dollar"], mdl.sessions,
@@ -520,7 +532,8 @@ _ERFC = np.frompyfunc(math.erfc, 1, 1)  # math.erfc over an array: each draw's v
 
 
 def _option_batch(contract: dict, spot: np.ndarray, remaining: float) -> np.ndarray:
-    """The existing exercise model over many states, with the same steps as its scalar calculation."""
+    """An option's value at many prices of its underlying, by the calculation that gives its delta (options.value),
+    step for step: Black-Scholes for a European contract, the averaged binomial tree for an American one."""
     call, early = contract["kind"] == "call", contract["style"] == "american"
     k, r, q, vol = contract["strike"], contract["rate"], contract["yield"], contract["volatility"]
     sign = 1.0 if call else -1.0
@@ -569,7 +582,8 @@ def zero_drift(ratios: np.ndarray) -> np.ndarray:
 def value_state(m: dict, load, centre: dict, world: str, factors: dict, names: dict,
                 variances: dict, at: str, *, expiry_states: dict | None = None,
                 contract_payoffs: dict | None = None, receipt: dict | None = None) -> dict:
-    """Value each holding on the same state, in today's dollars, with distributions supplied as gross ratios.
+    """Each holding's value at each draw of one world's state, in today's dollars (MATH.md 1.6, "One valuation, read
+    twice"; 1.8): the factors and names as drawn, ratios to today, valued by the terms the row's centre read them by.
 
     The input state has zero drift in today's dollars. For an option, its underlying's nominal ex-dividend
     price at the valuation date grows by its financing rate less dividends; the resulting price or expiry

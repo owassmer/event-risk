@@ -2,8 +2,9 @@
 
 One joint state is sampled for each draw. Factors, companies, currencies and fund
 remainders share it, and every occurrence of a company sees the same price. The
-ordinary state covariance uses production's completed-move estimator. Probabilities
-mix the conditional distributions; they do not change their ordinary width.
+state's covariance over completed moves is estimated as the portfolio's volatility is
+(3.2). Probabilities mix the conditional distributions; they do not change their
+ordinary width.
 """
 
 from __future__ import annotations
@@ -79,7 +80,8 @@ def _remember(cache, running, key, compute, kept: int = _COVARIANCE_CACHE_SIZE):
 
 
 def completed_covariance(values: np.ndarray, ok: np.ndarray, memory: int) -> np.ndarray:
-    """Production's Bartlett covariance, corrected for its finite-window centring.
+    """The covariance over completed moves the factors and the volatility are estimated with (estimate.covariances,
+    Bartlett's), corrected for its finite-window centring.
 
     The whole state enters the estimator together: lagged factor/residual and
     residual/residual cross-covariances are retained. No variance is subtracted
@@ -117,10 +119,10 @@ def _state_covariance(factors: np.ndarray, residuals: dict[str, np.ndarray], *, 
 
     With common histories this is exactly the completed covariance of all columns.
     A younger history joins by its conditional covariance over the sessions shared
-    with the existing state. Its conditional response leans toward zero, using the
-    production response strength, and its unexplained covariance has the production
-    one-session market prior. The block construction is positive semidefinite and
-    preserves the existing state's covariance and full history.
+    with the state built so far. Its conditional response leans toward zero, at the
+    strength every fit leans with, and its unexplained covariance has the one-session
+    market prior every fit has. The block construction is positive semidefinite and
+    keeps the covariance and full history of the state built so far.
 
     `estimate.figure` estimates one portfolio's scalar variance, with its own parts
     grouped and weighted in dollars. That scalar does not identify a multivariate
@@ -160,7 +162,7 @@ def _state_covariance(factors: np.ndarray, residuals: dict[str, np.ndarray], *, 
                 plain = xy.T @ np.linalg.pinv(xx, hermitian=True)
                 error = estimate.sym(yy - plain @ xy)
                 effective = estimate.freedom(mask, memory)
-                # As in the production response prior, a noisier residual leans
+                # As in every fit's response prior, a noisier residual leans
                 # further. Each row has its own precision in market-session units.
                 relative = np.maximum(np.diag(error), 0.0) / market if market > 0 else np.zeros(count)
                 lean = effective / (effective + kappa * relative) if effective > 0 else np.zeros(count)
@@ -291,7 +293,7 @@ class State:
     """An event's joint state, read only and shared by every reader of it (_state): what it is (`about`), its covariance
     over completed moves, that covariance's factorization, taken once (factorization; a period's is it times the root
     of the period's sessions), and each price's loading on it. A loading is a price's response to the factors and its
-    own part's column, with its coefficient, none for a factor's proxy: `rows` maps each price drawn to its loading's
+    residual's column, with its coefficient, none for a factor's proxy: `rows` maps each price drawn to its loading's
     row, so a company held under two ids is one row and one draw. Each row's log-variance per session is its loading
     through the covariance."""
 
@@ -322,7 +324,7 @@ class State:
             x.setflags(write=False)
 
     def log_moves(self, changes: np.ndarray) -> np.ndarray:
-        """Each row's compounded move at each draw, rows first: its response to the factors' changes, and its own part's
+        """Each row's compounded move at each draw, rows first: its response to the factors' changes, and its residual's
         change times its coefficient."""
         out = self.response @ changes[:, :self.k].T
         if len(self.owned):
@@ -332,8 +334,8 @@ class State:
 
 def _state(m: dict, load) -> State:
     centre = m.get("centre") or load(m["impact"])
-    # Production references include hashes of immutable payloads. Bare references
-    # in pure callers have no such guarantee and are deliberately not cached.
+    # A store's references carry the hash of what they name, so a state is kept by them; a reference without one, as
+    # a pure caller's, names nothing fixed, and its state is worked out each time.
     if not all(isinstance(m[k], dict) and m[k].get("sha256") for k in ("factors", "betas")):
         return State(*_state_uncached(m, load))
     terms = centre.get("valuation_terms") or {}

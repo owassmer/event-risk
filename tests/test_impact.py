@@ -1559,7 +1559,7 @@ def _bound_case(holdings: dict, betas: dict, paths: dict, reaches: dict, e: dict
                            "basis": "cmp:level"}]
          + [{"link": f"link:{10 + i}", "target": f"name:{n}", "on": "prop:1", "shock": x, "against": against,
              "c": 100.0, "basis": "cmp:level"} for i, (n, x) in enumerate((named or {}).items())]}
-    return impact._impact_compute(m, lambda ref: {"cmp:look": looked, "cmp:betas": fitted,
+    return impact.compute(m, lambda ref: {"cmp:look": looked, "cmp:betas": fitted,
                                                   "cmp:rows": {"rows": {}}}[ref["basis"]])
 
 
