@@ -16,11 +16,19 @@ A fund's holdings (`nport`), the latest Form N-PORT holdings publicly available 
    "seriesId", "classId", "symbol"], "data": [...]}`, every open-end fund's and ETF's ticker with its series, the
    fund that files; a closed-end fund or a unit trust (SPY, DIA), which has no series, files under the CIK the list of
    tickers gives it. Both lists are read once a day.
-2. Its filings. `GET https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={series or CIK}&type=NPORT-P&
-   dateb={YYYYMMDD}&owner=include&count=40&output=atom` (EDGAR's company feed,
-   https://www.sec.gov/about/rss-feeds) answers an Atom feed of the filer's NPORT-P and NPORT-P/A filings before the
-   date, newest first, each `<content>` giving `filing-type`, `filing-date`, `accession-number` and `filing-href`; a
-   series id answers that series' own filings, though its trust files them all under one CIK. A fund files NPORT-P,
+2. Its filings. A fund that files under a CIK alone (a unit trust, a closed-end fund), or a series whose registrant
+   the funds' list names no other series under (its report read where it names the series), is listed by EDGAR's
+   submissions record, `GET https://data.sec.gov/submissions/CIK##########.json`
+   (https://www.sec.gov/search-filings/edgar-application-programming-interfaces): `filings.recent`, a column per
+   field (`form`, `filingDate`, `accessionNumber`, ...), newest first, and `filings.files`, each older page by its
+   `name` under the same path, read only as far back as a read needs (_submitted). A series is listed by EDGAR's
+   company feed, `GET https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={series}&type=NPORT-P&
+   dateb={YYYYMMDD}&owner=include&count=40&output=atom` (https://www.sec.gov/about/rss-feeds), an Atom feed of its
+   NPORT-P and NPORT-P/A filings before the date, newest first, each `<content>` giving `filing-type`,
+   `filing-date`, `accession-number` and `filing-href`: the series' own filings, which its trust files under one
+   CIK beside every other series', with nothing in the submissions record to tell them apart. The feed answers
+   slowly and at times not at all (a timeout, or a 503, where the submissions record answers in a fraction of a
+   second), so it is asked up to FEED_TRIES times before the SEC is taken as not answering. A fund files NPORT-P,
    the public report, once a quarter, as of the quarter's end, within sixty days of it; NPORT-P/A restates a report.
 3. Its holdings. `GET https://www.sec.gov/Archives/edgar/data/{cik}/{accession without dashes}/primary_doc.xml`
    answers the report (EDGAR Form N-PORT XML Technical Specification,
@@ -70,6 +78,9 @@ from harness.venues.http import Cooldown, VenueError, client, now
 URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 FUNDS = "https://www.sec.gov/files/company_tickers_mf.json"
 FEED = "https://www.sec.gov/cgi-bin/browse-edgar"
+FEED_TRIES = 3  # the feed is asked this many times, a few seconds apart, before the SEC is taken as not answering
+FEED_TIMEOUT = 20.0  # seconds a request to the feed is given: it answered within ten when it answered
+SUBMISSIONS = "https://data.sec.gov/submissions"
 ARCHIVES = "https://www.sec.gov/Archives/edgar/data"
 INTERVAL = 0.11  # seconds between requests: the SEC asks for no more than ten a second
 FILINGS = 40  # the filings the feed is asked for, ten years of quarterly reports and their restatements
@@ -269,6 +280,9 @@ def report(xml: bytes | str) -> dict:
 # daily returns on its reference say what it pays (harness.derive.rows.measure). The census is filed once a year, within
 # 75 days of the fiscal year's end, so a fund in its first year has none.
 MULTIPLE = "Inverse of a benchmark"
+# A census is filed once a year, within 75 days of the fiscal year's end, so a series that exists at the as-of and has
+# filed one has filed it within this many days before: older censuses of its registrant are not read for it.
+CENSUS_REACH = 365 + 75
 
 
 def census(xml: bytes | str) -> dict:
@@ -299,8 +313,10 @@ def filings(feed: str) -> list[dict]:
 
 
 class SEC:
-    def __init__(self, *, http: httpx.Client | None = None, interval: float = INTERVAL, archive: Any = None):
+    def __init__(self, *, http: httpx.Client | None = None, interval: float = INTERVAL, archive: Any = None,
+                 pause: float = 2.0):
         self.http = http or client()
+        self.pause = pause  # seconds before a request the SEC did not answer is asked again, times the tries so far
         self.archive = archive  # this machine's observations: a filed report, by its accession, is read once on it
         self.interval = interval
         self.cooldown = Cooldown("The SEC")
@@ -308,24 +324,57 @@ class SEC:
         self._last = 0.0
         self._lists: dict[str, tuple[str, Any]] = {}  # each list of tickers, by URL, with the day it was read
 
-    def _get(self, url: str, params: dict | None = None) -> httpx.Response:
-        """One request, its interval after the one before; where the SEC does not answer, it is not asked again for a
+    def _get(self, url: str, params: dict | None = None, *, tries: int = 1,
+             timeout: float | None = None) -> httpx.Response:
+        """One request, its interval after the one before, asked up to `tries` times where the SEC does not answer
+        (no response, or a 5xx or 429); where it still does not, or answers otherwise, it is not asked again for a
         minute."""
         self.cooldown.check()
-        with self._slot:
-            wait = self._last + self.interval - time.monotonic()
-            if wait > 0:
-                time.sleep(wait)
-            self._last = time.monotonic()
+        failure = "the SEC did not answer"
+        for attempt in range(tries):
+            with self._slot:
+                wait = self._last + self.interval - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                self._last = time.monotonic()
+            try:
+                response = self.http.get(url, params=params, **({"timeout": timeout} if timeout else {}))
+            except httpx.HTTPError as e:
+                failure = f"the SEC: {e}"
+            else:
+                if response.status_code == 200:
+                    return response
+                failure = f"the SEC answered {response.status_code}"
+                if response.status_code < 500 and response.status_code != 429:  # an answer: asking again changes nothing
+                    break
+            if attempt + 1 < tries:
+                time.sleep(self.pause * (attempt + 1))
+        self.cooldown.failed()
+        raise VenueError(failure)
+
+    def _feed(self, params: dict) -> list[dict]:
+        """The filings EDGAR's company feed lists for a series (FEED), asked up to FEED_TRIES times."""
         try:
-            response = self.http.get(url, params=params)
-        except httpx.HTTPError as e:
-            self.cooldown.failed()
-            raise VenueError(f"the SEC: {e}") from None
-        if response.status_code != 200:
-            self.cooldown.failed()
-            raise VenueError(f"the SEC answered {response.status_code}")
-        return response
+            return filings(self._get(FEED, params, tries=FEED_TRIES, timeout=FEED_TIMEOUT).text)
+        except ET.ParseError:
+            raise VenueError("the SEC answered its filings feed with no feed") from None
+
+    def _submitted(self, cik: str, forms: tuple[str, ...], asof: str):
+        """A filer's filings of `forms` filed by `asof`, newest first, from EDGAR's submissions record: its recent
+        filings, then each older page in turn, read only when the reader asks for more than the pages before it hold.
+        Each as the feed gives it: its form, filing date, accession number and CIK."""
+        number = str(int(cik)).zfill(10)
+        body = self._json(f"{SUBMISSIONS}/CIK{number}.json")
+        pages = [(body.get("filings") or {}).get("recent") or {}]
+        older = [f["name"] for f in (body.get("filings") or {}).get("files") or [] if f.get("name")]
+        while pages:
+            r = pages.pop(0)
+            for i in range(len(r.get("form") or [])):
+                if r["form"][i] in forms and r["filingDate"][i] <= asof:
+                    yield {"form": r["form"][i], "filed": r["filingDate"][i], "accession": r["accessionNumber"][i],
+                           "cik": str(int(cik))}
+            if older:
+                pages.append(self._json(f"{SUBMISSIONS}/{older.pop(0)}"))
 
     def _json(self, url: str) -> Any:
         try:
@@ -371,14 +420,27 @@ class SEC:
                 return None, str(row[at["cik"]])
         return None, None
 
+    def sole_series(self, cik: str, series: str) -> bool:
+        """Whether the funds' list names no series under a registrant's CIK but this one: its filings are then this
+        series' own, as the submissions record lists them."""
+        listed = self._list(FUNDS)
+        at = {f: i for i, f in enumerate(listed.get("fields") or [])}
+        named = {str(row[at["seriesId"]]) for row in listed.get("data") or []
+                 if str(row[at["cik"]]).lstrip("0") == str(cik).lstrip("0") and row[at["seriesId"]]}
+        return named == {series}
+
     def nport(self, fund: str, asof: str) -> dict:
-        """The fund's latest Form N-PORT holdings filed by `asof`, its restatement filed by then included."""
+        """The fund's latest Form N-PORT holdings filed by `asof`, its restatement filed by then included. A series
+        whose registrant files for no other (sole_series) is listed by the submissions record, and its report is
+        read where it names the series; any other series by the feed."""
         retrieved = now()
         series, cik = self.filer(fund)
         before = (date.fromisoformat(asof) + timedelta(days=1)).strftime("%Y%m%d")  # filings on the as-of included
-        params = {"action": "getcompany", "CIK": series or cik, "type": "NPORT-P", "dateb": before,
+        params = {"action": "getcompany", "CIK": series, "type": "NPORT-P", "dateb": before,
                   "owner": "include", "count": FILINGS, "output": "atom"}
-        request = {"method": "GET", "url": FEED, "params": params}
+        request = ({"method": "GET", "url": FEED, "params": params} if series else
+                   {"method": "GET", "url": f"{SUBMISSIONS}/CIK{str(int(cik)).zfill(10)}.json"} if cik else
+                   {"method": "GET", "url": FUNDS})
 
         def none(said: str) -> dict:
             return {"payload": {"status": "NOT_FOUND", "fund": fund, "error": said}, "request": request,
@@ -386,11 +448,21 @@ class SEC:
 
         if not (series or cik):
             return none(f"the SEC lists no fund under {fund}")
-        try:
-            listed = filings(self._get(FEED, params).text)
-        except ET.ParseError:
-            raise VenueError("the SEC answered its filings feed with no feed") from None
-        listed = [f for f in listed if f["form"] in ("NPORT-P", "NPORT-P/A") and f["filed"] <= asof]
+        forms = ("NPORT-P", "NPORT-P/A")
+        listed = None
+        if not series or (cik and self.sole_series(cik, series)):  # newest first, back to the latest original
+            listed = []
+            for f in self._submitted(cik, forms, asof):
+                listed.append(f)
+                if f["form"] == "NPORT-P":
+                    break
+            first = next((f for f in listed if f["form"] == "NPORT-P"), None)
+            if series and first is not None and self._report(first).get("series") != series:
+                listed = None  # the registrant files for a series the list does not name: the feed tells them apart
+            elif series:
+                request = {"method": "GET", "url": f"{SUBMISSIONS}/CIK{str(int(cik)).zfill(10)}.json"}
+        if listed is None:
+            listed = [f for f in self._feed(params) if f["form"] in forms and f["filed"] <= asof]
         originals = [f for f in listed if f["form"] == "NPORT-P"]
         if not originals:
             return none(f"{fund} filed no Form N-PORT by {asof}")
@@ -426,10 +498,7 @@ class SEC:
             return {"payload": {"status": "NOT_FOUND", "fund": fund,
                                 "error": f"the SEC lists no fund series under {fund}"},
                     "request": {"method": "GET", "url": FUNDS}, "retrieved_at": retrieved, "range": (asof, asof)}
-        try:
-            listed = filings(self._get(FEED, params).text)
-        except ET.ParseError:
-            raise VenueError("the SEC answered its filings feed with no feed") from None
+        listed = self._feed(params)
         reports = sorted((f for f in listed if str(f["form"]).startswith("N-MFP") and f["filed"] <= asof),
                          key=lambda f: f["filed"])
         return {"payload": {"status": "OK", "fund": fund, "series": series, "money_market": bool(reports),
@@ -439,27 +508,25 @@ class SEC:
     def ncen(self, fund: str, asof: str) -> dict:
         """The fund's latest Form N-CEN filed by `asof` that answers for its series (an amendment filed after the
         original standing in its place): its fund types, and whether it seeks a multiple, or the inverse, of a
-        benchmark (MULTIPLE). A fund with no census filed by then, or one the SEC lists no fund for, is NOT_FOUND."""
+        benchmark (MULTIPLE). A census is filed by the registrant for every series it has, so its filings are listed
+        from the registrant's submissions record (_submitted), newest first, and the first that answers for the series
+        is read, as far back as a census of a fund that exists can lie (CENSUS_REACH). A fund with no census filed by
+        then, or one the SEC lists no fund for, is NOT_FOUND."""
         retrieved = now()
         series, cik = self.filer(fund)
-        before = (date.fromisoformat(asof) + timedelta(days=1)).strftime("%Y%m%d")
-        params = {"action": "getcompany", "CIK": series or cik, "type": "N-CEN", "dateb": before, "owner": "include",
-                  "count": 10, "output": "atom"}
-        request = {"method": "GET", "url": FEED, "params": params}
+        request = ({"method": "GET", "url": f"{SUBMISSIONS}/CIK{str(int(cik)).zfill(10)}.json"} if cik else
+                   {"method": "GET", "url": FUNDS})
 
         def none(said: str) -> dict:
             return {"payload": {"status": "NOT_FOUND", "fund": fund, "error": said}, "request": request,
                     "retrieved_at": retrieved, "range": (asof, asof)}
 
-        if not (series or cik):
+        if not cik:
             return none(f"the SEC lists no fund under {fund}")
-        try:
-            listed = filings(self._get(FEED, params).text)
-        except ET.ParseError:
-            raise VenueError("the SEC answered its filings feed with no feed") from None
-        listed = sorted((f for f in listed if f["form"] in ("N-CEN", "N-CEN/A") and f["filed"] <= asof),
-                        key=lambda f: (f["filed"], f["accession"]), reverse=True)
-        for filing in listed:
+        since = (date.fromisoformat(asof) - timedelta(days=CENSUS_REACH)).isoformat()
+        for filing in self._submitted(cik, ("N-CEN", "N-CEN/A"), asof):
+            if filing["filed"] < since:
+                break
             found = self._census(filing)
             types = found["series"].get(series) if series else []
             if types is None:

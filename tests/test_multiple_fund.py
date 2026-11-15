@@ -20,12 +20,12 @@ CENSUS = """<?xml version="1.0"?><edgarSubmission xmlns="http://www.sec.gov/edga
   <fundTypes><fundType>Exchange-Traded Fund</fundType></fundTypes></managementInvestmentQuestion>
 </managementInvestmentQuestionSeriesInfo></formData></edgarSubmission>"""
 
-FEED = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
-<entry><category term="N-CEN"/><content><accession-number>0000000001-26-000001</accession-number>
-<filing-date>2026-08-14</filing-date><filing-type>N-CEN</filing-type>
-<filing-href>https://www.sec.gov/Archives/edgar/data/1174610/000000000126000001/0000000001-26-000001-index.htm</filing-href>
-</content></entry>
-</feed>"""
+# The registrant's submissions record (data.sec.gov), its recent filings a column per field, newest first: a census, and
+# one filed more than a year and 75 days before the as-of, which a fund that exists does not rest on.
+SUBMITTED = {"name": "PROSHARES TRUST", "filings": {"recent": {
+    "form": ["10-K", "N-CEN", "N-CEN"], "filingDate": ["2026-09-01", "2026-08-14", "2024-08-14"],
+    "accessionNumber": ["0000000001-26-000009", "0000000001-26-000001", "0000000001-24-000001"],
+    "reportDate": ["", "", ""], "primaryDocument": ["x.htm", "primary_doc.xml", "primary_doc.xml"]}}}
 
 
 def test_a_census_gives_each_series_its_fund_types_and_its_period():
@@ -35,9 +35,13 @@ def test_a_census_gives_each_series_its_fund_types_and_its_period():
 
 
 def test_a_funds_census_says_whether_it_seeks_a_multiple_and_a_fund_with_none_filed_by_then_has_none(monkeypatch):
+    asked = []
+
     def answer(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("browse-edgar"):
-            return httpx.Response(200, text=FEED)
+        asked.append(request.url.path)
+        if request.url.path == "/submissions/CIK0001174610.json":
+            return httpx.Response(200, json=SUBMITTED)
+        assert request.url.path.endswith("/primary_doc.xml"), request.url  # the census is listed by its registrant
         return httpx.Response(200, text=CENSUS)
     client = sec.SEC(http=httpx.Client(transport=httpx.MockTransport(answer)), interval=0.0)
     monkeypatch.setattr(client, "filer", lambda fund: ({"QLD": "S000000001", "QQQX": "S000000002"}[fund], "1174610"))
@@ -45,6 +49,9 @@ def test_a_funds_census_says_whether_it_seeks_a_multiple_and_a_fund_with_none_fi
     assert (lev["seeks_multiple"], lev["filed"], lev["accession"]) == (True, "2026-08-14", "0000000001-26-000001")
     assert client.ncen("QQQX", "2026-11-11")["payload"]["seeks_multiple"] is False
     assert client.ncen("QLD", "2026-08-13")["payload"]["status"] == "NOT_FOUND"  # filed the day after
+    asked.clear()  # a census more than a year and 75 days old is not read for a fund that exists
+    assert client.ncen("QLD", "2026-01-10")["payload"]["status"] == "NOT_FOUND"
+    assert not any(path.endswith("primary_doc.xml") for path in asked)
 
 
 MEASURED = {"slope": 2.0123, "r2": 0.998, "sessions": 63, "from": "2026-08-07", "to": "2026-11-10"}
