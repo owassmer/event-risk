@@ -92,6 +92,28 @@ def test_an_etf_read_over_a_span_before_it_listed_is_a_listing_with_no_prices_th
     assert got["ticker_on"]("TSDD@2020-03-23", None)["payload"]["from"] == "massive"
 
 
+def test_listings_references_asked_together_decide_a_series_classes_with_no_reference_read_alone():
+    """A listing's references are asked of their client together, as many to a request as it takes (harness.venues.
+    keyless): which tickers the SEC lists as a series' classes are listings is decided from that one answer, on the day
+    and today, so an exchange-traded class, VOO, is read with the rest and a mutual fund's, VFIAX, from its own facts."""
+    massive = Massive()
+    base = massive_kinds()
+    batches = []
+
+    def many(subjects, covering):
+        batches.append(sorted(subjects))
+        return {s: {"payload": {"status": "NOT_FOUND"} if s == "VFIAX" else
+                    {"status": "OK", "results": {"ticker": s, "type": "ETF" if s == "VOO" else "CS"}}}
+                for s in subjects}
+    base["ticker_ref"].many = many
+    got = MutualFunds(massive, SEC(), Yahoo()).fetchers(base)
+    out = got["ticker_ref"].many(["VOO", "AAPL", "VFIAX"], ("2026-11-11", "2026-11-11"))
+    assert out["VOO"]["payload"]["results"]["type"] == "ETF" and out["AAPL"]["payload"]["results"]["type"] == "CS"
+    assert out["VFIAX"]["payload"]["results"]["type"] == MUTUAL
+    assert massive.asked == []  # no reference read alone
+    assert batches[0] == ["AAPL", "VFIAX", "VOO"]
+
+
 def test_a_mutual_funds_latest_mark_is_its_last_net_asset_value_struck_at_new_yorks_close():
     got = MutualFunds(Massive(), SEC(), Yahoo()).fetchers(massive_kinds())["snapshot"]("VFIAX", ("2026-11-12", "2026-11-12"))
     mark = series.snapshot_mark(got["payload"])

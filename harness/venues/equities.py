@@ -43,6 +43,7 @@ URL = "https://raw.githubusercontent.com/JerBouma/FinanceDatabase/main/compressi
 PATH = Path(__file__).resolve().parent.parent.parent / "observations" / "equities.sqlite"
 TIMEOUT = 60.0  # seconds the file's read is given: 18.6 MB, read live in about a second
 TRIES = 3
+INDEXED = ("symbol", "isin", "cusip", "figi", "composite_figi", "shareclass_figi")  # what a row is looked up by
 COLUMNS = ("symbol", "name", "currency", "sector", "industry_group", "industry", "exchange", "mic", "market",
            "country", "isin", "cusip", "figi", "composite_figi", "shareclass_figi", "delisted")
 
@@ -80,8 +81,8 @@ class Equities:
                 rows = ((*(r.get(c) or None for c in COLUMNS[:-1]), 1 if r.get("delisted") == "True" else 0,
                          r.get("summary") or None) for r in csv.DictReader(text) if r.get("symbol"))
                 db.executemany(f"INSERT INTO equities VALUES ({', '.join('?' * (len(COLUMNS) + 1))})", rows)
-            db.execute("CREATE INDEX by_symbol ON equities (symbol)")
-            db.execute("CREATE INDEX by_isin ON equities (isin)")
+            for column in INDEXED:
+                db.execute(f"CREATE INDEX by_{column} ON equities ({column})")
             db.executemany("INSERT INTO meta VALUES (?, ?)", [("etag", etag or ""), ("retrieved_at", retrieved)])
         os.replace(building, self.path)
 
@@ -119,6 +120,9 @@ class Equities:
                 if not held:
                     raise VenueError(failure or "FinanceDatabase's equities did not answer")
                 log.warning("%s; the file held is read", failure)
+            with sqlite3.connect(self.path) as db:  # a file built before a column was looked up by: its index made
+                for column in INDEXED:
+                    db.execute(f"CREATE INDEX IF NOT EXISTS by_{column} ON equities ({column})")
             self._checked = today
 
     def _query(self, sql: str, args: tuple) -> list[dict]:
@@ -129,13 +133,24 @@ class Equities:
 
     # ---------------------------------------------------------------- reads
 
-    def rows(self, *, symbol: str | None = None, isin: str | None = None) -> list[dict]:
-        """The rows of a listing by its symbol, or of an ISIN, each the file's columns but its summary, `delisted` a
-        boolean."""
-        column, value = ("symbol", symbol) if symbol else ("isin", isin)
+    def rows(self, **by: str) -> list[dict]:
+        """The rows of one identifier, by its column (INDEXED: a listing's symbol, an ISIN, a CUSIP, a FIGI of any of
+        the three levels), each the file's columns but its summary, `delisted` a boolean."""
+        [(column, value)] = by.items()
+        if column not in INDEXED:
+            raise ValueError(f"the file's rows are looked up by {', '.join(INDEXED)}, not {column}")
         found = self._query(f"SELECT {', '.join(COLUMNS)} FROM equities WHERE {column} = ? ORDER BY symbol",
                             (str(value or "").strip().upper(),))
         return [{**r, "delisted": bool(r["delisted"])} for r in found]
+
+    def us_listings(self) -> list[dict]:
+        """Every listing on a US exchange the file holds as listed now, by Yahoo's codes for the exchanges (NMS, NYQ,
+        ASE, PCX, BTS and the like) and not the dealers' market (PNK)."""
+        from harness.venues.yahoo import DEALERS, EXCHANGES
+        codes = sorted(c for c, (_, country) in EXCHANGES.items() if country == "US" and c not in DEALERS)
+        found = self._query(f"SELECT {', '.join(COLUMNS)} FROM equities WHERE delisted = 0 AND exchange IN "
+                            f"({', '.join('?' * len(codes))})", tuple(codes))
+        return [{**r, "delisted": False} for r in found]
 
     def summary(self, symbol: str) -> str | None:
         """What a listing's company does, in its own record's words."""

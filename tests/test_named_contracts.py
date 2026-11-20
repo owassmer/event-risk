@@ -232,3 +232,109 @@ def test_a_saved_store_whose_fund_holds_a_listed_option_reads_every_number_the_s
         assert json.dumps([looked(later), holdings(later)], sort_keys=True, default=str) == read_then
     finally:
         later.close()
+
+
+@pytest.mark.parametrize("expiry, quoted", [("261218", False), ("261030", True)],
+                         ids=["no exposure its terms and prices give", "expired by the as-of"])
+def test_a_fund_whose_rows_do_not_size_its_options_is_held_whole_by_its_own_response(tmp_path, monkeypatch, expiry,
+                                                                                     quoted):
+    """MATH.md 3.1: a fund whose rows hold an option with no exposure that can be worked out, or one that has expired by
+    the as-of, is held whole: its rows no longer say what its contracts are, and its own betas carry what they do."""
+    from harness import touches
+    from harness.derive import default_registry
+    from harness.store import Store
+    from massive_data import ASOF, FETCHED, flat_prices
+    from test_one_name import fund, looked, ref
+
+    monkeypatch.setattr(touches, "today", lambda: ASOF)
+    store = Store.create(tmp_path / "scratch-unsized", registry=default_registry())
+    flat_prices(store)
+    ref(store, "F", "ETF")
+    ref(store, "AAA", "CS")
+    fund(store, "F", [{"constituent_ticker": "AAA", "figi": "FIGIAAA", "weight": 1.0, "market_value": 1_000_000.0},
+                      {"constituent_ticker": f"AAA   {expiry}C00100000", "asset_class": "Option", "weight": -0.01,
+                       "market_value": -10_000.0, "shares_held": -10.0, "effective_date": "2026-10-01"}])
+    if quoted:
+        store.fetchers["option"] = lambda subject, covering: {
+            "payload": {"status": "OK", "details": {"shares_per_contract": 100, "exercise_style": "american"},
+                        "greeks": {"delta": 0.5}, "underlying_asset": {"ticker": "AAA", "price": 100.0},
+                        "last_quote": {"bid": 9.9, "ask": 10.1, "last_updated": 1762300800000000000}},
+            "request": {"method": "GET", "url": "option"}, "retrieved_at": FETCHED, "range": (ASOF, ASOF)}
+    store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 10000.0}]})
+    held = looked(store)["funds"]["F"]
+    assert held["expanded"] is False and "option" in held["reason"]
+    store.close()
+
+
+def test_a_broad_funds_rights_stated_by_their_value_alone_are_counted_at_it_and_the_fund_is_looked_through(
+        tmp_path, monkeypatch):
+    """MATH.md 3.1: a fund is held whole for options it cannot size only where they are material to what it is. A
+    broad fund's rights and warrants, which its holdings give by their value alone with no contract's terms (ETF
+    Global's security types `Right` and `Equity WRT`), are counted as the rows they are, at that value under derivative,
+    and its shares are looked through: a company's contingent value right at a ten-millionth of the fund, and a row its
+    source types a right at a sixth of a percent, as the loyalty-bonus shares of a company in France are typed."""
+    from harness import touches
+    from harness.derive import default_registry
+    from harness.store import Store
+    from massive_data import ASOF, flat_prices
+    from test_one_name import fund, looked, ref
+
+    monkeypatch.setattr(touches, "today", lambda: ASOF)
+    store = Store.create(tmp_path / "scratch-rights", registry=default_registry())
+    flat_prices(store)
+    ref(store, "F", "ETF")
+    ref(store, "AAA", "CS")
+    fund(store, "F", [{"constituent_ticker": "AAA", "figi": "FIGIAAA", "weight": 0.9983, "market_value": 998_300.0},
+                      {"constituent_ticker": "2223637D", "constituent_name": "CONTRA ABIOMED INC COMMON STOCK",
+                       "security_type": "Right", "isin": "US003CVR0169", "weight": 1e-07, "market_value": 0.1,
+                       "shares_held": 264.0},
+                      {"constituent_ticker": "OR FP", "constituent_name": "L OREAL PRIME DE FIDELITE COMMON STOCK",
+                       "security_type": "Right", "weight": 0.0016, "market_value": 1_600.0, "shares_held": 4.0,
+                       "country_of_exchange": "FR"},
+                      {"constituent_ticker": "ASPSW", "constituent_name": "ALTISOURCE PORTFOLIO - 30",
+                       "security_type": "Equity WRT", "weight": 1e-07, "market_value": 0.1, "shares_held": 50.0}])
+    store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 10000.0}]})
+    out = looked(store)
+    assert out["funds"]["F"]["expanded"] is True
+    assert out["e"]["name:AAA"] == pytest.approx(9983.0)
+    assert out["owned"]["kind:derivative"]["dollars"] == pytest.approx(10000.0 * (1e-07 + 0.0016 + 1e-07))
+    store.close()
+
+
+def report_option(value, contracts, per, strike, expiry, side="written", reference=None):
+    """A fund's report's option as Form N-PORT gives it (harness.derive.rows.nport_rows): its contracts in units of
+    contracts (NC), the shares each controls and its strike as the report states them, wrongly or not."""
+    return {"constituent_name": "AN INDEX CALL", "asset_category": "DE", "issuer_category": "CORP",
+            "market_value": value, "shares": contracts, "units": "NC", "currency": "USD", "weight": value / 1e9,
+            "derivative": {"category": "OPT", "reference": reference or {"index": {"name": "AN INDEX"}},
+                           "right": "call", "side": side, "strike": strike, "expiry": expiry,
+                           "underlying_per_contract": per}}
+
+
+@pytest.mark.parametrize("options, whole", [
+    # a covered-call fund's written index call, filed with its total shares as the shares each contract controls and
+    # its strike short by its first digit, expired by the as-of: its value is 1.3% of the fund, what it controls the fund
+    ([(-12.9e6, 4372.0, 437200.0, 480.0, "2026-08-21")], True),
+    # an equity-income fund's written calls on two of its companies, expired: their value is a hundredth of a percent of
+    # the fund, the shares they control two percent
+    ([(-24.8e3, 4200.0, 100.0, 360.0, "2026-07-17"), (-113.3e3, 100.0, 100.0, 1000.0, "2026-07-17")], True),
+    # one written call on a hundred shares of a fund of a billion dollars, expired
+    ([(-500.0, 1.0, 100.0, 50.0, "2026-07-17")], False),
+])
+def test_a_funds_unsized_contracts_hold_it_whole_where_the_shares_they_control_reach_the_floor_of_it(options, whole):
+    """MATH.md 3.1: a fund whose rows hold options that have expired, or whose exposure their terms and prices do not give,
+    is held whole where those contracts are material to what it is: the shares they control, worth at least the
+    look-through's floor per dollar of the fund. A written call's value is a small part of what it controls, so it is
+    measured by its shares."""
+    from harness.derive.portfolio import _unsized_option
+    from harness.derive.rows import nport_rows
+    report = {"status": "OK", "fund": "FUND", "effective_date": "2026-06-30", "net_assets": 1e9,
+              "results": [{"effective_date": "2026-06-30", "constituent_name": "A COMPANY", "asset_category": "EC",
+                           "issuer_category": "CORP", "market_value": 9.9e8, "shares": 1e7, "units": "NS",
+                           "currency": "USD", "weight": 0.99, "isin": "US0000000A11"}] +
+                         [{"effective_date": "2026-06-30", **report_option(*o)} for o in options]}
+    rows = nport_rows(report, Kinds(), {})
+    reason = _unsized_option(rows, "2026-11-19", report)
+    assert bool(reason) is whole
+    if whole:
+        assert reason.startswith("its holdings hold an option that expired on 20")

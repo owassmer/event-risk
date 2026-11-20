@@ -445,3 +445,97 @@ def test_a_fund_whose_reference_names_its_sponsors_cik_is_no_name_of_that_compan
     out = looked(store)
     assert out["e"]["name:STT"] == pytest.approx(48000.0 * 0.0057)
     assert "looks_through_to:name:XLF>name:XLF" not in out["links"] and "name:XLF" not in out["funds"]["XLF"]["parts"]
+
+
+def put(store, kind, subject, payload):
+    store.put_data(kind, subject, payload, {"method": "GET", "url": kind}, retrieved_at=FETCHED, range=(ASOF, ASOF))
+
+
+def listings_asked(store, figi_of):
+    """A client of each CUSIP's listing on the as-of (`cusip_listing`) that keeps each CUSIP it was asked."""
+    asked = []
+
+    def fetch(subject, covering):
+        asked.append(subject)
+        figi = figi_of(subject.split("@")[0])
+        return {"payload": {"status": "OK" if figi else "NOT_FOUND",
+                            "results": [{"composite_figi": figi}] if figi else []},
+                "request": {"method": "GET", "url": "cusip_listing"}, "retrieved_at": FETCHED, "range": covering}
+    store.fetchers["cusip_listing"] = fetch
+    return asked
+
+
+def given_isin(store, ticker, isin, *names):
+    """The ISIN a fund's row gives a US ticker, and OpenFIGI's mapping of that ISIN to the listings `names` FIGIs."""
+    put(store, "ticker_isin", ticker, {"status": "OK", "ticker": ticker, "isins": [isin]})
+    put(store, "figi", isin, {"status": "OK", "isin": isin, "composites": list(names),
+                              "listings": [{"ticker": ticker, "exchCode": "US", "compositeFIGI": f} for f in names]})
+
+
+def test_a_receipt_held_is_known_by_its_own_cusip_in_a_fund_below_the_floor_with_no_cusip_looked_up(store):
+    """MATH.md 3.1: a company the portfolio names is linked at any exposure, and a fund's row of a security is found by
+    the security's own identifiers first. TSMC is held by its receipt and reached at the floor in V by its ordinary in Taipei;
+    W holds the receipt below the floor, as a report names it, by its ISIN and CUSIP alone. That row is the receipt the
+    member holds: the receipt is known by the ISIN a fund's row gives its ticker, where OpenFIGI's mapping of that ISIN
+    names the receipt's own listing, and by its CUSIP, so no CUSIP of the funds' rows is looked up to find it."""
+    taiwan(store)
+    ref(store, "V", "ETF")
+    ref(store, "W", "ETF")
+    given_isin(store, "TSM", "US8740391003", "FIGITSM")
+    put(store, "lei", "US8740391003", {"status": "NOT_FOUND", "isin": "US8740391003", "records": []})
+    fund(store, "V", [{"constituent_ticker": "2330", "isin": "TW0002330008", "country_of_exchange": "TW",
+                       "weight": 0.5}])
+    fund(store, "W", [{"constituent_name": "TAIWAN SEMICONDUCTOR-SP ADR", "isin": "US8740391003",
+                       "us_code": "874039100", "weight": 0.0003, "country_of_exchange": None},
+                      {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.9997}])
+    asked = listings_asked(store, lambda cusip: "FIGITSM" if cusip == "874039100" else None)
+    store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "TSM", "dollars": 300.0},
+                                                       {"ticker": "V", "dollars": 1000.0},
+                                                       {"ticker": "W", "dollars": 10000.0}]})
+    out = looked(store)  # the floor is 0.05% of $11,300, $5.65: V's ordinary, $500, is above it, W's receipt, $3, below
+    assert out["links"]["looks_through_to:name:W>name:TSM"]["fields"]["dollars"] == pytest.approx(3.0)
+    assert out["e"]["name:TSM"] == pytest.approx(300.0 + 500.0 + 3.0)
+    assert asked == []
+
+
+def test_an_isin_given_under_the_held_ticker_that_openfigi_maps_to_another_listing_names_no_row_of_it(store):
+    """A ticker passes between securities, a FIGI does not: an ISIN a file of an earlier day gives the held ticker, which
+    OpenFIGI's mapping names another listing of, is another company's, and that company's row below the floor stays
+    unnamed. The held listing's own CUSIP is then not known, so the CUSIPs of the funds' rows are looked up."""
+    ref(store, "W", "ETF")
+    ref(store, "ABC", "CS", cik="0000000001")
+    given_isin(store, "ABC", "US00000ABC12", "FIGIOLD")
+    fund(store, "W", [{"constituent_name": "ANOTHER COMPANY", "isin": "US00000ABC12", "us_code": "00000ABC1",
+                       "weight": 0.0003, "country_of_exchange": None},
+                      {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.9997}])
+    asked = listings_asked(store, lambda cusip: "FIGIOLD" if cusip == "00000ABC1" else None)
+    store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "ABC", "dollars": 300.0},
+                                                       {"ticker": "W", "dollars": 10000.0}]})
+    out = looked(store)
+    assert out["e"]["name:ABC"] == pytest.approx(300.0)
+    assert not [k for k in out["links"] if k.endswith(">name:ABC")]
+    assert asked == [f"00000ABC1@{ASOF}"]
+
+
+def test_a_common_share_held_and_its_companys_other_class_are_known_by_their_own_cusips_below_the_floor(store):
+    """MATH.md 3.1: every US ticker the SEC gives the held company is known by its own CUSIP as well as its listings' FIGIs,
+    each confirmed by OpenFIGI's mapping of the ISIN a fund's row gives it: both of Liberty Media's classes in W, named
+    by ISIN and CUSIP alone below the floor, are its one name, and no CUSIP is looked up."""
+    ref(store, "W", "ETF")
+    ref(store, "FWONA", "CS", cik="0001560385")
+    for ticker, isin in (("FWONA", "US53122A1007"), ("FWONK", "US53122K1088")):
+        put(store, "figi_ticker", ticker, {"ticker": ticker, "share_classes": [f"SC{ticker}"]})
+        put(store, "figi_class", f"SC{ticker}", {"share_class": f"SC{ticker}", "composites": [f"FIGI{ticker}"],
+                                                 "listings": [{"ticker": ticker, "compositeFIGI": f"FIGI{ticker}"}]})
+        given_isin(store, ticker, isin, f"FIGI{ticker}")
+    fund(store, "W", [{"constituent_name": "LIBERTY MEDIA CORP-A", "isin": "US53122A1007", "us_code": "53122A100",
+                       "weight": 0.0002, "country_of_exchange": None},
+                      {"constituent_name": "LIBERTY MEDIA CORP-C", "isin": "US53122K1088", "us_code": "53122K108",
+                       "weight": 0.0004, "country_of_exchange": None},
+                      {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.9994}])
+    asked = listings_asked(store, lambda cusip: {"53122A100": "FIGIFWONA", "53122K108": "FIGIFWONK"}.get(cusip))
+    store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "FWONA", "dollars": 300.0},
+                                                       {"ticker": "W", "dollars": 10000.0}]})
+    out = looked(store)
+    assert out["e"]["name:FWONA"] == pytest.approx(300.0 + 2.0 + 4.0)
+    assert asked == []

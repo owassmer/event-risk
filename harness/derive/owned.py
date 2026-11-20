@@ -16,9 +16,9 @@ AngloGold Ashanti's row, its JSE ticker ANG under a US exchange and a British IS
 Direct's. A listing the file holds as delisted names no company by its symbol, since its symbol can since have passed
 to another; an ISIN's delisted rows are still its company's. **Its country** is its home: the country it is
 registered in, its ISIN's, where it also trades there, by a listing of it there or the exchange its fund names there;
-and otherwise the one its own record gives, the file's country, or, for a company the file holds by none of these,
-the country of its profile at Yahoo Finance, the first that answers of the listing a search by its ISIN finds, of each
-its own ticker builds, and of each US line OpenFIGI maps its ISIN to. A depositary receipt's ISIN is the receipt's
+and otherwise the one its own record gives, the file's country, or, for a company the file holds by none of these and
+that is at least the look-through's floor of the portfolio, the country of its profile at Yahoo Finance, the first that answers of the listing a search by its ISIN finds and of
+each its own ticker builds. A depositary receipt's ISIN is the receipt's
 own, issued where the receipt trades, and says nothing of where its company is registered, so a company met by its
 receipt (the look-through marks the row) has the home its own record gives. A company whose classification the file
 does not state stands under no industry, and one whose home no source states under no country, each with its name, so
@@ -41,7 +41,7 @@ import pycountry
 from harness.derive import series
 from harness.derive.assets import isin_of
 from harness.derive.engine import Derivation, Inputs
-from harness.derive.portfolio import asof_of
+from harness.derive.portfolio import FLOOR, asof_of
 from harness.venues.yahoo import pick, region_of, symbols_for
 
 # Names of countries that ISO 3166 names otherwise: Yahoo's (read on profiles of funds drawn by rule) and FinanceDatabase's
@@ -141,7 +141,7 @@ def _held(rows: list[dict], country: str | None, isin: str) -> dict | None:
 
 def classify(entries: dict[str, dict], securities: dict, equity: Callable[[str], list[dict] | None],
              found: Callable[[str], str | None], profile: Callable[[str], dict | None],
-             figi: Callable[[str], list[str] | None]) -> dict[str, dict]:
+             figi: Callable[[str], list[str] | None], floor: float = 0.0) -> dict[str, dict]:
     """Each company's row in FinanceDatabase's file, industry and home, each read through the callables (the file's
     rows of `symbol:{SYMBOL}` or `isin:{ISIN}`; a listing's symbol by its ISIN; a symbol's profile; the US listings
     OpenFIGI maps an ISIN to), which give None for what is not read yet. Returns, for each company, `{symbol, how,
@@ -173,23 +173,20 @@ def classify(entries: dict[str, dict], securities: dict, equity: Callable[[str],
         home = isin[:2] if isin and isin[:2] in (trades | places | {named_there}) and not row.get("receipt") else None
         named = country_code(record.get("country")) if record else None
         p: dict = {}
-        if not wants and record is None and home is None:  # the file holds it by none of them: its profile's country
+        # the file holds it by none of them: its profile's country, for a company at or above the floor
+        if not wants and record is None and home is None and abs(entry.get("dollars") or 0.0) >= floor:
             identified = _identified(entry)
             searched = found(identified) if identified else ""
-            lines = figi(isin) if isin else []
             if searched is None:
                 wants.append(("symbol", identified))
-            if lines is None:
-                wants.append(("figi", isin))
-            if not wants:
-                for t in dict.fromkeys(([searched] if searched else []) + own + built + (lines or [])):
-                    got = profile(t)
-                    if got is None:
-                        wants.append(("profile", t))
-                        break
-                    if got.get("country"):
-                        symbol, p = t, got
-                        break
+            for t in dict.fromkeys(([searched] if searched else []) + own + built) if not wants else ():
+                got = profile(t)  # the listing its ISIN's search finds, then its own and those its ticker builds
+                if got is None:
+                    wants.append(("profile", t))
+                    break
+                if got.get("country"):
+                    symbol, p = t, got
+                    break
         out[key] = {"symbol": symbol, "how": "file" if record else ("profile" if p else None),
                     "sector": record.get("sector") if record else None,
                     "industry": record.get("industry") if record else None,
@@ -241,6 +238,7 @@ def _inputs(ctx: Inputs, subject: str) -> dict:
     month = asof[:7]
     looked = ctx.value("lookthrough", "portfolio")["output"]
     entries = companies(looked.get("owned") or {}, looked["kinds"])
+    floor = FLOOR * ((ctx.value("holdings", "portfolio")["output"] or {}).get("V") or 0.0)
     equities: dict[str, dict] = {}
     symbols: dict[str, dict] = {}
     profiles: dict[str, dict] = {}
@@ -251,7 +249,7 @@ def _inputs(ctx: Inputs, subject: str) -> dict:
     for _ in range(8):  # the file's rows, then the searches, mappings and profiles each needs, a round at a time
         equity, found, profile, figi = _readers(asof, equities, symbols, profiles, figis, ctx.payload)
         wanted: dict[str, set[str]] = defaultdict(set)
-        for got in classify(entries, looked.get("securities") or {}, equity, found, profile, figi).values():
+        for got in classify(entries, looked.get("securities") or {}, equity, found, profile, figi, floor).values():
             for kind, what in got["wants"]:
                 wanted[kind].add(what)
         if not wanted:
@@ -298,7 +296,7 @@ def _compute(m: dict, load) -> dict:
     entries = companies(owned, looked["kinds"])
     equity, found, profile, figi = _readers(m["asof"], m.get("equities") or {}, m["symbols"], m["profiles"],
                                             m.get("figis") or {}, load)
-    got = classify(entries, looked.get("securities") or {}, equity, found, profile, figi)
+    got = classify(entries, looked.get("securities") or {}, equity, found, profile, figi, FLOOR * value)
     weight = (lambda d: d / value) if value else (lambda d: None)
     others = {k: d for k, d in _kinds_of(owned, looked.get("funds") or {}).items() if abs(d) > 0.005}
     kinds = [{"kind": k, "dollars": d, "weight": weight(d)} for k, d in sorted(others.items(), key=lambda kd: -abs(kd[1]))]
@@ -339,7 +337,7 @@ def _counted(values) -> dict:
     return out
 
 
-WEIGHTS = Derivation("weights", 9, "Portfolio", _inputs, _compute,
+WEIGHTS = Derivation("weights", 10, "Portfolio", _inputs, _compute,
                      fields=("by_company", "by_industry", "by_country"),
                      subject_of=lambda store, entity: "portfolio", stage="industries")
 

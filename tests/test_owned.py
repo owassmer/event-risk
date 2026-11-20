@@ -204,8 +204,8 @@ def test_a_row_below_the_floor_named_by_its_cusip_alone_reaches_the_company_the_
 def test_a_company_the_file_holds_by_none_of_its_listings_has_the_home_its_profile_gives_and_no_industry(store):
     """Where FinanceDatabase's file holds a company by none of its symbols or its ISIN, its home is its ISIN's where
     its fund names that it trades there, and else the first profile that answers of the listings it has: its ISIN's
-    search, its own ticker where it trades, then each US line OpenFIGI maps its ISIN to. Its industry is the file's
-    classification's, and it stands under none: one classification for every market."""
+    search, then its own ticker where it trades; else it has none. Its industry is the file's classification's, and it
+    stands under none: one classification for every market."""
     ref(store, "F", "ETF")
     ref(store, "AAPL", "CS")
     fund(store, "F", [{"constituent_ticker": "AAPL", "figi": "FIGIAAPL", "isin": "US0378331005", "weight": 0.5},
@@ -230,8 +230,8 @@ def test_a_company_the_file_holds_by_none_of_its_listings_has_the_home_its_profi
     got = {c["company"]: (c["industry"], c["country"]) for c in w["by_company"] if "company" in c}
     assert got["QORVO INC"] == (None, "US")  # its fund's holdings say it trades in the US: no profile read
     assert got["INTL CONTAINER TERMINAL"] == (None, "PH")  # registered there and traded there: no profile read
-    assert got["Kazax Corporation"] == (None, "KZ")  # by the US line OpenFIGI maps its ISIN to
-    assert w["unclassified"] == {"industry": 3, "country": 0}
+    assert got["KAZAX CORP"] == (None, None)  # no profile of its listings gives a country
+    assert w["unclassified"] == {"industry": 3, "country": 1}
 
 
 def test_a_portfolio_naming_no_company_beyond_the_floors_reads_no_cusips_listing(store):
@@ -400,3 +400,16 @@ def test_a_report_row_named_by_its_isin_alone_is_matched_by_where_the_funds_hold
     assert built_symbols({"row": row}) == ["0700.HK"]
     stated = {**row, "constituent_ticker": "700", "country_of_exchange": "HK"}
     assert traded({**stated, "listing": {"ticker": "X", "country": "US"}}) == ("700", "HK")  # the fund's own first
+
+
+def test_a_company_below_the_floor_the_file_lacks_is_read_no_further_and_stands_under_no_country():
+    """MATH.md 3.1: every row is counted. A company below the look-through's floor that FinanceDatabase's file holds by
+    none of its symbols or its ISIN, and whose fund names no exchange in its ISIN's country, stands under no country;
+    no search or profile is read for it. At or above the floor, its profile is read."""
+    from harness.derive.owned import classify
+    nothing = (lambda subject: [], lambda listing: None, lambda symbol: None, lambda isin: [])
+    row = {"row": {"constituent_ticker": "ZZZ", "isin": "KZ0000000001"}, "dollars": 4.0}
+    small = classify({"row:a": row}, {}, *nothing, floor=5.0)["row:a"]
+    assert (small["home"], small["wants"]) == (None, [])
+    large = classify({"row:a": {**row, "dollars": 6.0}}, {}, *nothing, floor=5.0)["row:a"]
+    assert large["wants"] == [("symbol", "KZ0000000001:KZ")]

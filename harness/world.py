@@ -51,9 +51,11 @@ NONE_FILED = {  # a company with nothing in a kind of its SEC filings: what else
 SEC = "the SEC"
 SOURCE = {"news": "Benzinga", "earnings": "Benzinga", "guidance": "Benzinga", "ratings": "Benzinga",
           "risk_factors": SEC, "annual_report": SEC, "current_reports": SEC}
-# A foreign issuer's reports at the SEC, read from EDGAR where Massive carries none (Massive's are a 10-K's sections and
-# an 8-K's items): its annual reports, on Form 20-F or, a Canadian issuer's, 40-F; and its reports between them, 6-K.
-FOREIGN_FORMS = {"annual_report": ("20-F", "20-F/A", "40-F", "40-F/A"), "current_reports": ("6-K", "6-K/A")}
+# A company's reports at the SEC, read from EDGAR where the company record read carries none (Massive's are a 10-K's
+# sections and an 8-K's items, and without its key none): its annual reports, on Form 10-K, or a foreign issuer's 20-F
+# or, a Canadian issuer's, 40-F; and its reports between them, 8-K or a foreign issuer's 6-K.
+FOREIGN_FORMS = {"annual_report": ("10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"),
+                 "current_reports": ("8-K", "8-K/A", "6-K", "6-K/A")}
 FOREIGN_LIMIT = {"annual_report": 1, "current_reports": 10}  # the reports read where a search names no limit
 # What a company held only abroad has, by kind: its results and analysts' ratings on its own market (Yahoo Finance).
 ABROAD = ("earnings", "ratings")
@@ -368,7 +370,7 @@ class World:
         if series.is_abroad(ticker):  # a company named by its home listing: its record on its own market, by the
             # listing's own symbol, or the one `{ISIN}:{country}`'s search finds
             return self._record_abroad(ticker, kind, what, asof, call,
-                                       symbol=ticker if series.symbol_abroad(ticker) else None)
+                                       symbol=ticker if series.symbol_abroad(ticker) else None, given=given)
         name, cik, listed = self._reference(ticker, asof)
         if not cik:  # a line over the counter whose reference names none: the SEC's list of tickers
             from harness.derive.identity import store_lookup
@@ -400,7 +402,7 @@ class World:
             if foreign is not None:
                 return foreign
         if kind in ABROAD and answered(payload) and not payload.get("results"):  # none at Massive: its own listing's
-            return self._record_abroad(ticker, kind, what, asof, call, symbol=ticker.replace(".", "-"))
+            return self._record_abroad(ticker, kind, what, asof, call, symbol=ticker.replace(".", "-"), given=given)
         with self.store.lock:
             return self._company_answer(ticker, kind, what, filed, name, cik, asof, sent, row, call, payload)
 
@@ -435,9 +437,10 @@ class World:
 
     def _foreign_reports(self, ticker: str, kind: str, cik: str, asof: str, sent: dict, since: str, dated_by: str,
                          given: dict, call: int | None) -> dict | None:
-        """A foreign issuer's reports, from EDGAR by its CIK (harness.venues.sec): its 20-F or 40-F annual reports, or
-        its 6-K reports between them, filed within the search's dates, the latest first, each held as a page as a 10-K's
-        sections are; None for a company that files none of them, whose answer is Massive's."""
+        """A company's reports, from EDGAR by its CIK (harness.venues.sec), where the record read carries none: its
+        10-K, 20-F or 40-F annual reports, or its 8-K or 6-K reports between them, filed within the search's dates, the
+        latest first, each held as a page with the Exhibit 99s of its filing; None for a company that files none of
+        them, whose answer is the record's."""
         try:  # EDGAR is read outside the store's lock
             listed = self.store.fetch_data("sec_filings", str(cik).zfill(10), covering=(asof, asof), required=False)
         except Unavailable as e:
@@ -473,12 +476,14 @@ class World:
                 "returned": len(rows), "rows": rows, "more": len(chosen) > limit}
 
     def _record_abroad(self, listing: str, kind: str, what: str, asof: str, call: int | None,
-                       symbol: str | None = None) -> dict:
+                       symbol: str | None = None, given: dict | None = None) -> dict:
         """A company's results and analysts' ratings from its listing's record on its own market (harness.venues.yahoo
         `record`), in the fields a US listing's carry: for a company named by its home listing, and for a US line whose
         record holds none of them. Its results are those reported by the as-of, and each quarter's figures by its
         period's end alone, which carry no report date, only at today's as-of; its ratings are as they stand on the day
-        they are read, so a past as-of has none."""
+        they are read, so a past as-of has none. The analyst's own parameters bound them as its search's do: a result
+        dated outside `date.gte` to `date.lte` is left out, one with no date where either is given, and `limit`, 100
+        where none is given, keeps the newest, `more` saying whether there were others."""
         if kind not in ABROAD:
             raise StoreError(f"{listing} is listed only abroad, and its record here is its results and its analysts' "
                              f"ratings (kind earnings or ratings), not its {what}")
@@ -505,12 +510,16 @@ class World:
             elif kind == "ratings":
                 rows = [record["ratings"]] if record.get("ratings") else []
             else:
+                low, high = str((given or {}).get("date.gte") or ""), str((given or {}).get("date.lte") or "")
                 rows = [r for r in record.get("results") or []
-                        if (r["date"] <= asof if r.get("date") else asof >= today)]
-            search = self.store.record_search("search_company", {"symbol": symbol}, rows, endpoint=kind, query=listing,
-                                              call=call)
+                        if (r["date"] <= asof and low <= r["date"] and (not high or r["date"] <= high)
+                            if r.get("date") else asof >= today and not (low or high))]
+            limit = int((given or {}).get("limit") or EARNINGS_LIMIT)
+            more, rows = len(rows) > limit, rows[:limit]
+            search = self.store.record_search("search_company", {"symbol": symbol, **(given or {})}, rows,
+                                              endpoint=kind, query=listing, call=call)
         return {"search": search, "ticker": listing, "kind": kind, "symbol": symbol, "source": "Yahoo Finance",
-                "returned": len(rows), "rows": rows, "more": False,
+                "returned": len(rows), "rows": rows, "more": more,
                 **({} if record.get("status") == "OK" else {"reason": f"no record of {symbol} is found"})}
 
     def _company_answer(self, ticker: str, kind: str, what: str, filed: bool, name: str | None, cik: str | None,
@@ -518,7 +527,8 @@ class World:
         """A company search's answer from the record read (`payload`, or the row's own): its rows, each document held as
         a page, and the search recorded."""
         payload = payload if payload is not None else (self.store.data_payload(row["id"]) or {})
-        out: dict[str, Any] = {"ticker": ticker, "kind": kind, "params": sent, "source": SOURCE[kind]}
+        out: dict[str, Any] = {"ticker": ticker, "kind": kind, "params": sent,
+                               "source": payload.get("source") or SOURCE[kind]}
         status = payload.get("status")
         if answered(payload):
             rows = self._record_rows(kind, payload, row["retrieved_at"], cik)

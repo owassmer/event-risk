@@ -1,6 +1,6 @@
 # event-risk
 
-event-risk identifies events that could move your portfolio, estimates how likely they are, and calculates how much you could gain or lose under each outcome. The AI analyst (Claude Fable 5.2) starts with your holdings, including the companies you own through funds. It researches events that matter to those holdings and uses prediction markets where they provide evidence about an event's probability.
+event-risk identifies events that could move your portfolio, estimates how likely they are, and calculates how much you could gain or lose under each outcome. The AI analyst (Claude Fable 5.2 by default) starts with your holdings, including the companies you own through funds. It researches events that matter to those holdings and uses prediction markets where they provide evidence about an event's probability.
 
 [Explore the example portfolio](https://owassmer.github.io/event-risk/) to see the 13 events the analyst found for a sample brokerage account. Open a forecast to see its market evidence and assumptions, select a gain or loss to see which holdings contribute, or replay the analysis from the first message.
 
@@ -30,19 +30,22 @@ event-risk identifies events that could move your portfolio, estimates how likel
 For a live analysis, give your coding agent these instructions.
 
 ```
-Clone https://github.com/owassmer/event-risk and install it with uv. Help me set up .env for a live analysis
-using Anthropic and Massive, plus Baseten if available. Then start the app with `uv run event-risk`.
+Clone https://github.com/owassmer/event-risk and install it with uv. Put my Anthropic API key in .env,
+with Massive and Baseten keys if I have them. Then start the app with `uv run event-risk`.
 ```
 
 ### Before you begin
 
 Install [uv](https://docs.astral.sh/uv/) to run the project locally. It can install Python 3.12 or later for you. The saved example runs without API keys.
 
-A new analysis uses the following services.
+A new analysis needs one key.
 
-- [Anthropic](https://platform.claude.com/) provides Claude Fable 5.2 for the analyst and Claude Haiku 5.5 for web searches and page reading. Your account needs access to both models.
-- [Massive](https://massive.com/) provides prices, fund holdings, company news and filings. Coverage depends on your plan.
-- [Baseten](https://www.baseten.co/) is optional. It runs a second model (mammoth-1) that checks the analyst's interpretation of market questions and related claims.
+- [Anthropic](https://platform.claude.com/) provides the analyst's model, Claude Fable 5.2 unless you [choose another](#choose-the-analysts-model), and Claude Haiku 5.5 for web searches and page reading. Your account needs access to both models.
+
+Two more keys are optional.
+
+- [Massive](https://massive.com/) provides daily fund holdings and Benzinga's news, results, guidance and analyst ratings. Without it, the app reads prices from Yahoo Finance and fund holdings from Vanguard's own files or each fund's latest report at the SEC, and the analyst finds company news through web search and SEC filings.
+- [Baseten](https://www.baseten.co/) runs a second model (mammoth-1) that checks the analyst's interpretation of market questions and related claims.
 
 See [Keys and limits](#keys-and-limits) for the data included with each entitlement.
 
@@ -64,15 +67,29 @@ This opens a read-only copy of the same analysis as the web example. The sample 
 
 ### Add your keys
 
-For a live analysis, create a file named `.env` at the top of the repository. Include `BASETEN_API_KEY` if you want the second model to check the analyst's interpretations.
+For a live analysis, create a file named `.env` at the top of the repository with your Anthropic key. Add the other two if you have them.
 
 ```
 ANTHROPIC_API_KEY=...   # Analyst and web research
-MASSIVE_API_KEY=...     # Prices, fund holdings, company news and filings
-BASETEN_API_KEY=...     # Optional second model
+MASSIVE_API_KEY=...     # Optional: daily fund holdings, Benzinga's news and records
+BASETEN_API_KEY=...     # Optional: second model
+EVENT_RISK_MODEL=...    # Optional: the analyst's model
 ```
 
 Git ignores `.env`, so your keys stay on your machine.
+
+### Choose the analyst's model
+
+The analyst runs on Claude Fable 5.2 unless `EVENT_RISK_MODEL` in `.env` names another Claude model. Nearly all of an analysis's cost is the analyst's model, so this choice sets what an analysis costs. The table applies [Anthropic's prices](https://platform.claude.com/docs/en/about-claude/pricing) to the tokens the example analysis used.
+
+| Model | `EVENT_RISK_MODEL` | An analysis like the example's |
+|---|---|---|
+| Claude Fable 5.2 | `claude-fable-5-2` (the default) | About $17 |
+| Claude Opus 5.5 | `claude-opus-5-5` | About $11 |
+| Claude Sonnet 5.5 | `claude-sonnet-5-5` | About $6 |
+| Claude Haiku 5.5 | `claude-haiku-5-5` | About $2 |
+
+Claude Fable 5.2 produced the example. Another model may find different events and take a different number of steps, so its cost can differ from these figures.
 
 ### Start the page
 
@@ -91,6 +108,14 @@ uv run event-risk --store stores/<name>
 ```
 
 You can read a saved conversation and inspect its events without API keys.
+
+### Host it for other people
+
+```
+uv run event-risk-host
+```
+
+This serves the page to visitors. Each visitor enters their own Anthropic API key and chooses the analyst's model, and gets a separate process with its own conversations. A session's data is deleted when the visitor ends it, or after two hours with no page open while the analyst isn't working. The `Dockerfile` runs the same command in a container, and [harness/host.py](harness/host.py) describes its settings.
 
 ## Use the page
 
@@ -192,7 +217,7 @@ Below the figures are three tabs.
 **Probability** shows how the forecast follows from market evidence and the analyst's assumptions.
 
 - Each market shows its question, venue, bid, ask, depth and midpoint. Bids and asks are quoted in cents. The midpoint and forecast appear as percentages on a shared scale, alongside the market range.
-- Conditional probabilities appear with the conditions they depend on. These can connect the event to a related market question or another event.
+- Conditional probabilities appear as a table. Each condition, a related market question or another event, heads a column; each row is one of its outcomes, If Yes or If No, with the event's Yes and No probabilities in that case.
 - When a forecast tracks a market, the page compares the original and current readings. The history records forecasts and market readings at each reply. You can also inspect the searches and the analyst's reasons for excluding a market.
 
 **Assumptions** shows the price changes used to value each outcome.
@@ -270,6 +295,7 @@ event-risk/
 │   ├── settlements.py      which markets have settled, and how
 │   ├── render.py           draws the page's panels, views and the downloaded ledger
 │   ├── server.py           the web server behind the page, and the event-risk and example commands
+│   ├── host.py             the page hosted for visitors, each on their own key and in their own process
 │   ├── trace.py            the conversation's record: every message, step and result
 │   └── credentials.py      keeps API keys out of everything that is saved
 ├── knowledge/              what the analyst reads before it starts
@@ -282,6 +308,7 @@ event-risk/
 ├── web/                    the page in the browser: HTML, JavaScript, styles and fonts
 ├── tests/                  the test suite
 ├── example/                one finished conversation, which uv run example opens
+├── Dockerfile              runs the hosted page (event-risk-host) in a container
 └── stores/                 your saved conversations, one folder each, kept out of Git
 ```
 
@@ -308,16 +335,16 @@ stores/<name>/
 |---|---|---|
 | `ANTHROPIC_API_KEY` | The analyst, its web search, and its reading of web pages | The analyst can't reply. Saved conversations still open. |
 | `BASETEN_API_KEY` | The second model's checks on market questions and relationships between claims | The analyst and calculations still run. New interpretations do not receive an independent check. |
-| `MASSIVE_API_KEY` | Prices, what each fund holds, and companies' news and filings | A new portfolio can't be priced, and companies' news and records can't be read. Saved conversations still open. |
+| `MASSIVE_API_KEY` | Daily fund holdings; Benzinga's news, results, guidance and analyst ratings; sections of SEC filings; listed option quotes | Prices come from Yahoo Finance. A Vanguard fund's holdings come from Vanguard's own file, and any other fund's from its latest report at the SEC. The analyst finds company news through web search and SEC filings. Guidance and listed option quotes aren't available, so a fund that holds listed options is treated as a single position. |
 
 Massive coverage depends on your plan.
 
 - **Stocks** provides prices, company reference data and sections of US companies' SEC filings, including 10-K risk factors and 8-K disclosures.
-- **ETF Global** provides daily fund holdings. Without this entitlement, the app uses the latest holdings report available from the SEC. It treats funds that do not report holdings there, such as some commodity pools or crypto trusts, as single positions.
+- **ETF Global** provides daily fund holdings. Without this entitlement, the app reads a Vanguard fund's holdings from the file Vanguard publishes and any other fund's from its latest holdings report at the SEC. It treats funds that do not report holdings there, such as some commodity pools or crypto trusts, as single positions.
 - **Benzinga** provides news, results, guidance and analyst ratings. SEC filings remain available through Stocks.
 - **Options** provides listed option quotes. These are needed to price a fund that holds listed options, such as a covered-call or buffer fund.
 
-Other sources are available without keys. Coinbase Exchange supplies crypto prices. Yahoo Finance covers non-US listings, currencies and mutual funds. [FinanceDatabase](https://github.com/JerBouma/FinanceDatabase) supplies company industries, countries and descriptions. OpenFIGI, the SEC and GLEIF identify fund holdings and their issuers. Yield and exchange-rate data come from the US Treasury, the European Central Bank, Frankfurter, the Federal Reserve, the Bank for International Settlements, Japan's Ministry of Finance and the Bank of Canada.
+Other sources are available without keys. Coinbase Exchange supplies crypto prices. Yahoo Finance covers non-US listings, currencies and mutual funds, and US prices when no Massive key is set. [FinanceDatabase](https://github.com/JerBouma/FinanceDatabase) supplies company industries, countries and descriptions. OpenFIGI, the SEC and GLEIF identify fund holdings and their issuers. Yield and exchange-rate data come from the US Treasury, the European Central Bank, Frankfurter, the Federal Reserve, the Bank for International Settlements, Japan's Ministry of Finance and the Bank of Canada.
 
 For faster OpenFIGI requests, set `OPENFIGI_API_KEY`. Set `SEC_CONTACT` in `.env` to the name and email you want to send with SEC requests.
 
@@ -325,7 +352,7 @@ The message box identifies any missing key and the feature that needs it.
 
 ### What to expect
 
-- The first portfolio on a machine takes the longest to price. The app loads two years of prices for direct and underlying holdings and downloads the company reference file. Later analyses reuse that data.
+- The first portfolio on a machine takes the longest to price. The app loads two years of prices for direct and underlying holdings and downloads the company reference file. Later analyses reuse that data. With only the Anthropic key, the example portfolio takes about a minute and a half to price the first time. Most of that is identifying fund holdings at OpenFIGI, which a free OpenFIGI key shortens (see above).
 - An initial analysis usually takes 20–30 minutes. The analyst reads news and company reports, searches markets and builds events in roughly 100–200 steps. You can watch the steps and open events as they appear.
 - The default analysis horizon is 180 days. You can ask for a different horizon.
 

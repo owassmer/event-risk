@@ -65,6 +65,7 @@ class MutualFunds:
     def __init__(self, massive: Any, sec: Any, yahoo: Any):
         self.massive, self.sec, self.yahoo = massive, sec, yahoo
         self._decided: dict[tuple[str, str], dict | None] = {}
+        self._read_with: dict[tuple[str, str], dict] = {}  # each listing's reference on a day, read with others
         self._lock = threading.Lock()
 
     def exchange_traded(self, entry: dict, ticker: str, day: str) -> str | None:
@@ -76,7 +77,9 @@ class MutualFunds:
         at = {f: i for i, f in enumerate(listed.get("fields") or [])}
         for symbol in sorted({str(r[at["symbol"]]).upper() for r in listed.get("data") or []
                               if r[at["seriesId"]] == entry.get("series")} - {ticker}):
-            got = self.massive.ticker(symbol, day)["payload"]
+            with self._lock:
+                got = self._read_with.get((symbol, day))
+            got = got if got is not None else self.massive.ticker(symbol, day)["payload"]
             if got.get("status") == "OK" and (got.get("results") or {}).get("type") == "ETF":
                 return symbol
         return None
@@ -106,6 +109,15 @@ class MutualFunds:
         with self._lock:
             self._decided[key] = found
         return found
+
+    def _listed(self, answers: dict[str, dict], day: str) -> None:
+        """Whether each ticker is a listing on the day, as its reference read with others answers it (_unlisted)."""
+        with self._lock:
+            for ticker, got in answers.items():
+                status = ((got or {}).get("payload") or {}).get("status") if isinstance(got, dict) else None
+                if status in ("OK", "NOT_FOUND"):
+                    self._decided.setdefault((ticker.upper(), "listed", day), None if status == "NOT_FOUND" else {})
+                    self._read_with[(ticker.upper(), day)] = got["payload"]
 
     def _unlisted(self, ticker: str, day: str) -> bool:
         """Whether no listing's reference gives the ticker on the day, asked once a day."""
@@ -208,5 +220,30 @@ class MutualFunds:
                 return self._answer({"status": "OK", "results": []}, CHART.format(ticker), {}, tuple(covering), now())
             if form is not None:
                 one.parse = form  # type: ignore[attr-defined]
+            if kind == "ticker_ref" and hasattr(listing, "many"):  # the listings' references asked together, as their
+                def many(subjects: Any, covering: Any) -> dict[str, dict]:  # client asks them; the rest one by one
+                    asked = list(subjects)
+                    # whether each is a listing, which decides a share class the SEC lists as a mutual fund's, from
+                    # one read of the listings' references: on the day, and today
+                    listable = [x for x in asked if not series.symbol_abroad(x)]
+                    listed = dict(listing.many(listable, covering)) if listable else {}
+                    self._listed(listed, covering[1])
+                    today = datetime.now(NY).date().isoformat()
+                    classes = [x for x in listable if self._class(x.upper()) is not None]
+                    if classes and today != covering[1]:
+                        self._listed(dict(listing.many(classes, (today, today))), today)
+                    alone = [x for x in asked if self.mutual(x, covering[1]) is not None or series.symbol_abroad(x)]
+                    out = {x: listed[x] for x in asked if x not in alone and x in listed}
+                    for x, got in list(out.items()):
+                        if (got.get("payload") or {}).get("status") == "NOT_FOUND" and series.symbol_abroad(x):
+                            out[x] = one(x, covering)
+                        elif isinstance(got.get("payload"), dict):
+                            got["payload"]["parse"] = form
+                    if alone:  # each read on its own, side by side
+                        from concurrent.futures import ThreadPoolExecutor
+                        with ThreadPoolExecutor(min(8, len(alone))) as pool:
+                            out.update(zip(alone, pool.map(lambda x: one(x, covering), alone)))
+                    return out
+                one.many = many  # type: ignore[attr-defined]
             return one
         return {kind: routed(kind) for kind in ROUTED if kind in base}
