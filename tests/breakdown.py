@@ -26,6 +26,13 @@ def stated(value, why: str = WHY) -> dict:
     return {**value, "note": why} if isinstance(value, dict) else {"value": value, "note": why}
 
 
+def named(statements: list) -> set:
+    """The statements of a set that cannot hold, as check() and a statement's return name them (MATH.md 1.10): a chance
+    by its proposition and what it is given, (of, given, given_not); a link and a proposition's fields by their ids."""
+    return {(x["of"], tuple(x["given"]), tuple(x["given_not"])) if isinstance(x, dict) and "given" in x else
+            x["id"] if isinstance(x, dict) else x for x in statements}
+
+
 def _based(v) -> bool:
     return isinstance(v, dict) and bool(set(v) & set(schema.BASIS))
 
@@ -52,6 +59,8 @@ def key(kind: str, statement: str, evidence: list[dict]) -> tuple:
     """A check named by its kind and the titles or questions it compares."""
     content = [e["content"] for e in evidence]
     props = [c["proposition"] for c in content if "proposition" in c]
+    if kind == "market_implication":  # two markets, each by its question
+        return (kind, *(c["market"] for c in content if "market" in c))
     if kind.startswith("market"):
         return (kind, props[0], next(c["market"] for c in content if "market" in c))
     return (kind, props[0], props[1])
@@ -164,13 +173,14 @@ class World:
         return self.derived(pid, "probability")
 
     def chances(self, pid: str, *items: dict, keep: bool = True) -> dict:
-        """State chances of pid, each {given, given_not, value}; with `keep`, beside those it states, any given the same
-        replaced."""
+        """State chances of pid, each {given, given_not, value}, each in place of the one given the same propositions
+        (ONTOLOGY.md 2.1); without `keep`, every other chance of pid taken away in the same edit, its value null."""
         cond = lambda c: (sorted(c.get("given") or []), sorted(c.get("given_not") or []))  # noqa: E731
         new = [{"given": [], "given_not": [], **c} for c in items]
-        held = [c for c in (self.store.stated_of(pid).get("chances") or []) if keep and
-                all(cond(c) != cond(n) for n in new)]
-        return self.store.edit(pid, "chances", held + with_basis("Proposition", {"chances": new})["chances"])
+        gone = [] if keep else [{"given": c["given"], "given_not": c["given_not"], "value": None}
+                                for c in self.store.stated_of(pid).get("chances") or []
+                                if all(cond(c) != cond(n) for n in new)]
+        return self.store.edit(pid, "chances", with_basis("Proposition", {"chances": new})["chances"] + gone)
 
     def left_open(self, pid: str):
         return self.derived(pid, "left_open")

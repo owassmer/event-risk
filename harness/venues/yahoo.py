@@ -76,15 +76,7 @@ named as a browser is (`SITE_AGENT`): named as this client, or as httpx, the cru
 read by it too: after some thousands of searches in a day, the search answered this client's own name 429 on every
 read (830 of 830) while it answered the browser's name 200; and on 2026-11-12 the chart answered this client's name 429
 on every read and the browser's 200, so the chart is read under the browser's name too, by a client of its own, paced
-and cooled apart from the site's. Each shape was checked against live answers on 2026-11-11:
-- `POST /v1/finance/screener?crumb=&formatted=false&useRecordsResponse=true` with `{size, offset, sortField,
-  sortType, quoteType: "EQUITY", includeFields, topOperator: "AND", query: {operator: "or", operands: [{operator:
-  "eq", operands: ["ticker", <symbol>]}, ...]}}` answers `{finance: {result: [{total, records: [{ticker, companyName,
-  sector, industry, exchange}]}]}}`: each listing it holds among the symbols named, on any market, with its sector and
-  its industry in Yahoo's one classification for every market. A query names at most SCREEN_TICKERS symbols, so its
-  answer is one page of SCREEN_PAGE (read live: 250 answered in a fraction of a second, 500 were refused
-  "Too many operators"). A symbol it holds no listing for is left out of its answer, and a listing with no sector carries
-  no classification to read.
+apart from the site's. Each shape was checked against live answers on 2026-11-11:
 - `GET /v10/finance/quoteSummary/{symbol}?crumb=&modules=assetProfile,price` answers `{quoteSummary: {result:
   [{assetProfile: {country, sector, industry, ...}, price: {longName, shortName, ...}}]}}`: the company's own record
   of where it is, its sector and industry, and its name. Some 60 a second hold, 12 at once; 24 at once were refused
@@ -113,16 +105,13 @@ A listing's symbol is its ticker where it trades with its exchange's suffix (`sy
 by the six-digit number's first digit, `000100.KS` Seoul (ETF Global writes `A000100`), `AC.MX` Mexico (ETF Global
 writes `AC *`), `BRK-B` a US class. A fund's row states its ticker as its exchange gives it, sometimes
 with the exchange's code after a space (`AAL LN`), a Swedish class after one (`ADDT B`, Yahoo's `ADDT-B.ST`) and a
-Thai foreign board after a dash (`ADVANC-F`, Yahoo's `ADVANC.BK`). A symbol is confirmed by the screener's listings,
-never taken on its form alone. Read on the equity rows of 14 funds drawn by rule, 10,036 of 11,040 matched their
-listing this way; 501 more were found by searching their ISIN (`symbol`), 72 by their profile.
+Thai foreign board after a dash (`ADVANC-F`, Yahoo's `ADVANC.BK`). A symbol is confirmed by a listing that holds it
+(FinanceDatabase's file, harness.venues.equities, whose symbols are Yahoo's), never taken on its form alone.
 
-What industry and country a company has changes seldom, and a listing new since is found by its profile, so a listing's
-sector, a listing's symbol and a company's profile are kept a month on a machine: each read under a subject naming
-its month (`{subject}@{YYYY-MM}`).
+What country a company has changes seldom, and a listing new since is found by its profile, so a listing's symbol and
+a company's profile are kept a month on a machine: each read under a subject naming its month (`{subject}@{YYYY-MM}`).
 
-A 429 or a server error is waited out and tried again; past its retries the read fails (VenueError), and where a
-surface does not answer it is not asked again for a minute: the price charts, and the site's own surfaces, each apart.
+A 429 or a server error is waited out and tried again; past its retries the read fails (VenueError).
 """
 
 from __future__ import annotations
@@ -137,7 +126,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from harness import sessions
-from harness.venues.http import Cooldown, Pace, VenueError, VenueRefused, carried, now
+from harness.venues.http import Pace, VenueError, VenueRefused, carried, now
 
 BASE = "https://query1.finance.yahoo.com"
 PARSE = 2  # the form a `home` payload's moments are in: 2, each exchange's own timetable where it states one
@@ -178,9 +167,7 @@ DEALERS = ("FRA", "STU", "DUS", "MUN", "HAM", "PNK")
 
 # Seconds before a search that found nothing is asked again.
 SEARCH_AGAIN = 2.0
-SITE = 1 / 60  # seconds between the site's own reads (the screener, a company's record): their pace, apart from prices
-SCREEN_PAGE = SCREEN_TICKERS = 250  # a page of the screener's answer, and the symbols one query names
-SCREEN_AT_ONCE = 8  # queries read at once
+SITE = 1 / 60  # seconds between the site's own reads (a search, a company's record): their pace, apart from prices
 # Each country's exchanges, by the suffix Yahoo writes their listings' symbols with, the main market first.
 SUFFIXES = {"JP": (".T",), "HK": (".HK",), "TW": (".TW", ".TWO"), "KR": (".KS", ".KQ"), "IN": (".NS", ".BO"),
             "GB": (".L",), "FR": (".PA",), "DE": (".DE", ".F"), "NL": (".AS",), "CH": (".SW",), "SE": (".ST",),
@@ -254,7 +241,7 @@ def region_of(symbol: str) -> str:
 COOKIE, CRUMB = "https://fc.yahoo.com", "/v1/test/getcrumb"
 SITE_AGENT = "Mozilla/5.0"  # how the site's own surfaces are read: its edge answers its crumb to a browser's name
 PROFILE = "assetProfile,price"
-RECORD = "earnings,recommendationTrend,financialData"  # a company's results and analysts' ratings
+RECORD = "earnings,recommendationTrend,financialData,calendarEvents"  # a company's results and analysts' ratings
 
 
 def mic_of(code: str | None) -> str | None:
@@ -399,15 +386,16 @@ def _reported(earnings: dict, currency: str | None) -> list[dict]:
 
 class Yahoo:
     def __init__(self, *, http: httpx.Client | None = None, interval: float = INTERVAL, pause: float = 1.0,
-                 site: httpx.Client | None = None):
+                 site: httpx.Client | None = None, equities: Any = None):
         # the chart is read named as a browser, as the site's surfaces are: its edge answered this client's name, and
         # httpx's, 429 on every read while it answered a browser's 200 on the same request (read live)
         self.http = http or httpx.Client(timeout=30.0, follow_redirects=True, headers={"User-Agent": SITE_AGENT})
         self.interval, self.pause = interval, pause
-        # each surface its own: a price chart refused says nothing of the site's listings, a profile, or a search, which
-        # are answered apart and paced apart (read live: charts refused 429 while the screener answered every page)
-        self.cooldown = Cooldown("Yahoo Finance")
-        self.site_cooldown = Cooldown("Yahoo Finance's listings and company records")
+        # FinanceDatabase's equities (harness.venues.equities): a listing's symbol by its ISIN and what its company does,
+        # read from the file first, and from Yahoo's own search and record where the file holds none
+        self.equities = equities
+        # each surface paced apart: the price charts and the site's listings, profiles and searches are answered apart
+        # (read live: charts refused 429 while the site's screener answered every page)
         self._pace = Pace(interval)  # the price charts' pace
         self._symbols: dict[tuple[str, str], str | None] = {}  # each listing's symbol, or none, found once a day
         self._sessions: dict[tuple[str, str], dict] = {}  # each exchange's sessions, read once a day
@@ -425,7 +413,6 @@ class Yahoo:
         the symbol names nothing (404, or a chart with no result) is None; a request Yahoo refuses as malformed (400,
         or 422, as for an hourly window older than it serves) is ours to correct, raised as VenueRefused and never
         kept as an answer."""
-        self.cooldown.check()
         for attempt in range(ATTEMPTS):
             self._pace.take()
             try:
@@ -450,7 +437,6 @@ class Yahoo:
                         continue
             if attempt < ATTEMPTS - 1:
                 time.sleep(self.pause * 2 ** attempt)
-        self.cooldown.failed()
         raise VenueError(failure)
 
     def _crumbed(self, again: bool = False) -> str:
@@ -475,7 +461,6 @@ class Yahoo:
     def _site(self, path: str, params: dict | None = None, body: dict | None = None) -> Any:
         """One answer of the site's own surfaces, with its crumb, at their own pace: a crumb it no longer holds read
         again once; a 429 or a server error waited out and tried again; 404 is None; past ATTEMPTS a VenueError."""
-        self.site_cooldown.check()
         again = False
         for attempt in range(ATTEMPTS):
             self._site_pace.take()
@@ -503,48 +488,17 @@ class Yahoo:
                     failure = f"Yahoo Finance answered {response.status_code}"
             if attempt < ATTEMPTS - 1:
                 time.sleep(self.pause * 2 ** attempt)
-        self.site_cooldown.failed()
         raise VenueError(failure)
-
-    def _screen(self, symbols: list[str]) -> list[dict]:
-        """The listings the screener holds among these symbols, at most SCREEN_TICKERS of them: one page."""
-        body = {"size": SCREEN_PAGE, "offset": 0, "sortField": "ticker", "sortType": "ASC", "quoteType": "EQUITY",
-                "includeFields": ["ticker", "companyshortname", "sector", "industry", "exchange"],
-                "topOperator": "AND", "query": {"operator": "or", "operands": [
-                    {"operator": "eq", "operands": ["ticker", s]} for s in symbols]}}
-        found = self._site("/v1/finance/screener", {"formatted": "false", "useRecordsResponse": "true",
-                                                    "lang": "en-US", "region": "US"}, body)
-        result = (((found or {}).get("finance") or {}).get("result") or [{}])[0] or {}
-        return result.get("records") or []
-
-    def sectors(self, symbols: list[str], day: str) -> dict[str, dict]:
-        """Each listing's sector and industry, by its symbol: `{status: "OK", symbol, name, sector, industry, exchange}`
-        where the screener holds it with a sector, and `{status: "NOT_FOUND", symbol}` where it holds none; the
-        symbols asked SCREEN_TICKERS to a query, SCREEN_AT_ONCE queries at once."""
-        from concurrent.futures import ThreadPoolExecutor
-        retrieved = now()
-        asked = sorted(set(symbols))
-        batches = [asked[k:k + SCREEN_TICKERS] for k in range(0, len(asked), SCREEN_TICKERS)]
-        with ThreadPoolExecutor(min(SCREEN_AT_ONCE, len(batches) or 1)) as pool:
-            records = [r for page in pool.map(carried(self._screen), batches) for r in page if isinstance(r, dict)]
-        held = {r["ticker"]: r for r in records if r.get("ticker") and r.get("sector")}
-        out = {}
-        for symbol in asked:
-            r = held.get(symbol)
-            payload = {"status": "OK", "symbol": symbol, "name": r.get("companyName"), "sector": r.get("sector"),
-                       "industry": r.get("industry"), "exchange": r.get("exchange")} if r else \
-                {"status": "NOT_FOUND", "symbol": symbol}
-            out[symbol] = {"payload": payload, "request": {"method": "POST", "url": BASE + "/v1/finance/screener",
-                                                          "ticker": symbol},
-                           "retrieved_at": retrieved, "range": (day, day)}
-        return out
 
     def record(self, symbol: str, day: str) -> dict:
         """A company's results and analysts' ratings, in the fields a US listing's carry (Massive's Benzinga rows), in
         its currency. `results`: each report, the latest first, with its date, and where its source states them, its
         period's end, fiscal period and year, its EPS actual and estimated with the surprise, and its revenue and
         earnings: the module's latest four, with each quarter's figures by its period's end that no report row holds
-        (no report date), then the calendar's earlier reports. `ratings`: how many analysts give each rating this month,
+        (no report date), then the calendar's earlier reports; and a report `calendarEvents` states as given (its
+        `earningsDate`, `isEarningsDateEstimate` false, by the day read) that no row holds, by its date alone: a company
+        that reports twice a year has no quarter's figures here, and its calendar reads a report with no EPS figure as a
+        meeting (read live: a half-yearly reporter's interim results). `ratings`: how many analysts give each rating this month,
         and their price targets, as they stand on the day read."""
         retrieved = now()
         request = {"method": "GET", "url": BASE + f"/v10/finance/quoteSummary/{symbol}", "modules": RECORD}
@@ -564,6 +518,12 @@ class Yahoo:
         rows += [{**q, "currency": currency} for q in self._quarters(symbol) if q["period_end"] not in covered]
         first = min((r["date"] for r in rows if r.get("date")), default=None)
         rows += [{**r, "currency": currency} for r in self._calendar(symbol) if first is None or r["date"] < first]
+        stated = (result.get("calendarEvents") or {}).get("earnings") or {}
+        if not stated.get("isEarningsDateEstimate"):
+            dated = {r.get("date") for r in rows}
+            rows += [{"date": when} for when in sorted({(d or {}).get("fmt") for d in stated.get("earningsDate") or []
+                                                        if isinstance(d, dict)} - {None})
+                     if when <= day and when not in dated]
         rows.sort(key=lambda r: r.get("date") or r.get("period_end") or "", reverse=True)
         trend = ((result.get("recommendationTrend") or {}).get("trend") or [{}])[0] or {}
         ratings = {k: v for k, v in {
@@ -695,15 +655,19 @@ class Yahoo:
         currency, _ = unit(meta.get("currency"))
         kind = {"EQUITY": "CS", "ETF": "ETF", "MUTUALFUND": "MF"}.get(meta.get("instrumentType") or "",
                                                                         meta.get("instrumentType"))
-        try:  # what it does, in its own record's words (`assetProfile.longBusinessSummary`), as Massive's description is
-            found = self._site(f"/v10/finance/quoteSummary/{symbol}", {"modules": "assetProfile"})
-        except VenueRefused:  # read live: a symbol Yahoo keeps no record for is answered 400
-            found = None
-        profile = ((((found or {}).get("quoteSummary") or {}).get("result") or [{}])[0] or {}).get("assetProfile") or {}
+        does = self.equities.summary(symbol) if self.equities is not None else None
+        if does is None:  # what it does, in its own record's words (`assetProfile.longBusinessSummary`)
+            try:
+                found = self._site(f"/v10/finance/quoteSummary/{symbol}", {"modules": "assetProfile"})
+            except VenueRefused:  # read live: a symbol Yahoo keeps no record for is answered 400
+                found = None
+            profile = ((((found or {}).get("quoteSummary") or {}).get("result") or [{}])[0] or {}).get(
+                "assetProfile") or {}
+            does = profile.get("longBusinessSummary") or None
         results = {"ticker": symbol, "name": meta.get("longName") or meta.get("shortName"), "type": kind,
                    "market": "home", "locale": exchange[1].lower(), "primary_exchange": exchange[0],
                    "currency_name": (currency or "").lower() or None, "active": True,
-                   **({"description": profile["longBusinessSummary"]} if profile.get("longBusinessSummary") else {})}
+                   **({"description": does} if does else {})}
         return {"payload": {"status": "OK", "results": results}, "request": request, "retrieved_at": retrieved,
                 "range": (day, day)}
 
@@ -711,12 +675,21 @@ class Yahoo:
 
     def symbol(self, listing: str) -> str | None:
         """The symbol of a listing: its own where it is named by its symbol (`0700.HK`); for `{ISIN}:{country}`, the
-        security the ISIN names, on its country's exchange."""
+        security the ISIN names, on its country's exchange, else on its ISIN's country's, else on any but a dealer's:
+        among the listings FinanceDatabase's file holds under the ISIN, else among those Yahoo's search by the ISIN
+        finds, the primary market first (pick), the file's symbols and exchange codes being Yahoo's."""
         if ":" not in listing:
             return listing
         key = (listing, date.today().isoformat())  # a listing not found today is asked again tomorrow, as one found is
         if key not in self._symbols:
             isin, _, country = listing.partition(":")
+            if self.equities is not None:
+                held = [{"symbol": r["symbol"], "exchange": r["exchange"], "quoteType": "EQUITY"}
+                        for r in self.equities.rows(isin=isin) if not r["delisted"]]
+                found = pick(held, country.upper()) or pick(held, isin[:2].upper()) or pick(held, None)
+                if found:
+                    self._symbols[key] = found
+                    return found
             params = {"q": isin, "quotesCount": 20, "newsCount": 0}
             quotes = (self._site("/v1/finance/search", params) or {}).get("quotes") or []
             if not quotes:  # read live, the search answered an ISIN it finds with none, under load: asked once more
@@ -845,16 +818,7 @@ class Yahoo:
         def monthly(read: Callable[[str, str], dict]) -> Callable[[str, Any], dict]:
             return lambda subject, covering: read(subject.rsplit("@", 1)[0], covering[1])
 
-        def listing_sector(subject: str, covering: Any) -> dict:  # `{symbol}@{YYYY-MM}`, a month's reading
-            return self.sectors([subject.rsplit("@", 1)[0]], covering[1])[subject.rsplit("@", 1)[0]]
-
-        def sectors_of(subjects: Any, covering: Any) -> dict[str, dict]:  # many at once, as the store's prefetch asks
-            named = {str(s).rsplit("@", 1)[0]: s for s in subjects}
-            return {named[k]: v for k, v in self.sectors(sorted(named), covering[1]).items()}
-
-        listing_sector.many = sectors_of  # type: ignore[attr-defined]
         return {"home": home,
-                "listing_sector": listing_sector,
                 "profile": monthly(self.profile),
                 "listing_symbol": monthly(self.listing_symbol),
                 "company_record": lambda subject, covering: self.record(subject, covering[1]),

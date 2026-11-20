@@ -61,14 +61,14 @@ def test_many_subjects_are_served_as_each_alone_would_be_with_one_query_a_chunk(
     fetch.many = many
     fetch.parse = 2
     month = (today(), today())
-    obs.keep("listing_sector", "OK@m", month, answer("OK@m", month, at=yesterday))  # names its listing: served
-    obs.keep("listing_sector", "NONE@m", month, answer("NONE@m", month, status="NOT_FOUND"))  # names none, today
-    obs.keep("listing_sector", "OLD@m", month, answer("OLD@m", month, status="NOT_FOUND", at=yesterday))  # read again
-    obs.keep("listing_sector", "FORM@m", month, answer("FORM@m", month, parse=1))  # another form: read again
+    obs.keep("profile", "OK@m", month, answer("OK@m", month, at=yesterday))  # names its listing: served
+    obs.keep("profile", "NONE@m", month, answer("NONE@m", month, status="NOT_FOUND"))  # names none, today
+    obs.keep("profile", "OLD@m", month, answer("OLD@m", month, status="NOT_FOUND", at=yesterday))  # read again
+    obs.keep("profile", "FORM@m", month, answer("FORM@m", month, parse=1))  # another form: read again
     many_kept = [f"S{i}@m" for i in range(1100)]
     for s in many_kept:
-        obs.keep("listing_sector", s, month, answer(s, month, at=yesterday))
-    sectors = obs.shared("listing_sector", fetch)
+        obs.keep("profile", s, month, answer(s, month, at=yesterday))
+    sectors = obs.shared("profile", fetch)
     alone = {s: sectors(s, month) for s in ("OK@m", "NONE@m")}
     assert asked == []  # each served, as kept
 

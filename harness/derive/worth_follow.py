@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 
-from harness.derive import episode, impact, outcomes, portfolio, structure, valuation, worlds
+from harness.derive import episode, impact, outcomes, portfolio, valuation, worlds
 from harness.derive.channels import ordered_channels
 from harness.derive.engine import Derivation, Inputs, Refused, Unavailable
 
@@ -42,7 +42,7 @@ def subject(event: str, name: str) -> str:
 
 
 def _ways(ctx: Inputs, pid: str) -> list[dict]:
-    return outcomes.ways_under(lambda oid: ctx.links(oid, "way", "both"), pid, lambda r: structure.bands(ctx, r))
+    return outcomes.tree(ctx, pid)
 
 
 def _unplaced_inputs(ctx: Inputs, key: str) -> dict:

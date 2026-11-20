@@ -122,6 +122,35 @@ def test_a_book_whose_bid_and_ask_meet_holds_its_proposition_and_one_quoted_on_o
     assert [s["link"] for s in out["stretched"]] == ["e"] and p(out, "E") == pytest.approx(0.25, abs=1e-9)
 
 
+def midpoint(link, on, price):
+    """A book whose price was observed and whose quotes were not, as a venue's history that keeps only the midpoint
+    gives it (MATH.md 3.3)."""
+    return {"link": link, "on": on, "bid": None, "ask": None, "price": price, "depth": None}
+
+
+def test_a_price_observed_without_its_quotes_is_the_widest_book():
+    """MATH.md 3.3, 1.2: a price whose bid and ask were not kept is a book whose range is 0 to 1. Alone on its proposition
+    it bounds nothing and holds the proposition at its price. Where an observed book bears on it, it gives way as the
+    widest book does, its distance measured in a half-spread of 0.5 against the observed book's 0.02: with E's book at
+    0.30-0.34, priced 0.32, B's price 0.20, and E implying B, E = B at the least of 2500 (E - 0.32)^2 + 4 (B - 0.20)^2,
+    which is 1601.6 / 5008, and no book is stretched, since the price's book reaches from 0 to 1."""
+    out = read(["B"], books=[midpoint("h", "B", 0.20)])
+    assert p(out, "B") == pytest.approx(0.20, abs=1e-9)
+    assert (out["props"]["B"]["range"]["lo"], out["props"]["B"]["range"]["hi"]) == pytest.approx((0.0, 1.0))
+    out = read(["E", "B"], [implies("l", "E", "B")], books=[book("e", "E", 0.30, 0.34), midpoint("h", "B", 0.20)])
+    assert p(out, "E") == pytest.approx(1601.6 / 5008, abs=1e-7) and p(out, "B") == pytest.approx(1601.6 / 5008, abs=1e-7)
+    assert out["stretched"] == [] and out["cannot_hold"] == []
+    assert (out["props"]["B"]["range"]["lo"], out["props"]["B"]["range"]["hi"]) == pytest.approx((0.30, 1.0))
+
+
+def test_where_two_books_on_one_proposition_have_no_depth_the_one_whose_quotes_were_observed_is_its_price():
+    """A day's closing quotes have no recorded depth, and neither has a price observed without its quotes: of the two
+    on one proposition, the price it stays near is the observed book's, whichever was linked first."""
+    for books in ([midpoint("h", "E", 0.50), book("q", "E", 0.30, 0.34, None)],
+                  [book("q", "E", 0.30, 0.34, None), midpoint("h", "E", 0.50)]):
+        assert p(read(["E"], books=books), "E") == pytest.approx(0.32, abs=1e-9)
+
+
 def test_the_ways_of_spec_1_5():
     """An event at 0.30 with two ways, the first's chance given it 0.7: worlds 0.21, 0.09 and 0.70; the second way, with
     no chance, takes what the first leaves."""
@@ -415,3 +444,111 @@ def test_a_group_that_holds_a_smaller_conflicting_one_is_not_listed_beside_it():
     too, but only because they hold that pair, so the pair alone is listed."""
     out = read(["T", "R"], [implies("i", "T", "R")], [chance("R", 0.5, ["T"]), chance("T", 0.62, ["R"])])
     assert [set(c["statements"]) for c in out["cannot_hold"]] == [{"R|T|", "i"}]
+
+
+# ---------------------------------------------------------------- the range a chance can take
+
+
+def test_the_range_the_worked_rows_chance_can_take_is_what_the_books_allow_its_share_of_r():
+    """The worked row: T implies R, so the chance of T given R is P(T) / P(R). A30's bid, 0.10, is T's floor through L, and R's
+    ask, 0.33, R's ceiling, so the least is 0.10 / 0.33; T can be all of R, so the most is 1. The 0.62 stated lies
+    within it, and no book is stretched."""
+    got = oneform.chance_ranges(tariff())
+    assert got == {"T.chances[0]": {"lo": pytest.approx(0.10 / 0.33, abs=1e-9), "hi": pytest.approx(1.0)}}
+
+
+def test_a_chance_between_two_events_on_markets_ranges_over_what_their_books_allow():
+    """Two events, A at 0.80 to 0.82 and B at 0.40 to 0.42, nothing else between them. The chance of B given A is
+    P(A and B) / P(A): at least (P(A) + P(B) - 1) / P(A), least at both bids, 0.20 / 0.80; at most P(B) / P(A), at B's
+    ask and A's bid, 0.42 / 0.80. Given B, A can hold all of B, and holds at least (P(A) + P(B) - 1) / P(B) of it, least
+    at both bids, 0.20 / 0.40. A second chance between them narrows the first's range to what the two hold together."""
+    books = [book("a", "A", 0.80, 0.82), book("b", "B", 0.40, 0.42)]
+    m = {"props": ["A", "B"], "links": [], "books": books, "chances": [chance("B", 0.5, ["A"], key="B|A")]}
+    assert oneform.chance_ranges(m) == {"B|A": {"lo": pytest.approx(0.25, abs=1e-9), "hi": pytest.approx(0.525, abs=1e-9)}}
+    m["chances"] = [chance("A", 0.9, ["B"], key="A|B")]
+    assert oneform.chance_ranges(m)["A|B"] == {"lo": pytest.approx(0.20 / 0.40, abs=1e-9), "hi": pytest.approx(1.0)}
+    m["chances"] = [chance("B", 0.5, ["A"], key="B|A"), chance("A", 0.9, ["B"], key="A|B")]
+    got = oneform.chance_ranges(m, keys={"B|A"})["B|A"]  # P(A and B) = 0.9 P(B), so B's share of A is 0.9 P(B) / P(A)
+    assert (got["lo"], got["hi"]) == pytest.approx((0.9 * 0.40 / 0.82, 0.9 * 0.42 / 0.80), abs=1e-9)
+
+
+def test_a_chance_between_two_events_on_the_analysts_own_chances_ranges_within_their_probabilities():
+    """The page's third case (Nov 19): one event at 0.42 and another at 0.12, each on a chance of its own. The second
+    given the first is at most 0.12 / 0.42, which 0.90 is not: it cannot hold, and its range says what it could be.
+    Each chance on its own is its proposition's probability, which the other statements leave free."""
+    m = {"props": ["A", "B"], "links": [], "books": [],
+         "chances": [chance("A", 0.42, key="A"), chance("B", 0.12, key="B"), chance("B", 0.90, ["A"], key="B|A")]}
+    got = oneform.chance_ranges(m)
+    assert got["B|A"] == {"lo": 0.0, "hi": pytest.approx(0.12 / 0.42, abs=1e-9)}
+    assert got["A"] == {"lo": 0.0, "hi": pytest.approx(0.12 / 0.90, abs=1e-9)}  # 0.90 of A lies within B's 0.12
+    assert got["B"] == {"lo": pytest.approx(0.90 * 0.42, abs=1e-9),  # B holds 0.90 of A's 0.42, and A's other 0.10
+                        "hi": pytest.approx(1 - 0.10 * 0.42, abs=1e-9)}  # lies outside it
+    assert oneform.read(m)["cannot_hold"]
+
+
+def test_a_chance_whose_other_statements_cannot_hold_or_give_its_condition_nothing_has_no_range():
+    """X stated at 0.3 and at 0.4 cannot hold together, whatever Y given X is; and a chance given a proposition the
+    statements put at 0 is said of cases that have no probability."""
+    m = {"props": ["X", "Y"], "links": [], "books": [],
+         "chances": [chance("X", 0.3, key="x1"), chance("X", 0.4, key="x2"), chance("Y", 0.5, ["X"], key="y")]}
+    assert oneform.chance_ranges(m, keys={"y"}) == {"y": {"why": "others"}}
+    m["chances"] = [chance("X", 0.0, key="x"), chance("Y", 0.5, ["X"], key="y")]
+    assert oneform.chance_ranges(m, keys={"y"}) == {"y": {"why": "given"}}
+
+
+def test_a_chance_is_ranged_within_a_book_the_other_statements_stretch():
+    """A's book is 0.50 to 0.52, and a chance of A on its own at 0.60 stretches it to 0.60. B's book is 0.30 to 0.32:
+    B given A is then at most 0.32 / 0.60, with A where the other statements put it."""
+    m = {"props": ["A", "B"], "links": [], "books": [book("a", "A", 0.50, 0.52), book("b", "B", 0.30, 0.32)],
+         "chances": [chance("A", 0.60, key="A"), chance("B", 0.5, ["A"], key="B|A")]}
+    assert oneform.chance_ranges(m, keys={"B|A"}) == {"B|A": {"lo": 0.0, "hi": pytest.approx(0.32 / 0.60, abs=1e-9)}}
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_within_a_chances_range_it_holds_with_the_books_and_past_either_end_it_does_not(seed):
+    """On structures drawn by rule: each chance at the middle of its range holds with every other statement and each
+    book within its bid and ask (or the stretch the others need), what it is given having a probability, and a
+    hundredth past either end, within 0 to 1, does not."""
+    m = drawn(seed)
+    for key, got in oneform.chance_ranges(m).items():
+        if "why" in got:
+            continue
+
+        def holds(value: float) -> bool:
+            model = oneform.compile({**m, "chances": [{**c, "value": value} if c["key"] == key else c
+                                                      for c in m["chances"]]})
+            base = oneform.statements(model)
+            rest = oneform.Rows(model.n)
+            for r, lo, hi, t in zip(base.rows, base.lo, base.hi, base.tags):
+                if t != (key,):
+                    rest.add(r, lo, hi, t)
+            c = next(c for c in model.chances if c["key"] == key)  # a chance given some propositions is said of their
+            cond = {**dict.fromkeys(c["given"], True), **dict.fromkeys(c["given_not"], False)}  # cases: they need
+            ok, _, most, _ = oneform.Program(oneform.with_books(model, base, oneform.stretches(model, rest))).solve(
+                -oneform.prob(model, cond))  # a probability (oneform.conflicts)
+            return ok and -most > oneform.TOL
+        assert got["lo"] <= got["hi"]
+        assert holds((got["lo"] + got["hi"]) / 2), (seed, key, got)
+        if got["lo"] >= 0.01:
+            assert not holds(got["lo"] - 0.01), (seed, key, got)
+        if got["hi"] <= 0.99:
+            assert not holds(got["hi"] + 0.01), (seed, key, got)
+
+
+def test_a_chance_between_two_events_moves_neither_within_their_probabilities_and_both_within_their_books_past_them():
+    """MATH.md 1.2, 1.9: A at 0.80 to 0.82 and B at 0.40 to 0.42 read 0.81 and 0.41. A chance of B given A within what those
+    two allow, (0.81 + 0.41 - 1) / 0.81 to 0.41 / 0.81, moves neither and fixes how often they happen together. Past
+    that and within its range, 0.25 to 0.525, both move within their books, as near their prices as the chance lets
+    them, and no book is stretched. Past its range, books are stretched."""
+    books = [book("a", "A", 0.80, 0.82), book("b", "B", 0.40, 0.42)]
+
+    def at(value):
+        out = read(["A", "B"], chances=[chance("B", value, ["A"], key="B|A")], books=books)
+        return out["props"]["A"]["p"], out["props"]["B"]["p"], [s for s in out["stretched"]
+                                                               if max(s["below"], s["above"]) > 1e-9]
+    lo, hi = (0.81 + 0.41 - 1) / 0.81, 0.41 / 0.81
+    for value in (lo + 1e-6, 0.40, hi - 1e-6):
+        assert at(value) == (pytest.approx(0.81), pytest.approx(0.41), [])
+    a, b, stretched = at(0.52)
+    assert 0.80 <= a < 0.81 - 1e-4 and 0.41 + 1e-4 < b <= 0.42 and not stretched
+    assert at(0.60)[2]

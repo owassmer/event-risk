@@ -164,6 +164,24 @@ def test_whether_a_market_is_open_is_the_venues_word_today_and_its_dates_for_a_p
     assert kalshi.is_open(ks, "2026-12-09", True) is True and kalshi.is_open(ks, "2026-12-10", True) is False
 
 
+@pytest.mark.parametrize("form, opening, creation, end", [
+    (polymarket, "startDate", "createdAt", "endDate"),
+    (polymarket_us, "startDate", "createdAt", "endDate"),
+    (kalshi, "open_time", "created_time", "close_time")])
+def test_at_a_past_as_of_a_market_is_open_only_from_the_day_it_began(form, opening, creation, end):
+    """MATH.md 3.3: at a past as-of the markets are those open on that date. A market begins on the day its trading
+    opened, or, where it states no opening, the day it was created, before which it could not trade; a market created
+    after the as-of is no market of that date, and one that states neither has nothing to establish it was one."""
+    ends = {end: "2027-06-30T04:00:00Z"}
+    opened = {"market": {opening: "2026-08-11T15:07:32Z", creation: "2026-08-10T12:00:00Z", **ends}}
+    assert form.is_open(opened, "2026-03-01", True) is False  # made months after the as-of
+    assert form.is_open(opened, "2026-08-10", True) is False  # created, not yet trading
+    assert form.is_open(opened, "2026-08-11", True) is True
+    created = {"market": {creation: "2026-08-11T15:07:32Z", **ends}}  # no opening stated
+    assert form.is_open(created, "2026-03-01", True) is False and form.is_open(created, "2026-08-11", True) is True
+    assert form.is_open({"market": dict(ends)}, "2026-03-01", True) is False  # neither: no beginning stated
+
+
 def test_the_venues_books_read_as_yes_bids_and_asks_best_first_kalshis_asks_from_its_no_bids():
     pm, ks = polymarket.levels(PM_BOOK), kalshi.levels(KS_BOOK)
     assert pm["bids"][0] == (0.32, 500.0) and pm["asks"][0] == (0.35, 1000.0)
@@ -188,8 +206,9 @@ def test_history_is_a_daily_price_at_each_venue():
 
 def test_a_past_as_of_reads_the_market_as_it_stood_at_that_days_end_and_never_an_invented_quote():
     """Kalshi's candle gives the day's closing bid and ask, Polymarket US's sample its best bid and ask (its NO price
-    one less the bid), Polymarket's history a price alone, which is no quote; a book the store kept by the as-of's end
-    stands where it was read after that close, its depth with it."""
+    one less the bid), Polymarket's history the book's midpoint alone: its last point by the end of the day in New York
+    is the market's price at that point's moment, with no bid, ask or depth, none having been kept (3.3). A book the
+    store kept by the as-of's end stands where it was read after the history's last word, its depth with it."""
     utc = lambda s: int(datetime.fromisoformat(s).timestamp())
     candles = {"candlesticks": [
         {"end_period_ts": utc("2026-10-01T04:00:00+00:00"), "yes_bid": {"close_dollars": "0.3000"},
@@ -204,12 +223,19 @@ def test_a_past_as_of_reads_the_market_as_it_stood_at_that_days_end_and_never_an
     sample = {"history": [{"timestamp": utc("2026-10-02T04:00:00+00:00"), "longPrice": "0.45", "shortPrice": "0.61"}]}
     q = past_price("polymarket_us", sample, "2026-10-01")
     assert (q["bid"], q["ask"], q["price"]) == (pytest.approx(0.39), 0.45, pytest.approx(0.42))
-    q = past_price("polymarket", {"data": [{"timestamp": utc("2026-10-01T20:00:00+00:00"), "price": 0.42}]},
-                   "2026-10-01")
-    assert (q["bid"], q["ask"], q["price"], q["history_price"]) == (None, None, None, 0.42)  # no quote, no price
+    midpoints = {"data": [{"timestamp": utc("2026-10-01T17:00:00+00:00"), "price": 0.40},
+                          {"timestamp": utc("2026-10-02T02:00:00+00:00"), "price": 0.42},  # 22:00 in New York
+                          {"timestamp": utc("2026-10-02T05:00:00+00:00"), "price": 0.47}]}  # October 2 there
+    q = past_price("polymarket", midpoints, "2026-10-01")
+    assert (q["price"], q["quoted_at"], q["price_date"], q["from"]) == (0.42, "2026-10-02T02:00:00+00:00",
+                                                                      "2026-10-01", "history")
+    assert (q["bid"], q["ask"], q["depth"], q["book"]) == (None, None, None, None)  # no quote was kept
+    assert past_price("polymarket", midpoints, "2026-09-30")["price"] is None  # nothing by then: no price
     book = {"bids": [{"price": "0.41", "size": "100"}], "asks": [{"price": "0.43", "size": "50"}]}
-    later = past_price("polymarket", {"data": []}, "2026-10-01", ("2026-10-01T22:00:00+00:00", book))
+    later = past_price("polymarket", midpoints, "2026-10-01", ("2026-10-02T03:00:00+00:00", book))
     assert (later["bid"], later["ask"], later["from"]) == (0.41, 0.43, "reading") and later["depth"] is not None
+    before = past_price("polymarket", midpoints, "2026-10-01", ("2026-10-01T22:00:00+00:00", book))
+    assert (before["price"], before["bid"], before["from"]) == (0.42, None, "history")  # the later point stands
     earlier = past_price("kalshi", candles, "2026-10-01", ("2026-10-01T15:00:00+00:00", {"orderbook": {}}))
     assert (earlier["bid"], earlier["from"]) == (0.40, "history")  # the close came after it: the close stands
 
@@ -398,10 +424,16 @@ def kalshi_route(method, path, query, body):
 
 
 def flat(found):
-    """The markets of a search's or a family's rows, in order, each row read by its columns."""
-    rows = found["markets"] if "markets" in found and "families" not in found else \
-        [row for f in found["families"] for row in f.get("markets", [])]
-    return [dict(zip(found["columns"], row)) for row in rows]
+    """The markets of a search's or a family's rows, in order, each row read by its columns, as the analyst reads them:
+    its close its own where the row gives one, and otherwise its family's."""
+    families = [found] if "markets" in found and "families" not in found else found["families"]
+    out = []
+    for f in families:
+        for row in f.get("markets", []):
+            got = dict(zip(found["columns"], row))
+            got["closes"] = got.pop("closes, where not the family's", f.get("closes"))
+            out.append(got)
+    return out
 
 
 def proposition(store):
@@ -550,9 +582,10 @@ def test_a_past_as_of_store_quotes_a_kept_market_from_its_history(world):
     t = proposition(world.store)
     world.store.link(t["id"], "asks", "market:polymarket:516710")
     derived = world.store.get("market:polymarket:516710")["derived"]
-    # Polymarket's history is a price a day: no quote, and so no price, at a past as-of with no book kept by then
+    # Polymarket's history keeps the book's midpoint alone: at a past as-of with no book kept by then, its last point
+    # by the day's end is the market's price, with no bid, ask or depth
     assert (derived["bid"]["value"], derived["ask"]["value"], derived["price"]["value"], derived["depth"]["value"]) == \
-        (None, None, None, None)
+        (None, None, 0.42, None)
     assert [d["kind"] for d in world.store.get("market:polymarket:516710")["data"]] == ["market", "history"]
 
 
@@ -666,7 +699,8 @@ def test_a_past_store_reads_its_markets_histories_side_by_side(world):
     found = world.search_markets("tariffs", proposition(world.store)["id"])
     prices = flat(found)
     assert len(prices) == 6 and found["prices_as_of"] == "2026-10-01"
-    assert all(m["price"] is None for m in prices)  # Polymarket's history a price alone: no quote, so no price
+    # Polymarket's history the book's midpoint alone: each market's price its last point by then, with no quote
+    assert all(m["price"] is not None and m["bid"] is None and m["ask"] is None for m in prices)
     assert sum(p.endswith("/books") for _, p, _, _ in opener.seen) == 0  # no book: the as-of is past
     assert state["most"] > 1  # side by side
 
@@ -712,8 +746,8 @@ def test_search_markets_returns_each_venues_families_with_their_open_markets_and
     assert "markets" not in large and large["open_markets"] == 14
     assert large["questions"] == [f"Rung {i}" for i in range(14)] and "ladders" not in large  # no strike as data
     assert large["span"] == {"closes": ["2026-12-31", "2027-09-01"]}
-    assert found["returned"] == 2 and found["columns"] == ["id", "question", "closes", "bid", "ask", "price",
-                                                           "depth ($)"]  # its unit at the column, in dollars
+    assert found["returned"] == 2 and found["columns"] == ["id", "question", "bid", "ask", "price", "depth ($)",
+                                                           "closes, where not the family's"]  # depth in dollars
 
 
 def test_a_searchs_row_shows_the_books_bid_and_ask_beside_its_price(world):
@@ -764,6 +798,42 @@ US_MARKET = {"id": 1003057, "slug": "rdc-usfed-fomc-2026-12-09-hike25", "questio
              "outcomes": '["Yes","No"]', "assetPriceTerms": None}
 US_EVENT = {"id": "122355", "slug": "usfed-fomc-2026-12-09", "title": "Fed Decision in December", "category": "macro",
             "endDate": "2026-12-10T04:59:00Z", "markets": [US_MARKET]}
+
+
+def test_polymarket_us_reads_books_several_at_a_time_in_order_and_fails_whole_where_one_fails():
+    """The venue has no batch read of books, so a search's books are read several at a time: each market's book comes
+    back under its id in the order asked, a market with no slug has none, and a book that cannot be read fails the call
+    as reading them one at a time would, the reads not yet begun left unmade."""
+    import threading
+    import time
+    at_once, most, lock = [0], [0], threading.Lock()
+
+    def route(method, path, query, body):
+        slug = path.split("/markets/")[1].split("/")[0]
+        if slug == "gone":
+            return 404, {}
+        with lock:
+            at_once[0] += 1
+            most[0] = max(most[0], at_once[0])
+        time.sleep(0.05)
+        with lock:
+            at_once[0] -= 1
+        return 200, {"marketData": {"bids": [], "offers": [], "of": slug}}
+
+    venue, seen = adapter("polymarket_us", route)
+    records = {f"market:polymarket_us:m{i}": {"market": {"slug": f"m{i}"}} for i in range(24)}
+    records = dict([*list(records.items())[:5], ("market:polymarket_us:none", {"market": {}}),
+                    *list(records.items())[5:]])
+    got = venue.books(records)
+    assert list(got) == [mid for mid in records if mid != "market:polymarket_us:none"]
+    assert all(got[mid]["marketData"]["of"] == mid.rsplit(":", 1)[1] for mid in got)
+    assert 1 < most[0] <= polymarket_us.BOOK_READS
+    seen.seen.clear()
+    failing = {f"market:polymarket_us:{slug}": {"market": {"slug": slug}}
+               for slug in ("m0", "gone", *(f"n{i}" for i in range(40)))}
+    with pytest.raises(LookupError):
+        venue.books(failing)
+    assert len(seen.seen) < len(failing)
 
 
 def test_polymarket_us_reads_a_market_with_its_event_a_family_whole_and_its_settlement():
@@ -844,3 +914,18 @@ def test_a_large_familys_markets_that_differ_only_by_their_strikes_are_a_ladder_
               enumerate([0, 1, 50, 100] + list(range(200, 1200, 100)))]
     got = entry("kalshi", "family:kalshi:KXE", "U", "2026-11-16", uneven, {}, many=True)
     assert got["ladders"][0]["strikes"] == [0, 1, 50, 100] + list(range(200, 1200, 100))
+
+
+def test_a_markets_close_is_given_only_where_it_is_not_its_familys(monkeypatch):
+    """A family gives its close once; each of its markets' rows gives its own close only where it differs, in the last
+    column, so a row reads as its family's close otherwise (MATH.md 3.3)."""
+    from harness import world as w
+    form = type("Form", (), {"listing": staticmethod(lambda r: {"question": r["q"], "close_time": r["close"]}),
+                             "label": staticmethod(lambda r: None)})
+    monkeypatch.setitem(w.FORMS, "kalshi", form)
+    rows = w.rows_of("kalshi", [("market:kalshi:A", {"q": "A?", "close": "2026-12-09"}),
+                                ("market:kalshi:B", {"q": "B?", "close": "2027-01-27"})], {}, many=True,
+                     closes="2026-12-09")
+    assert w.COLUMNS[-1] == "closes, where not the family's"
+    assert rows == [["market:kalshi:A", "A?", None, None, None, None],
+                    ["market:kalshi:B", "B?", None, None, None, None, "2027-01-27"]]

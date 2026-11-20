@@ -108,17 +108,21 @@ def as_of_end(asof: str) -> datetime:
 
 
 def past_price(venue: str, history: dict | None, asof: str, reading: tuple[str, dict] | None = None) -> dict:
-    """A market as it stood at the end of a past as-of: of a reading of its book the store kept by then (`reading`, its
-    moment and payload) and the day's closing quotes its venue's history gives, the later. A reading is its book whole,
-    its depth with it; a day's closing quotes give its bid and ask, the price their midpoint, its depth unknown. Where
-    the venue's history is its midpoint alone, the market has no quote, and so no price (3.3: the midpoint of its bid and
-    ask): the day's price stands as its history gives it (`history_price`), and the market bounds nothing. `quoted_at`
-    is the moment of what it rests on."""
+    """A market as it stood at the end of a past as-of (3.3): the latest of a reading of its book the store kept by then
+    (`reading`, its moment and payload) and what its venue's history gives by then. A reading is its book whole, its
+    depth with it. A history gives each day's closing quotes, their bid and ask and the price their midpoint, its depth
+    unknown; or, where it keeps the book's midpoint alone (Polymarket's), its last point by then, which is the market's
+    price at that point's moment, with no bid, ask or depth, since none was kept (each form's `daily_quotes` and
+    `midpoints`). `quoted_at` is the moment of what it rests on, and `price_date` its New York day."""
     forms = FORMS[venue]
     quotes = {d: q for d, q in forms.daily_quotes(history or {}).items() if d <= asof}
     day = max(quotes) if quotes else None
     closing = quotes[day] if day else None
-    if reading and (closing is None or datetime.fromisoformat(reading[0]) > datetime.fromisoformat(closing["at"])):
+    end = as_of_end(asof)
+    points = [(at, p) for at, p in forms.midpoints(history or {}) if datetime.fromisoformat(at) <= end]
+    point = points[-1] if points else None
+    kept = closing["at"] if closing else point[0] if point else None  # the moment of the history's last word by then
+    if reading and (kept is None or datetime.fromisoformat(reading[0]) > datetime.fromisoformat(kept)):
         book = forms.levels(reading[1])
         return {**priced(venue, book, reading[1], None), "book": {"bids": book["bids"], "asks": book["asks"]},
                 "past": True, "price_date": None, "quoted_at": reading[0], "from": "reading"}
@@ -127,11 +131,10 @@ def past_price(venue: str, history: dict | None, asof: str, reading: tuple[str, 
         return {"bid": bid, "ask": ask, "price": (bid + ask) / 2 if bid is not None and ask is not None else None,
                 "depth": None, "book": None, "past": True, "price_date": day, "quoted_at": closing["at"],
                 "last_trade": None, "from": "history"}
-    prices = {d: p for d, p in forms.daily(history or {}).items() if d <= asof}
-    last = max(prices) if prices else None
-    return {"bid": None, "ask": None, "price": None, "depth": None, "book": None, "past": True,
-            "history_price": prices[last] if last else None, "price_date": last, "quoted_at": None,
-            "last_trade": None, "from": "history" if last else None}
+    at, price = point if point else (None, None)
+    return {"bid": None, "ask": None, "price": price, "depth": None, "book": None, "past": True,
+            "price_date": datetime.fromisoformat(at).astimezone(NY).date().isoformat() if at else None,
+            "quoted_at": at, "last_trade": None, "from": "history" if at else None}
 
 
 def price_of_reading(ctx: Inputs, mid: str, ref: dict) -> float | None:
@@ -188,7 +191,8 @@ def _asof_or_none(ctx: Inputs) -> str | None:
 
 def is_open(venue: str, record: dict, asof: str | None, past: bool) -> bool | None:
     """Whether the market trades on the as-of date: the venue's own word on a record read that day, and for a past
-    as-of whether the market had not yet closed then."""
+    as-of whether the market had begun by then, by the day its trading opened or else the day it was created, and had
+    not yet closed (each form's `is_open`). A market that states no beginning is not open on a past day."""
     return FORMS[venue].is_open(record, asof, past)
 
 
@@ -219,9 +223,8 @@ def _price_compute(m: dict, load) -> dict:
             "open": opened, "quoted_at": (m.get("book") or {}).get("retrieved_at")}
 
 
-PRICE = Derivation("market_price", 6, "Market", _price_inputs, _price_compute,
-                   fields=("book", "bid", "ask", "price", "depth", "open", "last_trade", "quoted_at", "price_date",
-                           "history_price"))
+PRICE = Derivation("market_price", 8, "Market", _price_inputs, _price_compute,
+                   fields=("book", "bid", "ask", "price", "depth", "open", "last_trade", "quoted_at", "price_date"))
 
 
 def history_to(venue: str, payload: dict | None, day: str | None) -> dict[str, float]:

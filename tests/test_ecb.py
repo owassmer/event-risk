@@ -1,16 +1,20 @@
-"""The ECB's reference rates (harness.venues.ecb): a read waits for an answer that is slow to begin, as a query the ECB
-has not answered before is, and is asked again where its gateway gives the request up."""
+"""The ECB's reference rates (harness.venues.ecb): every window cut from the ECB's one history file, read once and kept,
+and read from Frankfurter where the file does not answer."""
 
 from __future__ import annotations
 
 import io
+import json
 import urllib.error
+import zipfile
 
+from harness.venues import ecb as ecb_module
 from harness.venues.ecb import ECB
 
-CSV = """KEY,FREQ,CURRENCY,CURRENCY_DENOM,EXR_TYPE,EXR_SUFFIX,TIME_PERIOD,OBS_VALUE
-EXR.D.JPY.EUR.SP00.A,D,JPY,EUR,SP00,A,2019-02-19,125.09
-EXR.D.USD.EUR.SP00.A,D,USD,EUR,SP00,A,2019-02-19,1.1317
+CSV = """Date,USD,JPY,CYP,
+2026-11-12,1.1081,170.10,N/A,
+2019-02-19,1.1317,125.09,N/A,
+2007-12-31,1.4721,164.93,0.5853,
 """
 
 
@@ -22,32 +26,42 @@ class Answer(io.BytesIO):
         return False
 
 
-def ecb(begins: float, gateway: list[int] | None = None) -> tuple[ECB, list[float]]:
-    """An ECB whose answer begins `begins` seconds after it is asked; `gateway`, the codes it answers first."""
-    asked: list[float] = []
-    codes = list(gateway or [])
+def zipped(text: str) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as z:
+        z.writestr("eurofxref-hist.csv", text)
+    return out.getvalue()
+
+
+def opener(file_codes: list[int] | None = None):
+    asked: list[str] = []
+    codes = list(file_codes or [])
 
     def open_(request, timeout=None):
-        asked.append(timeout)
-        if codes:
-            raise urllib.error.HTTPError(request.full_url, codes.pop(0), "Gateway Timeout", {}, None)
-        if timeout is not None and timeout < begins:
-            raise TimeoutError("The read operation timed out")
-        return Answer(CSV.encode())
-
-    client = ECB(opener=open_)
-    return client, asked
+        asked.append(request.full_url)
+        if request.full_url == ecb_module.HISTORY:
+            if codes:
+                raise urllib.error.HTTPError(request.full_url, codes.pop(0), "Unavailable", {}, None)
+            return Answer(zipped(CSV))
+        return Answer(json.dumps({"base": "EUR", "rates": {"2019-02-19": {"USD": 1.1317, "JPY": 125.09}}}).encode())
+    return open_, asked
 
 
-def test_an_answer_slow_to_begin_is_waited_for_in_one_request():
-    client, asked = ecb(begins=25.0)  # a query the ECB has not answered before: read live, 8 to 25 s to begin
+def test_every_window_is_cut_from_the_one_file_read_once():
+    open_, asked = opener()
+    client = ECB(opener=open_, pause=0)
     got = client.rates("JPY", "2019-02-19", "2026-11-12")
+    assert got["payload"]["per_euro"] == {"JPY": {"2019-02-19": 125.09, "2026-11-12": 170.10},
+                                          "USD": {"2019-02-19": 1.1317, "2026-11-12": 1.1081}}
+    assert client.rates("EUR", "2019-01-01", "2019-12-31")["payload"]["per_euro"]["EUR"] == {"2019-02-19": 1.0}
+    assert client.rates("CYP", "2019-01-01", "2026-11-12")["payload"]["status"] == "NOT_FOUND"  # none in the window
+    assert asked == [ecb_module.HISTORY]
+
+
+def test_where_the_file_does_not_answer_the_window_is_read_from_frankfurter():
+    open_, asked = opener(file_codes=[503, 503, 503])
+    client = ECB(opener=open_, pause=0)
+    got = client.rates("JPY", "2019-02-19", "2019-02-19")
     assert got["payload"]["per_euro"] == {"JPY": {"2019-02-19": 125.09}, "USD": {"2019-02-19": 1.1317}}
-    assert len(asked) == 1
-
-
-def test_a_request_the_gateway_gives_up_is_asked_again(monkeypatch):
-    monkeypatch.setattr("harness.venues.ecb.PAUSE", 0)
-    client, asked = ecb(begins=1.0, gateway=[504])
-    assert client.rates("USD", "2024-11-05", "2026-11-12")["payload"]["status"] == "OK"
-    assert len(asked) == 2
+    assert got["request"]["url"].startswith(ecb_module.FRANKFURTER)
+    assert asked.count(ecb_module.HISTORY) == ecb_module.ATTEMPTS

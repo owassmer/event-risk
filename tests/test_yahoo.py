@@ -206,8 +206,9 @@ def test_an_exchange_whose_calendar_cannot_be_built_has_none_and_reads_its_price
     assert sessions.closes("XTAE", "2026-11-01", "2026-11-06") == {}
 
 
-def test_a_price_chart_refused_past_its_tries_holds_back_charts_and_not_the_sites_listings():
-    """Each surface its own: the charts refused (429) leave the screener and a company's profile answering."""
+def test_a_price_chart_refused_past_its_tries_leaves_the_next_read_asking_and_the_site_answering():
+    """No read is declined: a chart refused (429) past its tries fails that read, the next chart is asked of Yahoo
+    again, and a company's profile, another surface, answers."""
     def routes(path, params):
         if path.startswith("/v8/finance/chart/"):
             return 429, {}
@@ -221,7 +222,7 @@ def test_a_price_chart_refused_past_its_tries_holds_back_charts_and_not_the_site
     from harness.venues.http import VenueError
     with pytest.raises(VenueError):
         y._get("/v8/finance/chart/6532.T", {})
-    with pytest.raises(VenueError, match="did not answer a moment ago"):
+    with pytest.raises(VenueError, match="429"):  # asked, and refused again
         y._get("/v8/finance/chart/IMI.L", {})
     assert y.profile("6501.T", "2026-11-11")["payload"]["country"] == "Japan"
 
@@ -260,38 +261,6 @@ def test_a_rows_ticker_as_etf_global_writes_it_is_yahoos_symbol_on_its_market():
     assert symbols_for("688", "CN", "CNE0000003F5") == ["000688.SZ"]
     assert symbols_for("600519", "CN") == ["600519.SS"]
     assert symbols_for("AC *", "MX") == ["AC.MX"]
-
-
-def test_a_listings_sector_is_read_by_its_symbol_as_many_at_once_as_the_screener_names_each_absent_one_answered():
-    """Yahoo.sectors: the symbols asked, SCREEN_TICKERS to a query, each query one "or" over tickers; a listing the
-    screener holds with a sector answered with it, one it holds with none, or does not hold, answered as not found."""
-    from harness.venues import yahoo
-    asked: list[list[str]] = []
-
-    def screen(self, symbols):
-        asked.append(list(symbols))
-        return [{"ticker": s, "companyName": f"{s} Co", "sector": None if s.startswith("X") else "Technology",
-                 "industry": "Semiconductors", "exchange": "NMS"} for s in symbols if not s.startswith("Z")]
-
-    y = Yahoo(interval=0, pause=0)
-    names = [f"A{k:03d}" for k in range(300)] + ["XNOSECTOR", "ZABSENT"]
-    original = yahoo.Yahoo._screen
-    yahoo.Yahoo._screen = screen
-    try:
-        got = y.sectors(names, "2026-11-12")
-    finally:
-        yahoo.Yahoo._screen = original
-    assert sorted(len(q) for q in asked) == [52, yahoo.SCREEN_TICKERS] and sorted(sum(asked, [])) == sorted(names)
-    assert got["A000"]["payload"] == {"status": "OK", "symbol": "A000", "name": "A000 Co", "sector": "Technology",
-                                      "industry": "Semiconductors", "exchange": "NMS"}
-    assert got["XNOSECTOR"]["payload"]["status"] == got["ZABSENT"]["payload"]["status"] == "NOT_FOUND"
-    fetch = y.fetchers()["listing_sector"]  # by `{symbol}@{YYYY-MM}`, a month's reading, many at once
-    yahoo.Yahoo._screen = screen
-    try:
-        many = fetch.many(["A001@2026-11", "ZABSENT@2026-11"], ("2026-11-12", "2026-11-12"))
-    finally:
-        yahoo.Yahoo._screen = original
-    assert set(many) == {"A001@2026-11", "ZABSENT@2026-11"} and many["A001@2026-11"]["payload"]["status"] == "OK"
 
 
 def test_a_span_before_a_symbol_first_traded_has_no_prices_and_any_other_refusal_stands():

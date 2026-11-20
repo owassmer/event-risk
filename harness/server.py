@@ -67,7 +67,7 @@ EXAMPLE = ROOT / "example"  # the one finished conversation the repository ships
 # The example's store as the repository holds it, compressed: a broad portfolio's store, with the data it re-derives
 # every number from, runs past the 100 MB a hosted repository takes in one file, and compresses to about a sixth.
 PACKED = STORE_FILE + ".gz"
-READ_ONLY = "This is a finished example, read only. Start your own with uv run event-risk."
+READ_ONLY = "This example is read-only. Start your own analysis with uv run event-risk."
 PORT = 8765
 KEYS = {  # each key, and what the page cannot do without it: one plain line each
     "ANTHROPIC_API_KEY": "No Claude key (ANTHROPIC_API_KEY in .env): the analyst can't reply.",
@@ -581,16 +581,18 @@ class Page:
             return render.chips(store, ids)
 
     def download(self) -> tuple[str, str]:
+        """The ledger as a CSV file: its name, the ledger as of the portfolio's date, and its text."""
         store = self.store
         if store is None:
             raise StoreError("There are no events yet.")
         with store.lock:
             if self.busy:
                 with render.cache_only(store):
-                    text = render.ledger_markdown(store)
+                    text = render.ledger_csv(store)
             else:
-                text = render.ledger_markdown(store)
-        return f"ledger-{store.dir.name}.md", text
+                text = render.ledger_csv(store)
+            asof = store.meta("asof")
+            return f"ledger-{asof}.csv" if asof else "ledger.csv", text
 
     # ---------------------------------------------------------------- the conversation, from the trace
 
@@ -830,7 +832,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(stores(page.root))
             if path == "/api/download":
                 name, text = page.download()
-                return self._send(200, text.encode(), "text/markdown; charset=utf-8",
+                return self._send(200, text.encode(), "text/csv; charset=utf-8",
                                   {"Content-Disposition": f'attachment; filename="{name}"'})
             if path == "/api/file":
                 return self._file(q.get("path", ""))
@@ -901,6 +903,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, b"not found", "text/plain")
         self._send(200, target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream")
 
+    def _shown(self, event: dict) -> dict | None:
+        """An event as this page follows it; None for one it does not follow."""
+        return event
+
     def _events(self) -> None:
         q = self.page.follow()
         try:
@@ -913,9 +919,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             while True:
                 try:
-                    event = q.get(timeout=15)
-                    data = json.dumps(event, ensure_ascii=False, default=str)
-                    self.wfile.write(f"data: {data}\n\n".encode())
+                    event = self._shown(q.get(timeout=15))
+                    if event is not None:
+                        data = json.dumps(event, ensure_ascii=False, default=str)
+                        self.wfile.write(f"data: {data}\n\n".encode())
                 except queue.Empty:
                     self.wfile.write(b": still here\n\n")
                 self.wfile.flush()
@@ -1012,7 +1019,7 @@ def example(argv: list[str] | None = None) -> int:
     """The finished conversation the repository ships, read only and with no keys, on a copy in a temporary
     directory that goes when the page stops: its trace and files as they are, and its store as it is once
     uncompressed (PACKED)."""
-    args = _arguments("example", "A finished conversation and its ledger, read only.").parse_args(argv)
+    args = _arguments("example", "Open a saved analysis in read-only mode.").parse_args(argv)
     if not (EXAMPLE / PACKED).is_file():
         print(f"example: there is no example at {EXAMPLE}", file=sys.stderr)
         return 1

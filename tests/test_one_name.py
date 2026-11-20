@@ -286,10 +286,10 @@ def test_a_company_a_consequence_names_is_reached_at_any_exposure_and_left_when_
     ref(store, "AAPL", "CS")
     ref(store, "XYZ", "CS")
     fund(store, "F", [{"constituent_ticker": "AAPL", "figi": "FIGIAAPL", "isin": "US0378331005", "weight": 0.5},
-                      {"constituent_ticker": "XYZ", "figi": "FIGIXYZ", "weight": 0.001},
+                      {"constituent_ticker": "XYZ", "figi": "FIGIXYZ", "weight": 0.0001},
                       {"constituent_ticker": "6861", "isin": "JP3236200006", "country_of_exchange": "JP",
-                       "weight": 0.002},
-                      {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.497}])
+                       "weight": 0.0002},
+                      {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.4997}])
     store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 10000.0}]})
     assert "name:XYZ" not in looked(store)["e"] and "name:JP3236200006:JP" not in looked(store)["e"]
     pid = store.add("Proposition", {"title": "T", "text": "T: the proposition", "comparison": "occurs",
@@ -298,7 +298,7 @@ def test_a_company_a_consequence_names_is_reached_at_any_exposure_and_left_when_
         shocks = [store._insert_link("consequence", pid, nid, {"shock": {"value": -0.2}}, "analyst", None)
                   for nid in ("name:XYZ", "name:JP3236200006:JP")]
     out = looked(store)
-    assert out["e"]["name:XYZ"] == pytest.approx(10.0) and out["e"]["name:JP3236200006:JP"] == pytest.approx(20.0)
+    assert out["e"]["name:XYZ"] == pytest.approx(1.0) and out["e"]["name:JP3236200006:JP"] == pytest.approx(2.0)
     assert out["kinds"]["name:JP3236200006:JP"]["security"] == "JP3236200006:JP"  # priced on its home market
     assert "looks_through_to:name:F>name:XYZ" in out["links"]
     store.remove(shocks[0])

@@ -1,117 +1,133 @@
 """The European Central Bank's euro foreign exchange reference rates: each currency's daily rate, public and with no
 key, by which a dividend paid in another currency than its listing's price is added back in the price's.
 
-`GET https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A?startPeriod=&endPeriod=&format=csvdata&detail=dataonly`
-(https://data.ecb.europa.eu/help/api/data) answers, as CSV, every daily reference rate over the period, one row per
-currency and day: `CURRENCY`, `TIME_PERIOD` (the day, `YYYY-MM-DD`), and `OBS_VALUE`, the units of the currency one
-euro buys. The ECB sets them by a concertation between central banks around 14:10 CET and publishes them around 16:00
-CET on every working day but TARGET's closing days, for twenty-nine currencies, the US dollar among them
-(https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html), so a
-currency's rate in US dollars that day is the dollar's rate over the currency's, both set at the same moment. A key
-naming one currency the ECB does not publish answers without that currency's rows, and one naming none answers 404.
+The ECB publishes them whole, as one file: `GET https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip`
+(https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html), a zip of
+one CSV, `eurofxref-hist.csv`: a header `Date,USD,JPY,...` naming each currency's column, then a row per working day
+from 1999-01-04 to the latest, newest first, each the units of the currency one euro buys, `N/A` where none was set
+that day (a currency before it was published, or after it was replaced by the euro). Read live: 7,140 days and 41
+currencies, 643 KB in 1.1 s, its dollar column equal to the ECB's own query service's answer on all 539
+days of a two-year window. The ECB sets the rates by a concertation between central banks around 14:10 CET and
+publishes them around 16:00 CET on every working day but TARGET's closing days, so a currency's rate in US dollars that
+day is the dollar's rate over the currency's, both set at the same moment.
 
-The ECB's certificate chains to a root (Sectigo Public Server Authentication Root E46) that some OpenSSL bundles
-lack, macOS's among them; the process's connections verify every source against the machine's own trust store
-(harness.venues.http.Pooled).
+Where the file does not answer, the same rates are read from Frankfurter (https://frankfurter.dev, keyless, MIT), which
+republishes the ECB's reference rates: `GET https://api.frankfurter.dev/v1/{start}..{end}?base=EUR` answers
+`{"base": "EUR", "start_date", "end_date", "rates": {day: {CCY: units one euro buys}}}`, every currency it holds on each
+working day of the window (read live: equal to the file's on every day read).
 
-A query it has not answered before can take tens of seconds to begin answering, and the same query asked again
-answers in half a second, its answer by then kept at the ECB. Read live on Nov 12, 2026, eight new queries, from
-2019-02 and from 2024-11 to the day, each of every currency and of two: the first byte came after 8 to 25 seconds,
-whatever the span or the number of currencies, which changed only the transfer after it (0.3 s for two currencies over
-eight years, 3.6 MB of every currency 9 s); asked again, 0.5 s. Its gateway gives up a request it holds at 30 seconds
-(504), where the same request asked again answers (read live: one request of six on one afternoon, and one of a
-first read's two). So a read waits TIMEOUT seconds for an answer to begin, past the gateway's own limit, and its 504
-is what has it asked again: a read given up sooner is a query begun again from nothing, which a slow start never
-answers.
-
-One request answers every currency over the window, so the client reads it once for a window and gives each currency
-its own data row, re-keyed from that answer: one start's wait for every currency, where a request a currency would
-wait each its own: `{"status", "currency",
+The file is read once for the process and again once its read is AGAIN old: it holds every window, and grows by a day.
+Each window asked is cut from it and answered for its currency: `{"status", "currency",
 "per_euro": {CCY: {day: rate}, "USD": {day: rate}}}`, the same numbers as the ECB's. A currency the ECB does not
 publish is answered `NOT_FOUND`, kept like any answer, so the store does not ask again and reads its rate elsewhere.
-The euro is the currency every rate is the price of, so it has no rows of its own: its rate in dollars is the dollar's
-rate, and it is answered with a rate of one euro per euro on each day the ECB sets the dollar's.
+The euro is the currency every rate is the price of, so it has no column of its own: its rate in dollars is the
+dollar's rate, and it is answered with a rate of one euro per euro on each day the ECB sets the dollar's.
 """
 
 from __future__ import annotations
 
 import csv
 import io
+import json
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
+import zipfile
 from typing import Any, Callable
 
+from harness.venues.http import TRANSIENT, VenueError, now, pooled
 
-from harness.venues.http import TRANSIENT, Cooldown, VenueError, now, pooled
-
-BASE = "https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A"
-TIMEOUT = 35.0  # seconds a read waits for an answer to begin: past the gateway's 30, whose 504 has it asked again
-ATTEMPTS = 6  # a read asked this many times before it fails: the gateway held four in a row, two minutes, once
-PAUSE = 2.0  # seconds between attempts
+HISTORY = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip"
+FRANKFURTER = "https://api.frankfurter.dev/v1"
+TIMEOUT = 30.0  # seconds a read waits for an answer
+ATTEMPTS = 3  # a source asked this many times before the next is read
+PAUSE = 1.0  # seconds between attempts
+AGAIN = 3600.0  # seconds the file is kept before it is read again: today's rates are published once, in the afternoon
 USD = "USD"
 EUR = "EUR"  # the currency every reference rate is the price of
 
 
-class ECB:
-    def __init__(self, *, opener: Callable | None = None, timeout: float = TIMEOUT):
-        self._open = opener or pooled()
-        self.timeout = timeout
-        self._read: dict[tuple[str, str], tuple[str, str, dict[str, dict[str, float]]]] = {}  # by window
-        self._lock = threading.Lock()
-        self.cooldown = Cooldown("The ECB")  # where it does not answer, it is not asked again for a minute
-
-    def url(self, start: str, end: str) -> str:
-        return BASE + "?" + urllib.parse.urlencode({"startPeriod": start, "endPeriod": end, "format": "csvdata",
-                                                    "detail": "dataonly"})
-
-    def _window(self, start: str, end: str) -> tuple[str, str, dict[str, dict[str, float]]]:
-        """Every currency's rates over the window, read once: the URL, when it was read, and the rates."""
-        with self._lock:
-            if (start, end) in self._read:
-                return self._read[(start, end)]
-            self.cooldown.check()
+def history(body: bytes) -> dict[str, dict[str, float]]:
+    """The history file's rates, `{CCY: {day: units one euro buys}}`."""
+    with zipfile.ZipFile(io.BytesIO(body)) as z:
+        text = z.read(next(n for n in z.namelist() if n.endswith(".csv"))).decode("utf-8")
+    rows = csv.reader(io.StringIO(text))
+    header = [c.strip() for c in next(rows)]
+    rates: dict[str, dict[str, float]] = {c: {} for c in header[1:] if c}
+    for row in rows:
+        if not row or not row[0].strip():
+            continue
+        day = row[0].strip()
+        for k in range(1, min(len(row), len(header))):
             try:
-                return self._fetch(start, end)
-            except VenueError:
-                self.cooldown.failed()
-                raise
+                value = float(row[k])
+            except ValueError:  # N/A: none set that day
+                continue
+            if header[k] and value > 0:
+                rates[header[k]][day] = value
+    return {c: days for c, days in rates.items() if days}
 
-    def _fetch(self, start: str, end: str) -> tuple[str, str, dict[str, dict[str, float]]]:
-        """Every currency's rates over the window, read now and kept for the window."""
-        url = self.url(start, end)
-        request = urllib.request.Request(url, headers={"Accept": "text/csv", "User-Agent": "event-risk"})
-        failed = 0
-        while True:
+
+class ECB:
+    def __init__(self, *, opener: Callable | None = None, timeout: float = TIMEOUT, pause: float = PAUSE):
+        self._open = opener or pooled()
+        self.timeout, self.pause = timeout, pause
+        self._file: tuple[float, str, dict[str, dict[str, float]]] | None = None  # when read, retrieved_at, rates
+        self._lock = threading.Lock()
+
+    def _get(self, url: str, accept: str) -> bytes:
+        request = urllib.request.Request(url, headers={"Accept": accept})
+        for attempt in range(ATTEMPTS):
             try:
                 with self._open(request, timeout=self.timeout) as response:
-                    text = response.read().decode("utf-8")
-                break
+                    return response.read()
             except urllib.error.HTTPError as e:
-                if e.code == 404:
-                    text = ""
-                    break
-                if e.code >= 500 and failed < ATTEMPTS - 1:
-                    failed += 1
-                    time.sleep(PAUSE)
+                if (e.code == 429 or e.code >= 500) and attempt < ATTEMPTS - 1:
+                    time.sleep(self.pause * (attempt + 1))
                     continue
-                raise VenueError(f"the ECB answered {e.code}") from None
+                raise VenueError(f"GET {url.split('?')[0]} answered {e.code}") from None
             except TRANSIENT as e:
-                if failed < ATTEMPTS - 1:
-                    failed += 1
-                    time.sleep(PAUSE)
+                if attempt < ATTEMPTS - 1:
+                    time.sleep(self.pause * (attempt + 1))
                     continue
-                raise VenueError(f"the ECB: {e}") from None
-        rates: dict[str, dict[str, float]] = {}
-        for row in csv.DictReader(io.StringIO(text)):
+                raise VenueError(f"GET {url.split('?')[0]}: {e}") from None
+        raise VenueError(f"GET {url.split('?')[0]}: no answer")
+
+    def _history(self) -> tuple[str, dict[str, dict[str, float]]]:
+        """The whole history, read again once its read is AGAIN old: when it was retrieved, and the rates."""
+        if self._file is None or time.monotonic() - self._file[0] > AGAIN:
+            body = self._get(HISTORY, "application/zip")
             try:
-                rates.setdefault(row["CURRENCY"], {})[row["TIME_PERIOD"]] = float(row["OBS_VALUE"])
-            except (KeyError, TypeError, ValueError):
-                continue
-        self._read[(start, end)] = (url, now(), rates)
-        return self._read[(start, end)]
+                self._file = (time.monotonic(), now(), history(body))
+            except (zipfile.BadZipFile, StopIteration, UnicodeDecodeError):
+                raise VenueError("the ECB answered its history with no file") from None
+        return self._file[1], self._file[2]
+
+    def _frankfurter(self, start: str, end: str) -> tuple[str, str, dict[str, dict[str, float]]]:
+        url = f"{FRANKFURTER}/{start}..{end}?base={EUR}"
+        retrieved = now()
+        try:
+            body = json.loads(self._get(url, "application/json"))
+        except ValueError:
+            raise VenueError("Frankfurter answered with no rates") from None
+        rates: dict[str, dict[str, float]] = {}
+        for day, by in (body.get("rates") or {}).items():
+            for currency, value in (by or {}).items():
+                if isinstance(value, (int, float)) and value > 0:
+                    rates.setdefault(currency, {})[day] = float(value)
+        return url, retrieved, rates
+
+    def _window(self, start: str, end: str) -> tuple[str, str, dict[str, dict[str, float]]]:
+        """Every currency's rates over the window: the URL read, when, and the rates; from the ECB's file, or from
+        Frankfurter where the file does not answer."""
+        with self._lock:
+            try:
+                retrieved, rates = self._history()
+            except VenueError:
+                return self._frankfurter(start, end)
+        cut = {c: {d: v for d, v in days.items() if start <= d <= end} for c, days in rates.items()}
+        return HISTORY, retrieved, {c: days for c, days in cut.items() if days}
 
     def rates(self, currency: str, start: str, end: str) -> dict:
         """A currency's daily reference rate and the dollar's, each in units one euro buys, over the window. The euro's
@@ -123,7 +139,8 @@ class ECB:
             payload: dict[str, Any] = {"status": "NOT_FOUND", "currency": currency,
                                        "error": f"the ECB publishes no reference rate for {currency}"}
         else:
-            payload = {"status": "OK", "currency": currency, "per_euro": {currency: rates[currency], USD: rates[USD]}}
+            payload = {"status": "OK", "currency": currency,
+                       "per_euro": {currency: rates[currency], USD: rates[USD]}}
         return {"payload": payload, "request": {"method": "GET", "url": url}, "retrieved_at": retrieved,
                 "range": (start, end)}
 

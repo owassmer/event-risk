@@ -189,6 +189,19 @@ def spread(worlds: list[dict], A: dict[str, float], side: str) -> float:
     return math.sqrt(max(sum(w["p"] * (A[w["id"]] - mean) ** 2 for w in on) / mass, 0.0))
 
 
+def outcome_mean(worlds: list[dict], parents: dict[str, dict], values: dict[str, float], n: str) -> float:
+    """A figure at an outcome (1.1): a world's own; a side's or a way's that has ways, the average of its worlds' at
+    their probabilities, or their plain mean where it has no probability. `parents` are the sides and ways that have
+    ways, each with its `ways` in order."""
+    leaf = {w["id"]: w for w in worlds}
+
+    def under(x: str) -> list[str]:
+        return [x] if x in leaf else [y for k in parents[x]["ways"] for y in under(k)]
+    ws = under(n)
+    mass = sum(leaf[w]["p"] for w in ws)
+    return sum(leaf[w]["p"] * values[w] for w in ws) / mass if mass > TOL else sum(values[w] for w in ws) / len(ws)
+
+
 def tree(worlds: list[dict], parents: dict[str, dict], A: dict[str, float], q: dict[str, float]) -> list[dict]:
     """The outcomes as a tree (1.1), from the event's two sides down, each parent's ways in their order: each outcome
     with its parent, its side, its title, its probability, the weight today's prices put on it, and the portfolio's P&L
@@ -208,7 +221,7 @@ def tree(worlds: list[dict], parents: dict[str, dict], A: dict[str, float], q: d
         ws = under(n)
         mass = sum(leaf[w]["p"] for w in ws)
         node = leaf.get(n) or parents[n]
-        a = sum(leaf[w]["p"] * A[w] for w in ws) / mass if mass > TOL else sum(A[w] for w in ws) / len(ws)
+        a = outcome_mean(worlds, parents, A, n)
         out.append({"id": n, "parent": parent, "side": node["side"], **({"title": node["title"]}
                                                                         if node.get("title") else {}),
                     "p": mass, "q": sum(q[w] for w in ws), "A": a,

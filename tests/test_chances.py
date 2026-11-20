@@ -7,11 +7,12 @@ size."""
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from breakdown import World, stated
+from breakdown import World, named, stated
 from harness import store as store_module
 from harness.derive.structure import subject
 from harness.ledger import check, row
@@ -201,7 +202,7 @@ def test_a_driver_reaches_e_through_both_of_its_outcomes(w):
     lid = w.link(e, "implies", d)
     assert w.point(e) is None
     [found] = check(w.store)["cannot_hold"]
-    assert set(found["statements"]) == {f"{e}.chances[1]", lid}
+    assert named(found["statements"]) == {(e, (), (d,)), lid}  # the chance of E given not D, by what it is given
 
 
 def test_part_e_is_b_and_c_or_b_then_c(w):
@@ -279,7 +280,7 @@ def test_a_proposition_nothing_else_bears_on_takes_its_chance_stated_on_its_own(
     d = w.prop("D")
     with pytest.raises(StoreError, match=rf"given {d} both true and false"):
         w.chances(e, {"given": [d], "given_not": [d], "value": 0.5})
-    with pytest.raises(StoreError, match=rf"{e}.chances\[1\] is given {e} itself"):
+    with pytest.raises(StoreError, match=rf"{e}.chances\[0\] is given {e} itself"):  # as it was written
         w.chances(e, {"given": [e], "value": 0.5})
     with pytest.raises(StoreError, match=r"is given prop:99, which is not a proposition in the store"):
         w.chances(e, {"given": ["prop:99"], "value": 0.5})
@@ -429,7 +430,7 @@ def test_a_chance_follows_only_a_market_the_proposition_asks_and_that_market_sta
     w.chances(e, {"value": 0.3, "follow": m, "responsiveness": 0.5})
     with pytest.raises(StoreError, match="follows market:polymarket:M") as refused:
         w.store.remove(lid)
-    assert refused.value.dependents == [f"{e}.chances[0]"]
+    assert refused.value.dependents == [f"the chance of {e} stated on its own"]
 
 
 def test_the_store_keeps_when_each_stated_field_was_written(w):
@@ -440,3 +441,127 @@ def test_the_store_keeps_when_each_stated_field_was_written(w):
     assert w.store.stated_at(e, "chances") > first
     w.store.edit(e, "chances", None)
     assert w.store.stated_at(e, "chances") is None
+
+
+# ---------------------------------------------------------------- a chance stated alone (ONTOLOGY.md 2.1, TOOLS.md 5)
+
+
+def test_a_chance_stated_alone_takes_the_place_of_the_one_given_the_same_propositions_and_is_otherwise_added(w):
+    """E is 0.6 given D and 0.2 given not D, with D at 0.5, so E is 0.4. Stated alone, by add with E's id or by edit,
+    a chance given not D at 0.3 takes the place of the one given not D, which keeps its place in the list, and leaves
+    the chance given D as it was: E is 0.5 x 0.6 + 0.5 x 0.3 = 0.45. A chance given another proposition is added
+    after them. The note the replaced chance rested on goes with it (ONTOLOGY.md 2)."""
+    from harness.tools import Tools
+    d = w.prop("D", chance=0.5)
+    e = w.prop("E")
+    Tools(w).edit(e, "chances", [stated({"given": [d], "value": 0.6}), stated({"given_not": [d], "value": 0.2})])
+    assert w.point(e) == pytest.approx(0.4)
+    first = w.store.stated_of(e)["chances"][1]["note"]
+    Tools(w).add("Proposition", {"id": e, "chances": [stated({"given_not": [d], "value": 0.3}, "the case for less")]})
+    held = w.store.stated_of(e)["chances"]
+    assert [(c["given"], c["given_not"], c["value"]) for c in held] == [([d], [], 0.6), ([], [d], 0.3)]
+    assert w.point(e) == pytest.approx(0.45)
+    assert w.store.type_of(first) is None and w.store.get(held[1]["note"])["stated"]["text"] == "the case for less"
+    f = w.prop("F", chance=0.5)
+    Tools(w).edit(e, "chances", [stated({"given": [d, f], "value": 0.7})])
+    held = w.store.stated_of(e)["chances"]
+    assert [(c["given"], c["value"]) for c in held] == [([d], 0.6), ([], 0.3), ([d, f], 0.7)]
+
+
+def test_a_chance_given_the_same_propositions_with_its_value_null_is_taken_away_with_its_note(w):
+    """A null value takes away the chance given the same propositions, and its note with it; the others keep their
+    order. A null value names the chance by what it is given, and carries nothing beside it, since the chance's basis
+    goes with it. A chance the proposition does not have is not taken away: the refusal says what its chances are
+    given, at the place the analyst wrote it."""
+    from harness.tools import Tools
+    d, f = w.prop("D", chance=0.5), w.prop("F", chance=0.5)
+    e = w.prop("E")
+    Tools(w).edit(e, "chances", [stated({"given": [d], "value": 0.6}), stated({"given_not": [d], "value": 0.2}),
+                                 stated({"given": [d, f], "value": 0.7})])
+    note = w.store.stated_of(e)["chances"][1]["note"]
+    Tools(w).edit(e, "chances", [{"given_not": [d], "value": None}])
+    held = w.store.stated_of(e)["chances"]
+    assert [(c["given"], c["given_not"]) for c in held] == [([d], []), ([d, f], [])]
+    assert w.store.type_of(note) is None
+    with pytest.raises(StoreError, match=re.escape(f'chances[0] has a null value, which removes the chance given not '
+                                                   f'{d}, with note beside it. A chance is removed by what it is given '
+                                                   f'alone: {{"given": [], "given_not": ["{d}"], "value": null}}')):
+        Tools(w).edit(e, "chances", [{"given_not": [d], "value": None, "note": "no longer"}])
+    with pytest.raises(StoreError, match=re.escape(f"fields.chances[1] removes the chance of {e} given not {d}, and "
+                                                   f"{e} has none. Its chances: one given {d}; one given {d} and {f}.")):
+        Tools(w).add("Proposition", {"id": e, "chances": [stated({"given": [f], "value": 0.4}),
+                                                          {"given_not": [d], "value": None}]})
+    assert len(w.store.stated_of(e)["chances"]) == 2  # nothing was written
+    Tools(w).edit(e, "chances", None)  # the field cleared: every chance taken away
+    assert not w.store.stated_of(e).get("chances")
+
+
+def test_a_statement_that_writes_chances_returns_its_propositions_chances_as_they_now_stand(w):
+    """A at 0.80 to 0.82 and B at 0.40 to 0.42, with nothing between them: the chance of B given A can take 0.25 to
+    0.525 (MATH.md 1.2; structure.CHANCE_RANGES). edit, add with B's id and a proposition stated whole each return the
+    chances of each proposition they write chances of, as they now stand, in the order of its list: each by what it is
+    given, with its figure and its range, those left as they were among them. Once the last is removed, the list is
+    empty. A proposition whose chances the statement does not write is returned without them."""
+    from harness.tools import Tools
+    a, b = w.prop("A"), w.prop("B")
+    for pid, title, bid, ask in ((a, "A", 0.80, 0.82), (b, "B", 0.40, 0.42)):
+        w.link(pid, "asks", w.market(title, f"{title}?", bid, ask))
+    got = Tools(w).edit(b, "chances", [stated({"given": [a], "value": 0.5})])
+    assert got["propositions"][b]["chances"] == [{"given": [a], "given_not": [], "value": 0.5, "range": [0.25, 0.525]}]
+    assert "chances" not in got["propositions"][a]
+    got = Tools(w).add("Proposition", {"id": b, "chances": [stated({"given_not": [a], "value": 0.3})]})
+    left, written = got["propositions"][b]["chances"]  # the chance given A stands as it was, and is returned first
+    assert (left["given"], left["given_not"], left["value"]) == ([a], [], 0.5) and left["range"] is not None
+    assert (written["given"], written["given_not"], written["value"]) == ([], [a], 0.3)
+    got = Tools(w).add("Proposition", {"id": b, "chances": [{"given_not": [a], "value": None}]})
+    assert got["propositions"][b]["chances"] == [{"given": [a], "given_not": [], "value": 0.5, "range": [0.25, 0.525]}]
+    got = Tools(w).edit(b, "chances", [{"given": [a], "value": None}])
+    assert got["propositions"][b]["chances"] == []
+    got = Tools(w).add("Proposition", {"title": "C", "text": "C: the proposition", "comparison": "occurs",
+                                       "window_end": "2027-03-31", "kind": "hitting",
+                                       "chances": [stated({"given": [a], "value": 0.5})],
+                                       "implies": [{"to": b}]})
+    c = got["made"]["fields"]
+    [(given, value, ranged)] = [(x["given"], x["value"], x["range"] is not None) for x in got["propositions"][c]["chances"]]
+    assert (given, value, ranged) == ([a], 0.5, True) and "chances" not in got["propositions"][b]
+
+
+def test_a_statements_structure_return_gives_each_share_to_six_places(w):
+    """The chance of B given A stated at 0.90, past the 0.525 the books allow, stretches a book (MATH.md 1.2): the return
+    gives each proposition's range and probability, each chance's figure and range, and the stretched book's bid, ask
+    and stretch, each to six places, as a row's are (TOOLS.md 9). The derivation keeps them exact."""
+    from harness.tools import Tools
+    a, b = w.prop("A"), w.prop("B")
+    for pid, title, bid, ask in ((a, "A", 0.80, 0.82), (b, "B", 0.40, 0.42)):
+        w.link(pid, "asks", w.market(title, f"{title}?", bid, ask))
+    got = Tools(w).edit(b, "chances", [stated({"given": [a], "value": 0.9})])
+    shares = [*(x for p in got["propositions"].values() for x in (*p.get("range", ()), p.get("probability"))),
+              *(x for s in got["stretched"].values() for k, x in s.items() if k in ("bid", "ask", "below", "above"))]
+    assert got["stretched"] and all(isinstance(x, float) and round(x, 6) == x for x in shares if x is not None)
+
+
+def test_a_following_chance_with_no_figure_now_is_returned_with_no_range(w):
+    """A chance that follows a market with no priced reading has no figure now, and the structure reads it as no
+    statement (MATH.md 1.2): returned among its proposition's chances, it gives its figure as stated, what it follows,
+    and `now` null, with no range, since a range is of a figure; null stays the range of a chance the other statements
+    cannot hold."""
+    from harness.tools import Tools
+    e = w.prop("E")
+    m = w.market("M", "E?", 0.39, None)  # a bid alone: no price
+    w.link(e, "asks", m)
+    got = Tools(w).edit(e, "chances", [stated({"value": 0.30, "follow": m, "responsiveness": 0.5})])
+    assert got["propositions"][e]["chances"] == [{"given": [], "given_not": [], "value": 0.3, "follow": m,
+                                                  "now": None}]
+
+
+def test_check_gives_a_stretched_books_shares_to_six_places_and_its_depth_to_the_cent(w):
+    """check() reads what cannot hold and each stretched book as a statement's return does (TOOLS.md 6, 9): the chance of B
+    given A at 0.90, past what A's and B's books allow, stretches a book, whose bid, ask and stretch are shares to six
+    places and whose depth is dollars to the cent."""
+    a, b = w.prop("A"), w.prop("B")
+    for pid, title, bid, ask in ((a, "A", 0.80, 0.82), (b, "B", 0.40, 0.42)):
+        w.link(pid, "asks", w.market(title, f"{title}?", bid, ask))
+    w.chances(b, {"given": [a], "value": 0.9})
+    [book] = check(w.store)["stretched"]
+    assert all(round(book[k], 6) == book[k] for k in ("bid", "ask", "below", "above"))
+    assert round(book["depth"], 2) == book["depth"]

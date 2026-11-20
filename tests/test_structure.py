@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from breakdown import World, stated
+from breakdown import World, named, stated
 from harness.ledger import check, event_now, row, watched as steps
 
 
@@ -193,13 +193,14 @@ def test_chances_that_cannot_hold_are_listed_and_the_structure_waits(w):
     w.chances(e, {"given": [q], "value": 0.5}, {"given_not": [q], "value": 0.2})
     assert all(p(w, x) is None for x in (e, a, b, q))
     [found] = check(w.store)["cannot_hold"]
-    assert {f"{e}.chances[0]", f"{q}.chances[0]", f"{q}.chances[1]", f"{a}.chances[0]"} <= set(found["statements"])
-    figures = {f["id"]: f for f in found["figures"]}  # each statement with its figures (MATH.md 1.10)
-    assert [f["id"] for f in found["figures"]] == found["statements"]
-    assert figures[f"{e}.chances[0]"] == {"id": f"{e}.chances[0]", "of": e, "given": [q], "given_not": [], "value": 0.5}
-    assert figures[f"{a}.chances[0]"]["value"] == 0.2 and figures[f"{q}.chances[1]"]["given_not"] == [a]
-    for lid in (s for s in found["statements"] if s.startswith("link:")):
-        assert figures[lid]["relation"] == "way" and figures[lid]["from"] == e and figures[lid]["side"] == "yes"
+    assert {(e, (q,), ()), (q, (a,), ()), (q, (), (a,)), (a, (), ())} <= named(found["statements"])
+    # each chance by what it is given, with its figure now (MATH.md 1.10), and no place in its list
+    assert {"of": e, "given": [q], "given_not": [], "value": 0.5} in found["statements"]
+    assert {"of": a, "given": [], "given_not": [], "value": 0.2} in found["statements"]
+    assert {"of": q, "given": [], "given_not": [a], "value": 0.1} in found["statements"]
+    assert "figures" not in found
+    for link in (s for s in found["statements"] if s.get("id", "").startswith("link:")):  # a link by its id
+        assert link["relation"] == "way" and link["from"] == e and link["side"] == "yes"
     why = w.store.engine.value("outcomes", e).output["why"]
     assert why.startswith(f"The statements of {e}'s structure cannot hold together")
     assert event_now(w.store, e)["figures"] is None
@@ -322,7 +323,7 @@ def test_a_chance_given_a_proposition_brings_it_into_the_structure_and_removing_
     e, d = w.prop("E"), asked(w, "D", 0.29, 0.31)
     w.chances(e, {"given": [d], "value": 0.6}, {"given_not": [d], "value": 0.2})
     assert p(w, e) == pytest.approx(0.30 * 0.6 + 0.70 * 0.2)
-    with pytest.raises(StoreError, match=rf"named by {e}\.chances\[0\], {e}\.chances\[1\]"):
+    with pytest.raises(StoreError, match=rf"named by the chance of {e} given {d}, the chance of {e} given not {d};"):
         w.store.remove(d)
 
 
@@ -357,3 +358,25 @@ def test_an_event_s_reasons_for_having_no_figures_read_as_sentences(w):
     w.link("portfolio", "watches", e)
     why = event_now(w.store, e)["why"]
     assert why.startswith(f"{e}'s probability is left open, from 0 to 1. ") and ".;" not in why and why.endswith(".")
+
+
+def test_what_the_statements_decide_alone_reaches_through_readings_and_not_through_a_chance_given_another(w):
+    """The probabilities read every chance, so the structure of E reaches B through the chance of E given B. What the
+    statements decide alone, as an outcome is, reaches only through a chance whose placing is a condition, a deadline
+    reading's: R, a rung of E's reading, is reached either way, and the reading keeps its place among E's chances, its
+    rungs named by its own index. A link that says one of its ends is false says it of what that end stands as."""
+    from harness.derive import structure
+    from harness.derive.engine import Inputs
+    b, r = w.prop("B"), w.prop("R by the later date", end="2027-06-30")
+    e = w.prop("E")
+    w.store.edit(e, "chances", [stated({"given": [b], "given_not": [], "value": 0.6}),
+                                stated({"given": [r], "given_not": [], "reading": "even"})])
+    reader = structure.InStore(Inputs(w.store.engine))
+    every, alone = structure.statements(reader, e), structure.statements(reader, e, chances=False)
+    assert {b, r} <= set(every["props"]) and r in alone["props"] and b not in alone["props"]
+    assert {x["id"] for x in alone["links"]} == {f"{e}.chances[1].rungs"}
+    m = w.market("M", "Will R happen?", 0.4, 0.5)
+    w.link(r, "asks", m, side="no")
+    links = structure.breakdown_links([{"id": "x", "relation": "implies", "from": e, "to": m, "to_true": False,
+                                        "stated": {}}], {e, r}, [m], {m: (r, False)})
+    assert links == [{"id": "x", "relation": "implies", "from": e, "to": r}]  # e implies not M, which is R

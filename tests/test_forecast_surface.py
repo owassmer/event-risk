@@ -1,5 +1,5 @@
 """The page reads the distribution, stated values, a following chance and held contracts as the engine returns them:
-each outcome's mean and middle 90% at the horizon beside the tree's P&L today, a weight that contradicts the price said
+each outcome's mean and middle 90% on the event's date beside the tree's P&L today, a weight that contradicts the price said
 as one, our estimate beside what it follows, and a held contract by its side and question."""
 import re
 from types import SimpleNamespace
@@ -7,16 +7,16 @@ from types import SimpleNamespace
 from harness import render
 
 
-def test_the_outcomes_at_the_horizon_read_the_engines_distribution_each_in_whole_dollars_in_its_tone():
-    """Each outcome's 5th and 95th percentiles at the horizon's end are the engine's (MATH.md 1.8), in whole dollars, each
+def test_the_outcomes_on_the_events_date_read_the_engines_distribution_each_in_whole_dollars_in_its_tone():
+    """Each outcome's 5th and 95th percentiles on the event's date are the engine's (MATH.md 1.8), in whole dollars, each
     in the tone of the money it gains or loses and opening the distribution's working. The mean there is in the
     outcome's working, not a row of the grid: beside its P&L today it reads as the same figure twice."""
     result = {
-        "horizon_end": "2027-05-03", "mean": -125.0,
+        "drawn_on": "2027-05-03", "mean": -125.0,
         "worlds": {"yes": {"p": 0.3, "mean": -400.0, "centre": -450.0, "quantiles": {"0.05": -1000.0, "0.95": 200.0}},
                    "no": {"p": 0.7, "mean": 100.0, "centre": 80.0, "quantiles": {"0.05": -300.0, "0.95": 800.0}}}}
     worlds = [{"id": "yes"}, {"id": "no"}]
-    rows = "".join(render._horizon_rows(result, "cmp:42", worlds))
+    rows = "".join(render._percentile_rows(result, "cmp:42", worlds))
     text = re.sub(r"<[^>]+>", "|", rows)
     assert "Mean" not in text
     assert "5th percentile, May 3" in text and "|−$1,000|" in text and "|+$800|" in text
@@ -28,7 +28,7 @@ def test_the_picture_is_one_working_its_centres_the_ones_its_distribution_read()
     centre. A row worked out again since the distribution was gives the titles, never a centre, so the picture never
     puts one working's centres on another's masses."""
     import json
-    dist = {"horizon_end": "2027-05-03", "mean": -125.0, "bins": {"edges": [-1000.0, 0.0, 1000.0], "mass": [.3, .7]},
+    dist = {"drawn_on": "2027-05-03", "mean": -125.0, "bins": {"edges": [-1000.0, 0.0, 1000.0], "mass": [.3, .7]},
             "quantiles": {"0.01": -900.0, "0.05": -800.0, "0.95": 700.0, "0.99": 900.0},
             "worlds": {"yes": {"p": 0.3, "mass": [.3, 0], "centre": -450.0,
                                "quantiles": {"0.01": -900.0, "0.05": -800.0, "0.95": -100.0, "0.99": -50.0}},
@@ -42,8 +42,8 @@ def test_the_picture_is_one_working_its_centres_the_ones_its_distribution_read()
                                                                          ("If it does not", 80.0, "70.0%")]
 
 
-def test_the_outcomes_at_the_horizon_are_absent_while_the_distribution_is():
-    assert render._horizon_rows({}, None, [{"id": "yes"}]) == []
+def test_the_outcomes_percentiles_are_absent_while_the_distribution_is():
+    assert render._percentile_rows({}, None, [{"id": "yes"}]) == []
 
 
 def test_following_a_name_keeps_an_unidentified_weight_open():
@@ -71,7 +71,7 @@ def test_held_contracts_show_the_side_and_question_in_the_portfolio_and_the_mark
     assert "No · Will it happen?" in html and f'data-go="{mid}"' in html
     assert render.name_of(w.store, mid) == "No · Will it happen?"  # as the largest contributors name it
     market = render.view(w.store, mid)["html"]
-    assert "Your holdings" in market and "20 contracts" in market and "$13.00" in market
+    assert '<h3 class="sub">Held</h3>' in market and ">20<" in market and "$13.00" in market
     w.store.close()
 
 
@@ -85,21 +85,41 @@ def test_worth_values_open_to_their_working(tmp_path):
     worth(w, a, "name:DEAL", "no", {"amount": 25})
     w.link(b, "consequence", channel(w, "SPY"), shock=0.1)
     opened = render.view(w.store, yes)
-    assert opened["title"] == "Value of DEAL" and "Value today in each world" in opened["html"]
+    assert opened["title"] == "Value of DEAL" and '<h3 class="sub">Value today</h3>' in opened["html"]
     assert "$40.00" in opened["html"] and "the deal terms" in opened["html"]
     event_html = render.view(w.store, a)["html"]
     assert "Values stated" in event_html and f'data-go="{yes}"' in event_html
     assert "Read events together" not in render.ledger_panel(render.Reader(w.store))
+    # the weight the price implies, (30 - 25) / (40 - 25), under its label, the event's probability beneath it
+    import re
+    from html import unescape
+    plain = lambda html: unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)))  # noqa: E731
+    implied = "Implied by today\u2019s price 33.3% Probability 30.0%"
+    assert implied in plain(event_html) and implied in plain(opened["html"])
+    # it opens to its working: today's price between the value stated for each side, with no formula
+    working = f'data-go="x:implied:{a}:name:DEAL"'
+    assert working in event_html and working in opened["html"]
+    shown = plain(render.view(w.store, f"x:implied:{a}:name:DEAL")["html"])
+    for said in ("Implied by today\u2019s price 33.3%", "Value if No $25.00", "Price today $30.00", "Value if Yes $40.00"):
+        assert said in shown, said
+    assert "/" not in shown.split("Full details")[0] and "0000%" not in shown
+    # the expected value's working names the values it comes from: 100 shares at 0.3 * $10 - 0.7 * $5
+    swing = plain(render.view(w.store, f"x:swing:{a}")["html"])
+    assert "Expected value" in swing and "\u2212$50" in swing
+    assert "Values stated DEAL \u00b7 per share" in swing and "$40.00" in swing and "$25.00" in swing and implied in swing
     w.store.close()
 
 
-def test_a_weight_outside_zero_to_one_reads_as_contradicting_the_price():
+def test_the_weight_a_price_implies_shows_where_it_is_a_weight_and_the_values_stand_as_stated_where_it_is_not():
+    """MATH.md 1.6: values that put today's price beyond them give a figure outside 0 to 1, which is no weight; the analyst
+    reads what they contradict in check() (1.10), and the page shows the values as stated and no weight for them. A
+    weight shows under its label, the event's probability beneath it where it is given."""
     import re
-    words = lambda x: re.sub(r"<[^>]+>", "", render._implied_words(x))  # noqa: E731
-    assert "implies 39.2% for the event" in words(0.392)
-    contradicting = words(2.1)
-    assert "contradict today’s price" in contradicting and "210%" in contradicting and "implies 210%" not in contradicting
-    assert words(None) == ""
+    from html import unescape
+    words = lambda *a: unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", render._implied_row(*a)))).strip()  # noqa: E731
+    assert words(0.392, "prop:1", 0.3) == "Implied by today\u2019s price 39.2% Probability 30.0%"
+    assert words(0.392) == "Implied by today\u2019s price 39.2%"
+    assert words(2.1, "prop:1", 0.3) == "" and words(-0.3) == "" and words(None) == ""
 
 
 def test_both_sides_of_a_held_contract_show_actual_quantity_and_payoff_operands(tmp_path):
@@ -114,14 +134,14 @@ def test_both_sides_of_a_held_contract_show_actual_quantity_and_payoff_operands(
     yes = w.store.link("portfolio", "holds", mid, {"side": "yes", "quantity": 100})["id"]
     w.store.link("portfolio", "holds", mid, {"side": "no", "quantity": 20})
     plain = lambda text: re.sub('<[^>]+>', '', text)
+    # a contract by its side and quantity; in each outcome, the chance it pays there and its P&L: no operands
     holding = plain(render.view(w.store, f"x:holding:{event_}:{yes}")["html"])
-    assert "100 × $1 × 100.0000% × (100.0000% − 0.0000%)" in holding
-    assert "100 × $1 × 100.0000% × 100.0000% − $35.00" in holding
+    assert "Side" in holding and "Yes" in holding and ">100<" in render.view(w.store, f"x:holding:{event_}:{yes}")["html"]
+    assert "100.0%" in holding and "+$65" in holding and "×" not in holding
     swing = plain(render.view(w.store, f"x:swing:{event_}")["html"])
-    assert "100 × $1 × 100.0000% × (100.0000% − 0.0000%)" in swing
-    assert "20 × $1 × 100.0000% × (0.0000% − 100.0000%)" in swing
-    outcome = plain(render.view(w.store, f"x:outcome:{event_}:yes")["html"])
-    assert "20 × $1 × 100.0000% × 0.0000% − $13.00" in outcome
+    assert "Yes, 100 contracts · No, 20 contracts" in swing and "×" not in swing
+    outcome = plain(render.view(w.store, f"x:parts:{event_}:yes")["html"])  # the outcome's P&L, worked
+    assert "Yes, 100 contracts · No, 20 contracts" in outcome and "×" not in outcome
     w.store.close()
 
 
@@ -136,21 +156,29 @@ def test_option_receipt_distinguishes_observed_price_boundary_and_world_values()
     assert "Pricing gap" in html and "+$1.00" in html and "Strike constraints" in html
 
 
-def test_an_opened_events_picture_has_its_place_while_its_draws_are_first_worked_out_and_is_drawn_once_they_are():
+def dated(monkeypatch) -> dict:
+    """A store's portfolio as of a day, and an event whose outcomes are all known by its own date, before the horizon's
+    end: the date the store draws them on (ledger.drawn_on, which reads the event's tree of ways and is proven against
+    the distribution's own in test_distribution)."""
+    monkeypatch.setattr(render, "drawn_on", lambda store, *events: "2027-03-31")
+    return {"type_of": lambda oid: "Portfolio" if oid == "portfolio" else "Proposition",
+            "stated_of": lambda oid: {"asof": "2026-11-04"} if oid == "portfolio" else {"window_end": "2027-03-31"}}
+
+
+def test_an_opened_events_picture_has_its_place_while_its_draws_are_first_worked_out_and_is_drawn_once_they_are(monkeypatch):
     """The opened event shows without waiting for its distribution's draws (MATH.md 1.8): while they are worked out for
     the first time, the picture's place says so (the view says it is being made, and the page reads it again); once
     they are, it is drawn."""
     from contextlib import nullcontext
     worlds = [{"id": "yes", "title": "Yes", "world": True, "A": -400.0, "p": 0.3},
               {"id": "no", "title": "No", "world": True, "A": 100.0, "p": 0.7, "baseline": True}]
-    store = SimpleNamespace(horizon_end=lambda: "2027-05-03",
-                            computation_of=lambda cid: {"derivation": "distribution", "subject": "prop:1"})
+    store = SimpleNamespace(**dated(monkeypatch), computation_of=lambda cid: {"derivation": "distribution", "subject": "prop:1"})
     waiting = SimpleNamespace(store=store, engine=SimpleNamespace(placeholders=nullcontext),
                               value=lambda *a: SimpleNamespace(waiting=True, output=None, basis=None))
     html = render._outcome_picture(waiting, {"id": "prop:1", "outcomes": worlds})
-    assert "Working out each outcome at the horizon" in html
-    assert "At May 3, 2027" in html and "data-dist" not in html
-    out = {"horizon_end": "2027-05-03", "mean": 0.0, "quantiles": {"0.01": -900.0, "0.05": -500.0, "0.95": 500.0,
+    assert "Working out each outcome" in html
+    assert "At Mar 31, 2027" in html and "data-dist" not in html  # the event's own date, before its draws are made
+    out = {"drawn_on": "2027-03-31", "mean": 0.0, "quantiles": {"0.01": -900.0, "0.05": -500.0, "0.95": 500.0,
                                                                    "0.99": 900.0},
            "bins": {"edges": [-1000.0, 0.0, 1000.0], "mass": [0.5, 0.5]},
            "worlds": {w["id"]: {"p": w["p"], "mean": w["A"], "centre": w["A"], "mass": [0.25, 0.25],
@@ -163,16 +191,16 @@ def test_an_opened_events_picture_has_its_place_while_its_draws_are_first_worked
     assert 'data-go="raw:value:distribution:prop:1"' in drawn  # its working opens by its value, as the value moves
 
 
-def test_a_picture_shown_keeps_its_place_while_a_reply_works_its_distribution_out_again():
+def test_a_picture_shown_keeps_its_place_while_a_reply_works_its_distribution_out_again(monkeypatch):
     """On a reply's turn, a distribution the page's read cannot give (worked out on the turn) is being worked out: the
     picture's place and the horizon's rows say so, so the page keeps the picture it shows until the new one comes
     (app.js morph). Read between replies, where every value is worked out, an absent distribution is no picture."""
     from contextlib import nullcontext
     worlds = [{"id": "yes", "title": "Yes", "world": True, "A": -400.0, "p": 0.3},
               {"id": "no", "title": "No", "world": True, "A": 100.0, "p": 0.7, "baseline": True}]
-    store = SimpleNamespace(horizon_end=lambda: "2027-05-03")
+    store = SimpleNamespace(**dated(monkeypatch))
     reader = lambda pending: SimpleNamespace(store=store, engine=SimpleNamespace(placeholders=nullcontext),  # noqa: E731
                                              value=lambda *a: None, pending=pending)
     on_the_turn = render._outcome_picture(reader(True), {"id": "prop:1", "outcomes": worlds})
-    assert "Working out each outcome at the horizon" in on_the_turn
+    assert "Working out each outcome" in on_the_turn
     assert render._outcome_picture(reader(False), {"id": "prop:1", "outcomes": worlds}) == ""

@@ -34,14 +34,20 @@ A row listed abroad is the security the fund holds, on its home market and in it
 they name none, its ISIN's), which `home` reads (harness.venues.yahoo). A US listing that confirms it, a depositary
 receipt among them, names its company (its CIK), never its price.
 
-A company is one name, whatever securities the portfolio holds it by (MATH.md 3.1). Its id is a listing chosen by one
+A company is one name, whatever securities the portfolio holds it by (MATH.md 3.1): the legal entity behind them. Its
+securities are those the SEC lists under its CIK, those of one share class, and those whose issuer is one LEI
+(`entities`): a depositary receipt's ISIN is the receipt's own and names no ordinary, and a share class at home often
+has no US listing to carry a CIK, but each names its issuer. A fund's Form N-PORT report names the issuer of each
+share it holds by its LEI (`issuers`), and GLEIF names the issuer of a receipt, and of many a share class abroad, by
+its ISIN (`Lookup.issuer`, harness.venues.gleif), so Petrobras's receipt held directly and its common and preferred
+shares in a fund are one company. An LEI that would make one company of securities the SEC lists under two CIKs is
+wrong for one of them, and is not taken; a company is never joined by its name. Its id is a listing chosen by one
 rule, over the company's listings and never over what is held: its first US ticker, the first the SEC's list of tickers
 gives its CIK (`first_ticker`; the list gives a company's main listing first, GOOGL before GOOG, BRK-B before BRK-A,
 BAC before its preferreds), in Massive's form (a class after a dot); and where the SEC gives it none, its home
 listing. `name_of` gives the id and the pricing security of the company a ticker names, for a company the portfolio
-holds nowhere: its home listing, which for a company in the US is its id's listing. A depositary receipt names no
-ordinary among its identifiers (its ISIN is the receipt's own), so a company named only by its receipt is priced
-through the receipt. It is taken by its identifiers, whether or not a source prices it: identity is not
+holds nowhere: its home listing, which for a company in the US is its id's listing; a company named only by its
+receipt is priced through the receipt. It is taken by its identifiers, whether or not a source prices it: identity is not
 pricing, and the company, the security the fund holds and its exposure are identified however a provider covers that
 market, so a listing its price source does not cover stays a name the fund holds, with its exposure. A holding of
 the US with no exchange listing is priced through one over the counter (`otc`) that Massive prices: one it has a close
@@ -54,9 +60,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from datetime import date, datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
+from harness.venues.gleif import valid_lei
 from harness.venues.massive import answered
 
 # Massive's types that are a share of a company (https://massive.com/docs/rest/stocks/tickers/ticker-types): common
@@ -257,6 +265,38 @@ class Lookup:
         found = self._read("company_listings", str(cik).zfill(10))
         return [r for r in (found or {}).get("results") or [] if isinstance(r, dict)] if isinstance(found, dict) else []
 
+    def issuer(self, isin: str | None) -> str | None:
+        """The legal entity GLEIF names the issuer of an ISIN (harness.venues.gleif): its LEI where it names one, none
+        where it names none or several."""
+        if not isin or not _ISIN.fullmatch(isin):
+            return None
+        found = self._read("lei", isin)
+        leis = {str(r.get("lei") or "").upper() for r in (found or {}).get("records") or []} \
+            if isinstance(found, dict) else set()
+        leis = {x for x in leis if valid_lei(x)}
+        return next(iter(leis)) if len(leis) == 1 else None
+
+    def isin_held(self, ticker: str) -> str | None:
+        """The ISIN of a security held directly or named by a shock whose issuer is asked of GLEIF: a listing abroad's
+        share class (`{ISIN}:{country}`, or by its symbol, abroad), and a depositary receipt's own, as a fund's row of
+        it gives it, confirmed by OpenFIGI's mapping of that ISIN naming the receipt's own FIGI; none where no fund's
+        holdings give one, or several are confirmed."""
+        from harness.derive import series
+        if series.is_abroad(ticker) and not series.symbol_abroad(ticker):
+            return ticker.split(":")[0]
+        reference = self.reference(ticker) if us_ticker(ticker) or series.symbol_abroad(ticker) else {}
+        if series.symbol_abroad(ticker) and reference.get("market") == "home":
+            return abroad(ticker, reference, self)["isin"]
+        if reference.get("type") in RECEIPTS:  # the ISIN a fund's row gives its ticker on a US exchange, where OpenFIGI's
+            # mapping of that ISIN names this listing's own FIGI: a ticker passes between securities, a FIGI does not
+            figi = reference.get("composite_figi")
+            found = self._read("ticker_isin", ticker)
+            isins = (found or {}).get("isins") or [] if isinstance(found, dict) else []
+            confirmed = [i for i in isins if figi and figi in set(self.composites_of_isin(i)) |
+                         {x.get("compositeFIGI") for x in self.us_listings({"isin": i})}]
+            return confirmed[0] if len(confirmed) == 1 else None
+        return None
+
     def priced(self, ticker: str) -> bool:
         """Whether Massive prices the listing: it has a close for it on or before the as-of, however old. Its dollars
         come from its fund's weight, and its price matters only to a shock stated on that price, which converts to a
@@ -444,6 +484,94 @@ def abroad(symbol: str, reference: dict, look: Lookup) -> dict:
 
 
 RECEIPTS = ("ADRC", "ADRP", "NYRS", "GDR")  # a depositary receipt's types: a company abroad, its home line not named
+
+# Form N-PORT's asset categories of a share: equity-common and equity-preferred (Form N-PORT Part C, Item C.4,
+# https://www.sec.gov/files/formn-port.pdf). A company's debt carries its issuer's LEI too, and is no share of it.
+EQUITY = ("EC", "EP")
+
+
+def issuers(reports: Iterable[Any]) -> dict[str, str]:
+    """The issuer's LEI the funds' Form N-PORT reports give each share, by its ISIN (or the ISIN its US CUSIP makes): a
+    report names each holding's issuer by its LEI (`lei`, harness.venues.sec), and a share's issuer is the company it is
+    a share of, the legal entity behind it. A row that is no share, or whose LEI is none (a report writes N/A, zeros or a
+    name where it has none), gives nothing; a share two reports give different LEIs has none, since one of them is
+    wrong and nothing here says which."""
+    from harness.derive.assets import isin_of as row_isin
+    found: dict[str, set[str]] = defaultdict(set)
+    for payload in reports:
+        for r in (payload or {}).get("results") or [] if isinstance(payload, dict) else []:
+            if not isinstance(r, dict) or str(r.get("asset_category") or "").upper() not in EQUITY:
+                continue
+            lei, isin = str(r.get("lei") or "").strip().upper(), row_isin(r)
+            if isin and valid_lei(lei):
+                found[isin].add(lei)
+    return {isin: next(iter(leis)) for isin, leis in found.items() if len(leis) == 1}
+
+
+def entities(members: dict[str, dict]) -> dict[str, str]:
+    """Each security's company, the legal entity behind it (MATH.md 3.1). `members`, each security by its ticker:
+    `{"isin": its share class's, where it is listed abroad; "cik"; "lei": its issuer's; "linked": the ids a link of the
+    store names it by}`. A company is the securities its identifiers make one: the listings of one share class are one
+    security; securities the SEC lists under one CIK are one company, and so are securities whose issuer is one LEI;
+    where the company that makes names at most one CIK, one LEI and one id a link names. Where two identifiers
+    disagree, a CIK whose securities name two issuers (the SEC's list can file a company's over-the-counter line under
+    another registrant, its parent: SoftBank Corp's under SoftBank Group's CIK) or an LEI naming securities of two
+    CIKs, the securities stay apart as far as they disagree, and that CIK names none of them; a company two links name
+    by two ids keeps each link's meaning, as two names. Returns each security's company: `cik:N` where its CIK's
+    securities are one company, else `lei:...` where an issuer joined it to another, else its share class or itself."""
+    base = {sec: f"isin:{info['isin']}" if info.get("isin") else f"ticker:{sec}" for sec, info in members.items()}
+    keys = sorted(set(base.values()))
+    parent = {k: k for k in keys}
+    held: dict[str, dict[str, set]] = {k: {"cik": set(), "lei": set(), "linked": set()} for k in keys}
+    by: dict[str, dict[Any, set[str]]] = {"cik": defaultdict(set), "lei": defaultdict(set)}
+    for sec, info in members.items():
+        for field in ("cik", "lei"):
+            if info.get(field):
+                held[base[sec]][field].add(info[field])
+                by[field][info[field]].add(base[sec])
+        held[base[sec]]["linked"] |= set(info.get("linked") or ())
+
+    def find(k: str) -> str:
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    def other(field: str, value: Any) -> set:  # what the securities one identifier names give of the other
+        other_field = "lei" if field == "cik" else "cik"
+        return {members[sec][other_field] for sec in members
+                if members[sec].get(field) == value and members[sec].get(other_field)}
+
+    # an identifier is taken whole or not at all: a CIK whose securities name one issuer at most, an LEI whose
+    # securities the SEC lists under one CIK at most; so where they disagree, neither joins what it names
+    for value in sorted((v for v in by["cik"] if len(other("cik", v)) <= 1), key=str):
+        first, *rest = sorted(by["cik"][value])
+        for k in rest:
+            a, b = sorted((find(first), find(k)))
+            if a != b:
+                parent[b] = a
+                held[a] = {f: held[a][f] | held[b][f] for f in held[a]}
+    for value in sorted(v for v in by["lei"] if len(other("lei", v)) <= 1):
+        roots = sorted({find(k) for k in by["lei"][value]})
+        together = {f: set().union(*(held[r][f] for r in roots)) for f in ("cik", "lei", "linked")}
+        # the groups it joins, whole, name one CIK and one issuer at most; and a company two links name by two ids
+        # keeps each link's meaning
+        if len(roots) > 1 and all(len(together[f]) <= 1 for f in together):
+            for r in roots[1:]:
+                parent[r] = roots[0]
+                held[roots[0]] = {f: held[roots[0]][f] | held[r][f] for f in held[r]}
+
+    whole = {cik for cik, ks in by["cik"].items() if len({find(k) for k in ks}) == 1}
+    size: dict[str, int] = defaultdict(int)
+    for k in keys:
+        size[find(k)] += 1
+    out: dict[str, str] = {}
+    for sec in members:
+        root = find(base[sec])
+        cik = next(iter(held[root]["cik"]), None) if len(held[root]["cik"]) == 1 else None
+        lei = next(iter(held[root]["lei"]), None) if len(held[root]["lei"]) == 1 else None
+        out[sec] = f"cik:{cik}" if cik in whole else f"lei:{lei}" if lei and size[root] > 1 else root
+    return out
 
 
 def company_id(look: Lookup, cik: int | None, fallback: str) -> str:

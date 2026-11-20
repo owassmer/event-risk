@@ -160,7 +160,7 @@ def test_a_name_with_an_exposure_and_no_price_moves_in_its_funds_remainder(tmp_p
         "fields"]
     with pytest.raises(StoreError):  # no price, so no price metric
         store.get(f"metric:price:{abroad}")
-    assert f"name:{abroad}" in {n.get("name") for n in what_it_owns(store)["by_company"]}
+    assert f"name:{abroad}" in {n.get("id") for n in what_it_owns(store)["by_company"]}
     out = impact_of(store, 0.4, market=-0.05)
     assert {n["name"] for n in out["contributors"]} == {"name:A"}
     (r,) = out["remainders"]

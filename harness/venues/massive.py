@@ -61,18 +61,22 @@ a 429 is waited out. A crypto pair's prices come from Coinbase Exchange (harness
   security: a company that moved its US listing from one security to another under the same ticker (TotalEnergies,
   from its depositary receipt to its ordinary shares on 2025-12-08) has events naming only the new security's earlier
   placeholder ticker, which traded nothing; where an earlier ticker gives no rows, the ticker's own earlier rows stand,
-  if its reference names the same company (one CIK) then as now (`read` names the ticker read). Before the first
-  event, the security had no ticker Massive's events name, though its rows can be under one: a security Massive
-  re-identified lists only itself (USO from 2020-04-29, at its reverse split, GLD from 2008-05-22, UUP from 2018-06-04,
-  EWT and SMH from 2016-11-04 and 2016-05-03, each of whose bars go back to its listing and join continuously). So the
-  days before the first event are read under its first ticker, and stand where that ticker's reference the day before
-  names the same company as the current ticker's does now; a ticker another company held then names another CIK, and
-  its rows are left out. A reference of long ago can name no CIK (GLD's before 2008-05-22): then the two are the same
-  listing where they name one composite FIGI, or else one listing date, since a ticker another listing held before
-  names that listing's own (BNY's on 2025-01-02 names a municipal fund's of 2001-07-27, and BNY Mellon's of 1969-12-04
-  today), and no two listings under one ticker listed on one day. An earlier ticker's bars are
-  adjusted for its own splits only, so each is put on today's share basis by the splits executed under the tickers
-  after it, as is an earlier dividend's split-adjusted amount. A ticker Massive gives no events for (not a stock,
+  where they continue its listing (below; `read` names the ticker read). Before the first event, the security had no
+  ticker Massive's events name, though its rows can be under one: a security Massive re-identified lists only itself
+  (USO from 2020-04-29, at its reverse split, GLD from 2008-05-22, UUP from 2018-06-04, EWT and SMH from 2016-11-04
+  and 2016-05-03, each of whose bars go back to its listing and join continuously). So the days before the first event
+  are read under its first ticker; and where that ticker listed nothing before it (HONI, Honeywell's from 2026-06-15
+  to 06-28, through its separation, HON before and after), under the current ticker. Either stands where it continues
+  the current ticker's listing: where the two references, the day before and now, name one company (one CIK) or one
+  listing (one composite FIGI, or one listing date). A company that reorganized under a holding company of its own
+  takes a new CIK and new FIGIs and keeps its listing: Exxon Mobil Corporation (CIK 34088) became ExxonMobil Holdings
+  Corporation (CIK 2115436) on 2026-07-02, listed since 1920-03-25 in both references, its close running on from 136.28
+  to 137.09, one share for one. A reference of long ago can name no CIK (GLD's before 2008-05-22). A ticker another
+  listing held names that listing's own CIK, FIGI and date (BNY's on 2025-01-02 names a municipal fund's of 2001-07-27,
+  and BNY Mellon's of 1969-12-04 today), and no two listings under one ticker listed on one day, so its rows are left
+  out. Rows read under the current ticker are on today's share basis already; an earlier ticker's bars are adjusted
+  for its own splits only, so each is put on today's share basis by the splits executed under the tickers after it, as
+  is an earlier dividend's split-adjusted amount. A ticker Massive gives no events for (not a stock,
   or a 404) is read as itself. Of VTI's 3,423 holdings on 2026-11-09, 76 (0.54% of its weight) changed ticker inside
   two years.
 - Every listing Massive prices is quoted in USD (its reference's `currency_name`). A currency pair's rates come from
@@ -486,15 +490,13 @@ class Massive:
         return (str(found.get("cik") or "").lstrip("0"), str(found.get("composite_figi") or ""),
                 str(found.get("list_date") or ""))
 
-    def _same_company(self, ticker: str, then: str, now: str, *, earlier: str | None = None) -> bool:
-        """Whether the listing under `earlier` (by default `ticker`) on `then` was the company listed under `ticker` on
-        `now`: one CIK in both references; where the earlier names none, one listing, by its composite FIGI or else
-        its listing date."""
+    def _continues(self, ticker: str, then: str, now: str, *, earlier: str | None = None) -> bool:
+        """Whether the rows under `earlier` (by default `ticker`) on `then` continue the listing under `ticker` on `now`:
+        the two references name one company (one CIK) or one listing (one composite FIGI, or one listing date). A
+        reorganization under a holding company changes the CIK and keeps the listing date; another listing's ticker
+        names its own of each (module docstring)."""
         before, after = self._identity(earlier or ticker, then), self._identity(ticker, now)
-        if before[0]:
-            return before[0] == after[0]
-        return bool(before[1]) and before[1] == after[1] if before[1] and after[1] else \
-            bool(before[2]) and before[2] == after[2]
+        return any(b and b == a for b, a in zip(before, after))
 
     def _later_splits(self, tenure: list[dict]) -> list[float]:
         """For each ticker of a tenure, what puts its amounts on today's share basis beyond its own splits: the splits
@@ -522,11 +524,14 @@ class Massive:
             return read(ticker, start, end)
         if tenure[0].get("before"):
             first = tenure.pop(0)
-            if self._same_company(ticker, first["to"], end, earlier=first["ticker"]):
-                if tenure and tenure[0]["ticker"] == first["ticker"]:
+            # Under the first event's ticker, or else under the current ticker: whichever continues the listing.
+            source = next((t for t in dict.fromkeys((first["ticker"], ticker))
+                           if self._continues(ticker, first["to"], end, earlier=t)), None)
+            if source:
+                if tenure and tenure[0]["ticker"] == source:
                     tenure[0]["from"] = first["from"]  # one ticker throughout: its own earlier rows stand
                 else:
-                    tenure.insert(0, {"ticker": first["ticker"], "from": first["from"], "to": first["to"]})
+                    tenure.insert(0, {"ticker": source, "from": first["from"], "to": first["to"]})
             if len(tenure) == 1 and tenure[0]["ticker"] == ticker and tenure[0]["from"] == start:
                 return read(ticker, start, end)
         factors = self._later_splits(tenure)
@@ -535,12 +540,13 @@ class Massive:
             found, asked = read(held["ticker"], held["from"], held["to"])
             urls += asked
             if held["ticker"] != ticker and not (answered(found) and found.get("results")) and \
-                    self._same_company(ticker, held["to"], tenure[-1]["to"]):
+                    self._continues(ticker, held["to"], tenure[-1]["to"]):
                 found, asked = read(ticker, held["from"], held["to"])  # the company's earlier security under it
                 urls += asked
                 held["read"] = ticker
             if held["ticker"] == ticker or body is None:
                 body = {k: v for k, v in found.items() if k != "results"}
+            factor = 1.0 if held.get("read", held["ticker"]) == ticker else factor  # the current ticker's: today's basis
             rows += [adjust(r, factor) if factor != 1.0 else r for r in found.get("results") or [] if isinstance(r, dict)
                      and held["from"] <= (day_of(r) or "") <= held["to"]] if answered(found) else []
         return {**(body or {}), "status": "OK", "ticker": ticker, "tenure": tenure, "results": rows}, urls
@@ -662,6 +668,26 @@ class Massive:
             raise VenueError(f"ETF Global's holdings naming {figi} could not be read: {status}")
         found = next((r.get("isin") for r in body.get("results") or [] if r.get("isin")), None)
         return {"payload": {"status": "OK" if found else "NOT_FOUND", "figi": figi, "isin": found},
+                "request": self._record([url]), "retrieved_at": retrieved, "range": (asof, asof)}
+
+    def ticker_isin(self, ticker: str, asof: str) -> dict:
+        """The ISINs ETF Global gives the rows of the funds' holdings that name a US listing's ticker on a US exchange,
+        in the week of processing to the as-of (https://massive.com/docs/rest/partners/etf-global/constituents:
+        `constituent_ticker` filters it; read live: Trip.com's receipt, TCOM, in rows with no FIGI, each with
+        US89677Q1076, which figi_isin does not find). A ticker names one listing in the US on a date but passes between
+        securities, so what it gives is confirmed where it is used, by OpenFIGI's mapping of the ISIN naming the listing's
+        own FIGI (harness.derive.identity.Lookup.isin_held). NOT_FOUND where no fund ETF Global reads holds it."""
+        retrieved = _now()
+        week = (Date.fromisoformat(asof) - timedelta(days=7)).isoformat()
+        url = self.url("/etf-global/v1/constituents", {"constituent_ticker": ticker, "processed_date.gte": week,
+                                                         "processed_date.lte": asof, "limit": 100,
+                                                         "fields": "isin,country_of_exchange"})
+        status, body = self.get(url)
+        if status != 200:
+            raise VenueError(f"ETF Global's holdings naming {ticker} could not be read: {status}")
+        found = sorted({r["isin"] for r in body.get("results") or [] if r.get("isin")
+                        and (r.get("country_of_exchange") or "US") == "US"})
+        return {"payload": {"status": "OK" if found else "NOT_FOUND", "ticker": ticker, "isins": found},
                 "request": self._record([url]), "retrieved_at": retrieved, "range": (asof, asof)}
 
     def isin_listings(self, isins: list[str], asof: str) -> dict[str, dict]:
@@ -919,6 +945,7 @@ class Massive:
             "holdings_history": _parsed(lambda subject, covering: self.holdings_history(subject, *covering), HISTORY),
             "holdings_processed": lambda subject, covering: self.processed(covering[1]),
             "figi_isin": lambda subject, covering: self.figi_isin(subject, covering[1]),
+            "ticker_isin": lambda subject, covering: self.ticker_isin(subject, covering[1]),
             "isin_listings": self._isin_listings_fetcher(),
             "snapshot": lambda subject, covering: self.snapshot(subject, covering[1]),
             "news": lambda subject, covering: self.news(subject, covering[0], covering[1]),

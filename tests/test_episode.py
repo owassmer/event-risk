@@ -87,6 +87,10 @@ def test_a_window_a_proxy_has_no_prices_for_is_refused_and_the_event_names_its_e
                                          rf"over it, and \w+ has no close on or before {early}: its prices begin"):
         w.store.edit(e, "episode", {"value": {"start": early, "end": SESSIONS[5]}, "note": "a window before them"})
     assert "episode" not in w.store.stated_of(e)
+    asof = w.store.meta("asof")  # a window that ends after the as-of is refused by its dates, as every window is
+    with pytest.raises(StoreError, match=rf"^{e}.episode: a past window ends on or before the as-of, {asof}, and this "
+                                         rf"one ends 2099-01-02$"):
+        w.store.edit(e, "episode", {"value": {"start": SESSIONS[-5], "end": "2099-01-02"}, "note": "one to come"})
     w.store.edit(e, "episode", {"value": {"start": SESSIONS[-75], "end": SESSIONS[-25]}, "note": "the window"})
     now = event_now(w.store, e)
     [filled] = [f for f in now["factors"] if f["factor"] == oil]
@@ -94,3 +98,17 @@ def test_a_window_a_proxy_has_no_prices_for_is_refused_and_the_event_names_its_e
     assert filled["worlds"]["yes"]["by"] == "moves with the stated ones" and episode["on"] == e
     assert episode["window"] == [SESSIONS[-75], SESSIONS[-25]] and episode["sessions"] == 50
     assert "no" not in filled["worlds"]  # the baseline sets no factor and moves nothing: no episode, and no entry
+
+
+def test_an_episodes_window_starts_before_its_end(tmp_path):
+    """ONTOLOGY.md 2.1: an episode is a past window, two dates with its start before its end. One whose start is after its
+    end, or a window of no length, is refused in the words every past window's dates take, and nothing is written."""
+    from harness.store import StoreError
+    from test_impact import world, event
+    w = world(tmp_path, g={"SPY": 5000})
+    e = event(w, p=0.3)
+    for start, end in (("2026-03-02", "2026-02-02"), ("2026-03-02", "2026-03-02")):
+        with pytest.raises(StoreError) as got:
+            w.store.edit(e, "episode", {"value": {"start": start, "end": end}, "note": "A past window."})
+        assert str(got.value).endswith(f": a window starts before its end, and this one starts {start} and ends {end}")
+        assert "episode" not in w.store.stated_of(e)

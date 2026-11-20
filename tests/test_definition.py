@@ -66,5 +66,5 @@ def test_the_tool_returns_its_structure_as_a_change_of_its_chances_does(w):
         "title": "Traffic recovers by March", "text": "Traffic recovers by March 31, 2027.", "comparison": "occurs",
         "window_end": "2027-03-31", "kind": "hitting"}})
     assert ok, out
-    assert out["stated"]["title"] == "Traffic recovers by March"
+    assert "stated" not in out and w.store.stated_of(p)["title"] == "Traffic recovers by March"
     assert out["propositions"][p]["probability"] == pytest.approx(0.4)

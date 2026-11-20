@@ -6,6 +6,8 @@ docstring."""
 
 from __future__ import annotations
 
+import csv
+import io
 import math
 
 import numpy as np
@@ -13,10 +15,10 @@ import pytest
 
 from harness.derive import worlds
 from harness.ledger import check, event_now, row
-from harness.render import ledger_markdown
+from harness.render import ledger_csv
 from harness.store import StoreError
 from test_impact import channel, event, holding_world, output, world
-from breakdown import stated
+from breakdown import named, stated
 
 
 
@@ -73,7 +75,13 @@ def test_the_ways_illustration_through_the_store(tmp_path):
         ("yes", "Yes", False), (first, "the first way", True), (second, "the second way", True), ("no", "No", True)]
     assert by_id(tree)["yes"]["A"] == pytest.approx(r["yes"]) and by_id(tree)["yes"]["ways"] == [first, second]
     assert by_id(tree)["no"]["baseline"] and by_id(tree)[first]["parent"] == "yes"
-    assert "Worst outcome \u2212$17,653 \u00b7 the second way" in ledger_markdown(w.store)  # the download
+    sheet = list(csv.DictReader(io.StringIO(ledger_csv(w.store).removeprefix("\ufeff"))))  # the download
+    assert len(sheet) == 1 and {k: v for k, v in sheet[0].items() if k not in ("Event", "Known by")} == {
+        "Forecast (%)": "30.0", "Lower bound (%)": "", "Upper bound (%)": "", "Market bid (\u00a2)": "",
+        "Market ask (\u00a2)": "", "If Yes ($)": "-6845", "If Yes (% of portfolio)": "-6.78", "If No ($)": "2934",
+        "Full impact ($)": "-9779", "Volatility ($)": "5924", "Worst outcome ($)": "-17653",
+        "Worst outcome": "the second way", "Worst outcome probability (%)": "9.0", "Expected value ($)": "0",
+        "GSPY if Yes ($)": "-6845"}  # as the page shows them: Yes of the whole portfolio, a volatility under $5,924.50
 
 
 def test_a_weight_stated_on_a_way_stands_and_the_worlds_with_none_share_what_it_leaves(tmp_path):
@@ -99,7 +107,11 @@ def test_a_weight_stated_on_a_way_stands_and_the_worlds_with_none_share_what_it_
     assert r["priced_in"] == {second: {"q": 0.15, "stated": True}}
     w.store.edit(e, "priced_in", stated(0.10))  # the event's 0.10 under its second way's 0.15 cannot hold
     assert row(w.store, e)["full_impact"] is None and "come to 0.15" in event_now(w.store, e)["why"]
-    assert [x["id"] for x in check(w.store)["weights_cannot_hold"]] == [e]
+    [listed] = check(w.store)["weights_cannot_hold"]
+    assert listed["id"] == e and "come to 0.15" in listed["why"]
+    # each stated weight is read as it stands, whether or not they hold together
+    held = {"yes": {"q": 0.10, "stated": True}, second: {"q": 0.15, "stated": True}}
+    assert row(w.store, e)["priced_in"] == listed["priced_in"] == held
 
 
 def test_nested_ways_on_the_baseline_side_with_the_baseline_a_way(tmp_path):
@@ -275,7 +287,7 @@ def test_shares_that_cannot_make_up_their_parent_are_listed_and_leave_no_figures
     assert row(w.store, e)["full_impact"] is None and w.derived(a, "probability") is None
     assert "cannot hold together" in event_now(w.store, e)["why"]
     (listed,) = check(w.store)["cannot_hold"]
-    assert {f"{a}.chances[0]", f"{b}.chances[0]"} <= set(listed["statements"])
+    assert {a, b} <= {x[0] for x in named(listed["statements"]) if isinstance(x, tuple)}
     w.store.edit(b, "chances", None)
     c = way(w, e, "a third way", side="yes")
     why = event_now(w.store, e)["why"]
@@ -394,12 +406,12 @@ def test_a_way_or_a_ways_shock_returns_its_event_as_it_now_stands(tmp_path):
         {"yes": 0.3, first: 0.21, second: 0.09, "no": 0.7})
     ok, got = tools.call("link", {"from_id": first, "relation": "consequence", "to_id": channel(w, "SPY"), "fields": {"shock": stated(-0.05)}})
     assert ok and got["events"][0]["id"] == e and got["events"][0]["row"]["full_impact"] is not None
-    assert {o["id"] for o in got["events"][0]["outcomes"] if o["world"]} == {first, second, "no"}
+    assert {o["id"] for o in tools.call("get", {"id": e})[1]["outcomes"] if o["world"]} == {first, second, "no"}
     # a share restated once a shock stands moves every figure, and returns them (TOOLS.md 5): evaluation's case
     before = got["events"][0]["row"]["full_impact"]
     ok, got = tools.call("edit", {"id": first, "field": "chances", "value": [stated({"given": [e], "value": 0.4})]})
-    assert ok and [x["id"] for x in got["events"]] == [e] and got["events"][0]["holdings"]
-    assert {o["id"]: o["p"] for o in got["events"][0]["outcomes"]}[first] == pytest.approx(0.12)
+    assert ok and [x["id"] for x in got["events"]] == [e]
+    assert {o["id"]: o["p"] for o in tools.call("get", {"id": e})[1]["outcomes"]}[first] == pytest.approx(0.12)
     assert got["events"][0]["row"]["full_impact"] != pytest.approx(before)
     # the watched event's own statement gives its row once, in the event, and not among its derived fields
     ok, got = tools.call("edit", {"id": e, "field": "title", "value": "E, renamed"})
@@ -459,3 +471,29 @@ def test_a_fund_stated_against_both_references_measures_its_residual_from_where_
     assert (1 + both["whole"]["name:FUND"][second]) == pytest.approx((1 + unstated) * 0.95)
     nvda_through = w.store.engine.value("impact", e).output["d"]["name:FUND"][second]
     assert nvda_through == pytest.approx(0.0, abs=1e-9)  # at 0 its residual is 0: NVDA's move is in where it stands
+
+
+def test_each_holding_name_and_remainder_is_given_at_a_way_with_ways_of_its_own_and_they_add_to_its_pl(tmp_path):
+    """MATH.md 1.1, 1.7: a way with ways of its own has the P&L of its worlds averaged at their probabilities. Each
+    holding's, each name's and each fund's remainder's share is given there by the same average (`outcomes`), so the
+    holdings add to the way's P&L, and in each fund its names and its remainder add to the fund's."""
+    w = holding_world(tmp_path)
+    e = event(w, p=0.4)
+    first = way(w, e, "first", side="yes", weight=0.6)
+    way(w, e, "second", side="yes")
+    a, b = way(w, first, "a", weight=0.3), way(w, first, "b")
+    w.link(e, "consequence", channel(w, "SPY"), shock=-0.1)
+    w.link(a, "consequence", "name:NVDA", shock=-0.2)
+    out = output(w, e)
+    tree = by_id(out["outcomes"])
+    p = {x: tree[x]["p"] for x in (a, b)}
+    held = out["by_holding"]
+    for h in held:
+        assert set(h["outcomes"]) == {first}  # the sides are `yes` and `no`, and no other way has ways
+        for share in (h, *h["names"], *h["remainders"]):
+            v = share["worlds"]
+            assert share["outcomes"][first] == pytest.approx((p[a] * v[a] + p[b] * v[b]) / (p[a] + p[b]), rel=1e-12)
+        if h["names"]:
+            assert sum(x["outcomes"][first] for x in (*h["names"], *h["remainders"])) == \
+                pytest.approx(h["outcomes"][first], rel=1e-9)
+    assert sum(h["outcomes"][first] for h in held) == pytest.approx(tree[first]["A"], rel=1e-9)

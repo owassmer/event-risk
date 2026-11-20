@@ -90,6 +90,33 @@ def test_the_company_on_its_own_is_carried_from_its_close_on_the_date(tmp_path):
     assert anchor["carried"] == pytest.approx(anchor["observed_price"] * math.exp(moved))
 
 
+def test_a_company_on_its_own_from_its_first_close_has_its_row_and_its_draws_say_what_they_need(tmp_path):
+    """MATH.md 1.6, 1.8: the company on its own carried from its first close has no history before it, so its betas
+    then are a share's prior and its row stands; what its draws vary it by is its residual's history to that date,
+    of which it has none, and its distribution says so. The row stood absent for the draws' need."""
+    from massive_data import SESSIONS
+    w = world(tmp_path)
+    first = SESSIONS[-60]
+    put_reference(w.store, "DEAL", "CS")
+    prices = closes_from(random_returns(np.random.default_rng(9), .01))
+    put_bars(w.store, "DEAL", {d: c * 27.95 / prices[max(prices)] for d, c in prices.items() if d >= first})
+    w.store.link("portfolio", "holds", schema.name_id("DEAL"), {"dollars": 2795})
+    e = event(w, p=.30)
+    worth(w, e, "name:DEAL", "yes", {"amount": 35})
+    from harness.derive import series
+    for row in list(w.store._all("SELECT * FROM data WHERE kind IN ('bars', 'dividends')")):  # the history to the date
+        w.store.put_data(row["kind"], row["subject"], w.store.data_payload(row["id"]), {"url": "test:history"},
+                         retrieved_at="2026-11-05T02:00:00+00:00", range=(series.lookback(first), "2026-11-04"))
+    worth(w, e, "name:DEAL", "no", {"date": first, "return": 0.0})
+    found = output(w, e)
+    anchor = found["valuation_terms"]["worth"]["name:DEAL"]["no"]["anchor"]
+    assert anchor["state_covariance"] is None and anchor["betas"] == pytest.approx({channel(w, "SPY"): 1.0})
+    assert found["no"] is not None
+    drawn = w.store.engine.value("distribution", e)
+    assert drawn.output is None
+    assert drawn.cause == "the company on its own needs at least two observed sessions to carry its uncertainty"
+
+
 def test_received_shares_use_the_acquirers_world_price_without_placing_cash(tmp_path):
     w = world(tmp_path)
     holding(w, "DEAL", 30, 3000)
@@ -191,18 +218,6 @@ def test_historical_sleeve_subtraction_preserves_short_expiry_and_trading_flows(
     assert got[0] == pytest.approx((0, 1, .06 / .9))
 
 
-def test_expired_option_cash_uses_its_expiry_state_once():
-    contract = {"kind": "call", "style": "european", "strike": 100, "expiry": "2027-01-01", "rate": 0,
-                "yield": 0, "volatility": .2, "underlying_today": 100, "units_per_nav": .01,
-                "reference": {"ticker": "CO", "name": "name:CO"}}
-    m = {"lookthrough": "looked", "fund_rows": "rows", "betas": "betas", "channels": [], "holds": {"h": "name:FUND"}, "values": {"h": 100}}
-    centre = {"valuation_terms": {"options": {"name:FUND": {"full": True, "sleeve_today": .1,
-        "contracts": [contract], "asof": "2026-11-01", "shares": []}}}}
-    state = valuation.value_state(m, lambda _: {}, centre, "yes", {}, {"name:CO": np.array([2., .5])}, {}, "2027-05-01",
-        expiry_states={"2027-01-01": {"factors": {}, "names": {"name:CO": np.array([1.2, .8])}}})
-    assert state["h"] == pytest.approx([110, 90])
-
-
 def test_unaffected_company_handles_a_factor_at_zero_without_inventing_a_log_price():
     assert valuation.raw_response({"factor": 0}, {"factor": -1}) == 1
     assert valuation.raw_response({"factor": .25}, {"factor": -1}) == .75
@@ -244,19 +259,6 @@ def test_zero_consideration_removes_the_company_draw_through_a_fund():
     got = valuation.value_state(m, lambda _: looked, centre, "yes", {},
         {"name:FUND": np.array([.8, 1.2]), "name:CO": np.zeros(2), "response:name:CO": np.array([.8, 1.2])}, {}, "2027-01-01")
     assert got["h"] == pytest.approx([0, 0])
-
-
-def test_an_expired_option_uses_the_targets_same_cash_consideration():
-    contract = {"kind": "call", "style": "european", "strike": 100, "expiry": "2027-01-01", "rate": 0,
-                "yield": 0, "volatility": .2, "underlying_today": 100, "units_per_nav": .01,
-                "reference": {"ticker": "CO", "name": "name:CO"}}
-    m = {"lookthrough": "looked", "fund_rows": "rows", "channels": [], "holds": {"h": "name:FUND"}, "values": {"h": 100}}
-    centre = {"valuation_terms": {"options": {"name:FUND": {"full": True, "sleeve_today": .1,
-        "contracts": [contract], "asof": "2026-11-01", "shares": []}},
-        "worth": {"name:CO": {"yes": {"fixed": 120, "c": 100}}}}}
-    got = valuation.value_state(m, lambda _: {}, centre, "yes", {}, {"name:CO": np.array([2., .5])}, {}, "2027-05-01",
-        expiry_states={"2027-01-01": {"factors": {}, "names": {"name:CO": np.array([.7, 1.5])}}})
-    assert got["h"] == pytest.approx([110, 110])
 
 
 def test_multiple_reference_basket_keeps_unrelated_equity_outside_the_index(tmp_path):
@@ -310,3 +312,60 @@ def test_a_fund_its_contracts_value_stated_whole_is_valued_from_its_terms_and_wa
     assert "yield_curve" in asked  # its terms read
     assert got is None  # its row waits on what its terms read, and no world stands at its betas meanwhile
     store.close()
+
+
+def test_each_side_of_the_implied_weight_is_its_values_at_their_shares(tmp_path):
+    """The weight a holding's price implies, (c - N) / (Y - N) (MATH.md 1.6), reads each side's mean of its stated values,
+    each world at its share of the weight today's prices carry on its side: with Yes's two ways at 0.6 and 0.4 of it, Y is
+    0.6 x 45 + 0.4 x 40 = 43, and N the No side's 20, so a price of 30 implies 10 / 23. The worth link's Computation
+    gives each side with its shares and what they are by. Where today's prices carry no weight on a side, its shares are its worlds'
+    probabilities; and where a side has one world and neither, that world."""
+    w = world(tmp_path)
+    holding(w, "DEAL", 30, 3000)
+    e = event(w, p=.3)
+    first, second = w.prop("First"), w.prop("Second")
+    w.link(e, "way", first, side="yes")
+    w.chances(first, {"given": [e], "value": .6})
+    w.link(e, "way", second, side="yes")
+    lid = worth(w, e, "name:DEAL", "yes", {"amount": 40})
+    worth(w, e, "name:DEAL", "no", {"amount": 20})
+    w.store.link(first, "worth", "name:DEAL", {"value": {"value": {"amount": 45}, "note": "first terms"}})
+    found = w.store.engine.value("worth", lid).output
+    assert found["sides"]["yes"] == {"mean": pytest.approx(43.0), "shares": pytest.approx({first: .6, second: .4}),
+                                     "by": "weight"}
+    assert found["sides"]["no"] == {"mean": pytest.approx(20.0), "shares": {"no": 1.0}, "by": "weight"}
+    assert found["implied"] == pytest.approx(10 / 23)
+    ws = [{"id": "a", "side": "yes", "p": .2}, {"id": "b", "side": "yes", "p": .1}, {"id": "no", "side": "no", "p": .7}]
+    sides = valuation.value_sides({"a": 50.0, "b": 20.0, "no": 10.0}, ws, {"a": 0.0, "b": 0.0, "no": 1.0})
+    assert sides["yes"] == {"mean": pytest.approx(40.0), "shares": pytest.approx({"a": 2 / 3, "b": 1 / 3}),
+                            "by": "probability"}
+    one = valuation.value_sides({"y": 5.0, "no": 1.0}, [{"id": "y", "side": "yes", "p": 0.0},
+                                                         {"id": "no", "side": "no", "p": 1.0}], {"y": 0.0, "no": 1.0})
+    assert one["yes"] == {"mean": 5.0, "shares": {"y": 1.0}, "by": "one world"}
+
+
+def test_a_held_contracts_close_is_its_new_york_date_on_any_machine(tmp_path, monkeypatch):
+    """A market's close is the New York date its venue's client gives (MATH.md 3.3), the date a held contract's cash is
+    discounted to and the one that says whether it pays within the horizon. It is that date whatever zone the machine
+    reading it is set to: the fixture's market closes at 03:59 UTC on Apr 1, Mar 31 in New York, and a machine set to
+    UTC reads the same date and the same discount as one set to New York."""
+    import time
+    from harness.venues.markets import ny_date
+    got = {}
+    for zone in ("America/New_York", "UTC"):
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+        try:
+            w = world(tmp_path / zone.replace("/", "-"))
+            government_curve(w)
+            e = event(w, p=.3)
+            mid = w.market("contract", "Will E occur?", .3, .4)
+            w.link(e, "asks", mid)
+            yes = w.store.link("portfolio", "holds", mid, {"side": "yes", "quantity": 100})["id"]
+            (terms,) = [t for t in output(w, e)["valuation_terms"]["contracts"] if t["holding"] == yes]
+            got[zone] = (terms["close"], terms["discount"])
+            assert ny_date("2027-03-31") == "2027-03-31" and ny_date("2027-03-31T12:00:00") is None
+        finally:
+            monkeypatch.undo()
+            time.tzset()
+    assert got["UTC"] == got["America/New_York"] and got["UTC"][0][:10] == "2027-03-31"

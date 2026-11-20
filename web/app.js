@@ -26,6 +26,10 @@ const S = {
   rank: "volatility",    // the ledger's order: by volatility, or worst outcome first
   rows: "moves",         // the assumptions grid's lower rows: each price's move, or each price's level there
   tab: "outcomes",       // an opened event's view: its outcomes, its probability, or its assumptions
+  payoff: "now",         // payoff card mode: each outcome's P&L today ("now") or the distribution on the event's date ("dated")
+  stage: "portfolio",    // active main workspace tab: the portfolio until the first event, then "events" once
+  stagePicked: false,    // whether the member explicitly chose a workspace tab
+  chatClosed: false,     // whether the right analyst rail is collapsed on wide screens
   weightBy: "company",   // which list of where the portfolio's weight is the portfolio panel shows
   outcome: null,         // the outcome selected, {event, id}: marked in the picture, each grid and the history
   stick: true,           // whether the conversation follows its newest line: it does while it is at its end
@@ -37,18 +41,33 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 
+// A request that did not give the page what it asked for: no answer came, so the server is out of reach, or the server
+// answered with a refusal or a failure, in its own words. Anything else thrown while the page works is its own script's
+// error, and is left to the browser, which reports it with its file and line.
+class RequestError extends Error {}
+const UNREACHABLE = "The page can't reach its server.";
+
+async function request(path, init) {
+  let r;
+  try {
+    r = await fetch(path, init);
+  } catch {  // no answer came
+    throw new RequestError(UNREACHABLE);
+  }
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    throw new RequestError(j.error || r.statusText || `${path} answered ${r.status}`);
+  }
+  return r;
+}
+
 async function api(path) {
-  const r = await fetch(path, { cache: "no-store" });
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error || r.statusText);
-  return j;
+  return (await request(path, { cache: "no-store" })).json();
 }
 
 async function post(path, body = {}) {
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || r.statusText);
-  return j;
+  const r = await request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return r.json().catch(() => ({}));
 }
 
 function notice(text) {
@@ -74,25 +93,50 @@ function toBottom(force) {
 
 // ---------------------------------------------------------------- markdown, our own
 
+// a link relative to the page a text was read from (md's `base`), as an address of its own; none where there is no page
+let mdBase = null;
+function absolute(href) {
+  if (!mdBase) return null;
+  try {
+    const u = new URL(href.replace(/&amp;/g, "&"), mdBase);
+    return /^https?:$/.test(u.protocol) ? u.href : null;
+  } catch { return null; }
+}
+
 function inline(text) {
-  const codes = [];
+  const codes = [], lit = [];
   let s = text.replace(/`([^`]+)`/g, (_, c) => `\u0000${codes.push(c) - 1}\u0000`);
+  s = s.replace(/\\([!-\/:-@\[-`{-~])/g, (_, c) => `\u0001${lit.push(c) - 1}\u0001`);  // a character markdown escapes
+  // a picture: a page's text keeps its words and not its pictures, as its passages are read (store.words)
+  s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, "").replace(/\[\s*\]\([^)]*\)/g, "");
   s = esc(s);
-  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // a link's words can hold brackets of their own, as a page's footnote does: [[24]](#ref-24)
+  s = s.replace(/\[((?:[^\[\]]|\[[^\]]*\])+)\]\((https?:\/\/[^\s)]+)(?:\s+&quot;[^&]*&quot;)?\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s = s.replace(/\[((?:[^\[\]]|\[[^\]]*\])+)\]\(([^\s)]+)(?:\s+&quot;[^&]*&quot;)?\)/g, (_, t, href) => {
+    const u = absolute(href);
+    return u ? `<a href="${esc(u)}" target="_blank" rel="noopener">${t}</a>` : t;
+  });
   // a signed figure stays whole: a line never breaks between its sign and its number
   s = s.replace(/(^|[\s(\[\/*_])([−+\-±~≈]\s?[$€£]?\d[\d,]*(?:\.\d+)?(?:\s?(?:%|pp|bp|k|m|bn|x|×)(?![\w]))?)/g, '$1<span class="nw">$2</span>');
   s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>").replace(/__([^_]+?)__/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*\w])\*(?!\s)([^*]+?)\*(?!\w)/g, "$1<em>$2</em>").replace(/(^|[^_\w])_(?!\s)([^_]+?)_(?!\w)/g, "$1<em>$2</em>");
   s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  s = s.replace(/\u0001(\d+)\u0001/g, (_, i) => esc(lit[+i]));
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${esc(codes[+i])}</code>`);
 }
 
 const LIST = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
 // a figure, alone or as a range, with its sign, currency, and unit: "−$40.4k", "20%", "≥ 15%", "4.0%–32%"
 const FIG = "[~≈±+\\-−≥≤<>]?\\s?[$€£]?\\d[\\d,]*(?:\\.\\d+)?\\s?(?:%|pp|bp|k|m|bn|x|×)?";
-const FIGURE = new RegExp(`^${FIG}(?:\\s?[–—-]\\s?${FIG})?(?:\\s?\\(${FIG}\\))?$`, "i");
+// a figure may carry one word before it, as "about −$35" does, and still read in a column of figures
+const FIGURE = new RegExp(`^(?:[a-z]+\\s)?${FIG}(?:\\s?[–—-]\\s?${FIG})?(?:\\s?\\(${FIG}\\))?$`, "i");
 
-function md(src) {
+function md(src, base) {
+  if (base !== undefined) {
+    const before = mdBase;
+    mdBase = base || null;
+    try { return md(src); } finally { mdBase = before; }
+  }
   const lines = src.replace(/\r\n?/g, "\n").split("\n");
   const out = [];
   let i = 0;
@@ -193,10 +237,46 @@ function list(lines, i, indent) {
   return [`<${tag}${ordered && start !== 1 ? ` start="${start}"` : ""}>${items.map((it) => `<li>${body(it)}${it.nested}</li>`).join("")}</${tag}>`, i];
 }
 
+// Where a passage quoted from a page begins and ends in its text, as the page's renderer finds it (render._page_text):
+// U+E000 and U+E001 around a passage quoted, U+E002 and U+E003 around the one opened. Each stretch of text between
+// them is marked, across whatever the markdown made of it, and the characters themselves go.
+const QUOTE_MARK = /[\uE000-\uE003]/;
+function markQuoted(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const texts = [];
+  while (walker.nextNode()) texts.push(walker.currentNode);
+  let quoted = 0, here = 0;
+  for (const node of texts) {
+    const s = node.nodeValue;
+    if (!quoted && !here && !QUOTE_MARK.test(s)) continue;
+    const frag = document.createDocumentFragment();
+    let run = "";
+    const flush = () => {
+      if (!run) return;
+      if (quoted || here) {
+        const m = document.createElement("mark");
+        if (here) m.className = "here";
+        m.textContent = run;
+        frag.append(m);
+      } else frag.append(run);
+      run = "";
+    };
+    for (const ch of s) {
+      if (ch === "\uE000") { flush(); quoted++; }
+      else if (ch === "\uE001") { flush(); quoted = Math.max(0, quoted - 1); }
+      else if (ch === "\uE002") { flush(); here++; }
+      else if (ch === "\uE003") { flush(); here = Math.max(0, here - 1); }
+      else run += ch;
+    }
+    flush();
+    node.replaceWith(frag);
+  }
+}
+
 // ---------------------------------------------------------------- ids in the analyst's words, as chips
 
 const TICKER = "[A-Z0-9][A-Z0-9.&\\-]*(?::[A-Z0-9.\\-]+)?";  // as harness/schema.py's TICKER: "M&M.NS" is a symbol
-const ID = `(?:prop:\\d+|factor:\\d+|src:\\d+|note:\\d+|link:\\d+|cmp:\\d+|market:(?:polymarket_us|polymarket|kalshi):[A-Za-z0-9_.#\\-]+|metric:price:${TICKER}|metric:[a-z][a-z0-9_]*|name:${TICKER}|cash:[A-Z]{3})`;  // cash:{CURRENCY}, as schema.CASH_ID_RE
+const ID = `(?:prop:\\d+|factor:\\d+|src:\\d+|note:\\d+|link:\\d+|cmp:\\d+|market:(?:polymarket_us|polymarket|kalshi):[A-Za-z0-9_.#\\-]+|metric:price:${TICKER}|metric:[a-z][a-z0-9_]*|name:${TICKER}|cash:[A-Z]{3}|industry:[a-z0-9]+(?:-[a-z0-9]+)*|country:[A-Z]{2})`;  // cash:{CURRENCY}, as schema.CASH_ID_RE; a group by its id (derive/owned.py)
 const ID_IN_TEXT = new RegExp(`(?<![\\w:/])${ID}`, "g");
 const ID_WHOLE = new RegExp(`^${ID}$`);
 const trimId = (s) => s.replace(/[.\-:]+$/, "");
@@ -223,9 +303,10 @@ function fillChip(a) {
 
 // `typing`: the text is still arriving, so an id at its very end may be part of a longer one, and waits
 function decorate(root, typing = false) {
-  for (const el of $$("[data-md]", root)) {  // a note: its markdown, rendered as a reply's is
+  for (const el of $$("[data-md]", root)) {  // a note, or a page's text: its markdown, rendered as a reply's is
     if (el._md === el.dataset.md) continue;
-    el.innerHTML = md(el.dataset.md);
+    el.innerHTML = md(el.dataset.md, el.dataset.base);
+    if (QUOTE_MARK.test(el.dataset.md)) markQuoted(el);
     el._md = el.dataset.md;
   }
   for (const code of $$("code", root)) {
@@ -234,7 +315,8 @@ function decorate(root, typing = false) {
     if (ID_WHOLE.test(t)) code.replaceWith(chipEl(t));
   }
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode: (n) => n.parentElement.closest("pre, code, a, .chip, .id") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+    // a page's own words are the page's: an id in them is no object of the conversation's
+    acceptNode: (n) => n.parentElement.closest("pre, code, a, .chip, .id, .page") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
   });
   const texts = [];
   while (walker.nextNode()) texts.push(walker.currentNode);
@@ -279,17 +361,19 @@ async function fetchChips(refresh) {
     .filter((id) => refresh || (!S.chips.has(id) && !chipAsked.has(id)));
   if (!ids.length) return;
   for (const id of ids) chipAsked.add(id);
+  let got;
   try {
-    const got = await api(`/api/chips?ids=${encodeURIComponent(ids.join(","))}`);
-    for (const [id, c] of Object.entries(got)) S.chips.set(id, c);
-    for (const a of $$("[data-chip]")) if (got[a.dataset.chip]) fillChip(a);
+    got = await api(`/api/chips?ids=${encodeURIComponent(ids.join(","))}`);
   } catch (e) {
+    if (!(e instanceof RequestError)) throw e;
     for (const id of ids) chipAsked.delete(id);  // the chip keeps its id, and is asked for again, a little later each time
     chipRetry = Math.min(chipRetry ? chipRetry * 2 : 1000, 30000);
     setTimeout(() => fetchChips(refresh), chipRetry);
     return;
   }
   chipRetry = 0;
+  for (const [id, c] of Object.entries(got)) S.chips.set(id, c);
+  for (const a of $$("[data-chip]")) if (got[a.dataset.chip]) fillChip(a);
 }
 
 // ---------------------------------------------------------------- the work line
@@ -382,8 +466,8 @@ function stageText(p) {
   }
   if (p.stage === "prices") return `Loading two years of ${p.kind === "dividends" ? "dividends" : "prices"}, ${p.done} of ${p.of}`;
   if (p.stage === "exposures") return "Fitting the holdings' betas";
-  if (p.stage === "distribution") return "Valuing outcomes at the horizon";
-  if (p.stage === "news") return "Reading the news on the largest holdings";
+  if (p.stage === "distribution") return "Working out each event's outcomes";  // on each event's own date (MATH.md 1.8)
+  if (p.stage === "reports") return "Reading the reports of the largest holdings";  // MATH.md 3.1, a company's reports
   return null;
 }
 
@@ -482,12 +566,17 @@ async function showCall(d) {
   const io = $(".io", d);
   let input = entry.input, result = entry.preview, error = false;
   if (entry.call) {
+    let got = null;
     try {
-      const got = await api(`/api/call?n=${entry.call}`);
+      got = await api(`/api/call?n=${entry.call}`);
+    } catch (e) {
+      if (!(e instanceof RequestError)) throw e;  // the preview stands
+    }
+    if (got) {
       input = got.input;
       result = got.result !== undefined && got.result !== null ? got.result : got.error;
       error = got.result === undefined || got.result === null;
-    } catch { /* the preview stands */ }
+    }
   }
   const show = (v) => esc(typeof v === "string" ? v : JSON.stringify(v, null, 2));
   io.innerHTML = `<div class="label">Input</div><pre>${show(input)}</pre>` +
@@ -503,7 +592,7 @@ function turnEl(turn) {
   el.dataset.session = turn.session;
   el._turn = turn;
   const files = (turn.files || []).map((f) =>
-    `<a class="file" href="/api/file?path=${encodeURIComponent(f.path)}" target="_blank" rel="noopener">${FILE_ICON}${esc(f.name)}</a>`).join("");
+    `<a class="file" href="/api/file?path=${encodeURIComponent(f.path)}" target="_blank" rel="noopener"${PDF.test(f.name) ? " data-view" : ""}>${FILE_ICON}${esc(f.name)}</a>`).join("");
   el.innerHTML = `<div class="you"><div class="bubble">${files ? `<div class="files">${files}</div>` : ""}<span class="said"></span></div>
     <div class="actions"><button class="linkish" data-act="edit" type="button" title="${EDIT_SAYS}">Edit</button></div></div><div class="reply"></div>
     <div class="actions after"><button class="linkish" data-act="retry" type="button" title="${RETRY_SAYS}">${RETRY_ICON}Retry</button></div>`;
@@ -516,9 +605,39 @@ function turnEl(turn) {
   return el;
 }
 
+// A PDF the member sent opens in a viewer over the whole page, where the browser shows PDFs itself; any other file,
+// and a PDF where the browser has no viewer of its own, opens by its link.
+const PDF = /\.pdf$/i;
+let viewer = null;
+
+function openViewer(href, name) {
+  if (!viewer) {
+    viewer = document.createElement("dialog");
+    viewer.id = "viewer";
+    viewer.innerHTML = `<header><span class="v-name"></span><button type="button" class="icon v-close" title="Close" aria-label="Close">` +
+      `<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15"/></svg></button></header><iframe></iframe>`;
+    viewer.addEventListener("click", (ev) => { if (ev.target === viewer || ev.target.closest(".v-close")) viewer.close(); });
+    viewer.addEventListener("close", () => { $("iframe", viewer).src = "about:blank"; });
+    document.body.append(viewer);
+  }
+  $(".v-name", viewer).textContent = name;
+  const frame = $("iframe", viewer);
+  frame.title = name;
+  frame.src = href + "#toolbar=0&navpanes=0&view=FitH";
+  viewer.showModal();
+  $(".v-close", viewer).focus();
+}
+
+$("#conversation").addEventListener("click", (ev) => {
+  const a = ev.target.closest("a.file[data-view]");
+  if (!a || navigator.pdfViewerEnabled === false || ev.metaKey || ev.ctrlKey || ev.shiftKey) return;
+  ev.preventDefault();
+  openViewer(a.getAttribute("href"), a.textContent);
+});
+
 // what Edit and Retry do, said where they are offered
-const EDIT_SAYS = "Change this message and send it again: the conversation and the ledger go back to before it";
-const RETRY_SAYS = "Send this message again: the conversation and the ledger go back to before it";
+const EDIT_SAYS = "Edit and resend this message. The conversation and ledger restart from this point.";
+const RETRY_SAYS = "Resend this message. The conversation and ledger restart from this point.";
 const FILE_ICON = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11.5 3H6a1.5 1.5 0 0 0-1.5 1.5v11A1.5 1.5 0 0 0 6 17h8a1.5 1.5 0 0 0 1.5-1.5V7z"/><path d="M11.5 3v4h4"/></svg>';
 const RETRY_ICON = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 10a5.5 5.5 0 1 1-1.6-3.9"/><path d="M15.5 4v3h-3"/></svg>';
 
@@ -804,7 +923,7 @@ $("#conversation").addEventListener("click", async (ev) => {
 const input = $("#input");
 
 function placeholder() {
-  input.placeholder = !S.state.can_reply ? "" : S.turns.length ? "Message the analyst" : "Paste holdings, or attach a statement";
+  input.placeholder = !S.state.can_reply ? "" : S.turns.length ? "Message the analyst" : "Paste holdings or attach a statement";
 }
 
 function grow() {
@@ -959,6 +1078,8 @@ function applyState(st) {
   if (st.error) notice(st.error);
   if (!st.busy && S.live) finishLive(S.live);
   $("#app").classList.toggle("empty", !S.turns.length && !st.busy && !st.waiting.length && !st.store);
+  syncTopbar();
+  layout();
 }
 
 // ---------------------------------------------------------------- charts: one small line chart, drawn from its points
@@ -997,6 +1118,15 @@ function chartRanges(points) {
 }
 
 function drawCharts(root) {
+  for (const scale of $$(".pt", root)) {
+    scale._w = scale.clientWidth;
+    if (!scale._w) continue;
+    for (const label of $$(".pt-v", scale)) {
+      const width = label.parentElement.clientWidth;
+      const x = width * parseFloat(label.style.left) / 100;
+      label.classList.toggle("pt-l", x > width / 2 && x + label.offsetWidth + 2 > width);
+    }
+  }
   for (const el of $$("[data-chart]", root)) if (el._chart !== el.dataset.chart) drawChart(el);
   for (const el of $$("[data-dist]", root)) if (el._dist !== el.dataset.dist || el._w !== el.clientWidth) drawDist(el);
   for (const el of $$("[data-history]", root)) if (el._w !== el.clientWidth) el._history = null;
@@ -1069,9 +1199,9 @@ function plot(el, spec) {
   box.onpointerleave = () => show(pts.length - 1, false);
 }
 
-// ---------------------------------------------------------------- an event's outcomes at the horizon
+// ---------------------------------------------------------------- an event's outcomes on its date
 
-// The picture: one row for each outcome, its own range at the horizon's end at its own height, so a rare outcome's
+// The picture: one row for each outcome, its own range on the event's date at its own height, so a rare outcome's
 // range reads as whole as a likely one's; its probability beside its title; its P&L were it known today a line, and
 // its 5th to 95th percentiles beneath; then all of them together, quietly. Every row is the engine's draws counted
 // on one set of bins and shares one dollar axis, today at zero; losses rust and gains teal either side of it. Each
@@ -1124,7 +1254,7 @@ function drawDist(el) {
 // The outcomes grid's lower rows, by the reader's choice: each price's move, each price's level, or each holding's
 // P&L; the choice holds from one event to the next, and through a refresh.
 function applyRows() {
-  for (const t of $$("#detail table.og, #base table.og")) {
+  for (const t of $$("#detail table.og, #event-bg table.og")) {
     if (t.dataset.fixed) continue;  // a grid of one view shows it
     const scope = t.closest("[data-pane]") || t.closest(".ev") || document;
     const have = $$("button[data-rows]", scope).map((b) => b.dataset.rows);
@@ -1132,30 +1262,63 @@ function applyRows() {
     if (want) t.dataset.rows = want;
     for (const b of $$("button[data-rows]", scope)) b.setAttribute("aria-pressed", String(b.dataset.rows === want));
   }
+  applyPayoff();
   applyTabs();
+}
+
+function applyPayoff() {
+  for (const card of $$("#detail .po-card, #event-bg .po-card")) {
+    const dated = !!$('[data-payoff-pane="dated"]', card);
+    const mode = dated && S.payoff === "dated" ? "dated" : "now";
+    for (const p of $$("[data-payoff-pane]", card)) p.hidden = p.dataset.payoffPane !== mode;
+    for (const b of $$("button[data-payoff]", card)) b.setAttribute("aria-pressed", String(b.dataset.payoff === mode));
+  }
 }
 
 // An opened event's view by the reader's choice, held from one event to the next
 function applyTabs() {
-  for (const ev of $$("#detail .ev.ws, #base .ev.ws")) {
+  for (const ev of $$("#detail .ev.ws, #event-bg .ev.ws")) {
     ev.dataset.tab = S.tab;
     for (const b of $$("button[data-tab]", ev)) b.setAttribute("aria-selected", String(b.dataset.tab === S.tab));
   }
 }
 
 document.addEventListener("click", (e) => {
-  const b = e.target.closest("#detail button[data-tab], #base button[data-tab]");
+  const b = e.target.closest("#detail button[data-tab], #event-bg button[data-tab]");
   if (!b) return;
   e.preventDefault();
   S.tab = b.dataset.tab;
   applyTabs();
   for (const el of $$("[data-history]")) el._history = null;
-  drawCharts($("#base"));
+  drawCharts($("#event-bg"));
   drawCharts($("#detail"));
 });
 
 document.addEventListener("click", (e) => {
-  const b = e.target.closest("#detail button[data-rows], #base button[data-rows]");
+  const b = e.target.closest("[data-switch-tab]");
+  if (!b) return;
+  e.preventDefault();
+  S.tab = b.dataset.switchTab;
+  applyTabs();
+  const nav = $("#detail .tabs") || $("#event-bg .tabs");
+  if (nav) nav.scrollIntoView({ block: "nearest", behavior: reducedMotion.matches ? "auto" : "smooth" });
+  drawCharts($("#event-bg"));
+  drawCharts($("#detail"));
+});
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-payoff]");
+  if (!b) return;
+  e.preventDefault();
+  S.payoff = b.dataset.payoff;
+  applyPayoff();
+  for (const el of $$("[data-dist]")) el._dist = null;
+  drawCharts($("#event-bg"));
+  drawCharts($("#detail"));
+});
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("#detail button[data-rows], #event-bg button[data-rows]");
   if (!b) return;
   e.preventDefault();
   S.rows = b.dataset.rows;
@@ -1198,8 +1361,10 @@ function drawHistory(el) {
   const step = S.trail[S.shown - 1];
   const sel = S.outcome && step && S.outcome.event === step.target ? S.outcome.id : null;
   el._history = el.dataset.history + "|" + sel;
-  const w = el._w = el.clientWidth;
-  if (!w) return;
+  el._w = el.clientWidth;
+  if (!el._w) return;
+  const style = getComputedStyle(el);
+  const w = el._w - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
   const spec = JSON.parse(el.dataset.history);
   const picked = sel && spec.outcomes[sel], main = picked ? picked.points : spec.ours;
   const lines = [main, ...(main !== spec.ours ? [spec.ours] : []), ...spec.markets.map((m) => m.points)];
@@ -1227,14 +1392,14 @@ function drawHistory(el) {
   main.forEach((p, i) => {
     svg += `<circle class="ours${i === main.length - 1 ? " now" : ""}" cx="${x(p[0]).toFixed(1)}" cy="${y(p[1]).toFixed(1)}" r="3"/>`;
   });
-  if (spec.band) svg += `<rect class="band" x="${(w - right + 6).toFixed(1)}" y="${y(spec.band[1]).toFixed(1)}" width="6" height="${Math.max(2, y(spec.band[0]) - y(spec.band[1])).toFixed(1)}"><title>Market-implied range today</title></rect>`;
+  if (spec.band) svg += `<rect class="band" x="${(w - right + 6).toFixed(1)}" y="${y(spec.band[1]).toFixed(1)}" width="6" height="${Math.max(2, y(spec.band[0]) - y(spec.band[1])).toFixed(1)}"><title>Market range today</title></rect>`;
   svg += `<text class="tick" x="${left}" y="${base + 16}">${esc(when(t0, t1 - t0))}</text>` +
     `<text class="tick" x="${w - right}" y="${base + 16}" text-anchor="end">${esc(when(t1, t1 - t0))}</text>` +
     `<line class="cursor" y1="${HTOP}" y2="${base}" x1="-9" x2="-9"/>`;
-  const names = [picked ? `${picked.title}, at each reply` : "Forecast, at each reply", ...spec.markets.map((m) => m.label)];
+  const names = [picked ? picked.title : "Forecast at each reply", ...spec.markets.map((m) => m.label)];
   el.innerHTML = `<div class="h-read"></div><svg class="dr" style="width:${w}px;height:${base + 22}px" viewBox="0 0 ${w} ${base + 22}">${svg}</svg>` +
     `<div class="h-key">${names.map((n, i) => i ? `<span class="k-mkt">${dashKey(i - 1)}${esc(n)}</span>` : `<span class="k-ours">${esc(n)}</span>`).join("")}` +
-    `${picked ? '<span class="k-event">The event, at each reply</span>' : ""}</div>`;
+    `${picked ? '<span class="k-event">Event forecast at each reply</span>' : ""}</div>`;
   // what stood at a moment: each line's value as it stood then, the forecast a step that holds until the next reply
   const at = (pts, t) => { let v = null; for (const p of pts) if (stamp(p[0]) <= t) v = p[1]; return v; };
   const read = $(".h-read", el), cursor = $("line.cursor", el), svgEl = $("svg", el);
@@ -1245,7 +1410,7 @@ function drawHistory(el) {
       ...spec.markets.map((m, i) => ["k-mkt", spec.markets.length > 1 || m.label !== m.short ? dashKey(i) : esc("Market"),
                                      at(m.points, t)])];
     read.innerHTML = `<span class="ch-d">${esc(when(t, t1 - t0))}</span>` + parts.filter(([, , v]) => v !== null)
-      .map(([cls, n, v]) => ` <span class="${cls}">${cls === "k-ours" ? esc(n) : n} <span class="n">${chartValue(cls === "k-ours" ? "chance" : "cents", v)}</span></span>`).join("");
+      .map(([cls, n, v]) => ` <span class="${cls}">${cls === "k-ours" ? esc(n) : n} <span class="n">${chartValue("chance", v)}</span></span>`).join("");
     const cx = hover ? left + ((t - t0) / (t1 - t0)) * (w - left - right) : -9;
     cursor.setAttribute("x1", cx); cursor.setAttribute("x2", cx);
     cursor.style.visibility = hover ? "visible" : "hidden";  // drawn only where the pointer reads
@@ -1262,26 +1427,26 @@ function drawHistory(el) {
 // One outcome is selected at a time, and shows as selected wherever it appears in the open event: its row in the
 // picture, its column in each grid, and its probability's history.
 function applyOutcome() {
-  const step = inspected() || S.trail[S.shown - 1];  // the event, kept in view while a figure of it is inspected
+  const step = activeEventStep() || S.trail[S.shown - 1];
   const id = S.outcome && step && S.outcome.event === step.target ? S.outcome.id : null;
-  for (const el of $$("#detail [data-outcome], #base [data-outcome]")) el.classList.toggle("sel", el.dataset.outcome === id);
-  for (const el of $$("#detail [data-history], #base [data-history]")) if (el._history !== el.dataset.history + "|" + id) drawHistory(el);
+  for (const el of $$("#detail [data-outcome], #event-bg [data-outcome]")) el.classList.toggle("sel", el.dataset.outcome === id);
+  for (const el of $$("#detail [data-history], #event-bg [data-history]")) if (el._history !== el.dataset.history + "|" + id) drawHistory(el);
 }
 
 function selectOutcome(id) {
-  const step = inspected() || S.trail[S.shown - 1];
+  const step = activeEventStep() || S.trail[S.shown - 1];
   if (!step) return;
   S.outcome = S.outcome && S.outcome.event === step.target && S.outcome.id === id ? null : { event: step.target, id };
   applyOutcome();
 }
 
 document.addEventListener("click", (e) => {
-  const o = e.target.closest("#detail [data-outcome], #base [data-outcome]");
+  const o = e.target.closest("#detail [data-outcome], #event-bg [data-outcome]");
   if (!o || e.target.closest("[data-go]")) return;
   selectOutcome(o.dataset.outcome);
 });
 document.addEventListener("keydown", (e) => {
-  const o = e.target instanceof Element && e.target.matches("#detail [data-outcome][tabindex], #base [data-outcome][tabindex]") ? e.target : null;
+  const o = e.target instanceof Element && e.target.matches("#detail [data-outcome][tabindex], #event-bg [data-outcome][tabindex]") ? e.target : null;
   if (!o || (e.key !== "Enter" && e.key !== " ")) return;
   e.preventDefault();
   selectOutcome(o.dataset.outcome);
@@ -1291,7 +1456,7 @@ document.addEventListener("keydown", (e) => {
 const resized = new ResizeObserver((entries) => {
   for (const { target } of entries) if (target._w !== target.clientWidth) drawCharts(target.parentElement || target);
 });
-const watchSizes = (root) => { for (const el of $$("[data-dist], [data-history]", root)) resized.observe(el); };
+const watchSizes = (root) => { for (const el of $$(".pt, [data-dist], [data-history]", root)) resized.observe(el); };
 
 // ---------------------------------------------------------------- merging a panel into place
 
@@ -1403,13 +1568,17 @@ function setPanel(name, html) {
   drawCharts(box);
   watchSizes(box);
   focusable(box);
-  layout();
-  markOpeners();
   if (name === "ledger") markRank();
-  // a list first shown with no reply under way is in rank from the start; while the analyst works its rows hold the
-  // places they come in, and a reply's end or a refresh that moves a value ranks them (the server's "rank")
   if (first && S.state && !S.state.busy) rankRows(false);
   if (name === "portfolio") markWeightBy();
+  syncTopbar();
+  syncEventRail();
+  // until the member picks a view: the portfolio, where the first read shows, and Events once, when the first event
+  // arrives; a view the member picks stays theirs
+  if (!S.stagePicked) S.stage = $("#ledger ol.events > li.event") ? "events" : "portfolio";
+  layout();
+  markOpeners();
+  if (name === "ledger" && S.stage === "matrix") loadMatrix();
 }
 
 // where the portfolio's weight is, one list at a time: by company, by industry, or by country
@@ -1429,7 +1598,8 @@ $("#portfolio").addEventListener("click", (e) => {
 // the events in rank: by volatility, or worst outcome first; with `glide`, each moves to its place. The ledger's list
 // and By holding are each a list in rank, its rows carrying their place in both orders.
 function rankRows(glide) {
-  for (const ol of $$("#ledger [data-ranked], #detail [data-ranked]")) rankList(ol, glide);
+  for (const ol of $$("#ledger [data-ranked], #detail [data-ranked], #matrix [data-ranked]")) rankList(ol, glide);
+  syncEventRail();
 }
 
 function rankList(ol, glide) {
@@ -1444,14 +1614,13 @@ function rankList(ol, glide) {
   for (const r of sorted) {
     const dy = before.get(r) - r.getBoundingClientRect().top;
     if (dy && !r.classList.contains("enter")) {
-      r.animate([{ transform: `translateY(${dy}px)` }, { transform: "none" }], { duration: 520, easing: "cubic-bezier(.2,.7,.2,1)" });
+      r.animate([{ transform: `translateY(${dy}px)` }, { transform: "none" }], { duration: 420, easing: "cubic-bezier(.2,.7,.2,1)" });
     }
   }
 }
 
 function markRank() {
-  // each row marks the figure the ledger is ordered by
-  for (const box of [$("#ledger"), $("#detail")]) box.dataset.rank = S.rank;
+  for (const box of [$("#ledger"), $("#detail"), $("#matrix")]) if (box) box.dataset.rank = S.rank;
   for (const b of $$("[data-rank]")) if (b.tagName === "BUTTON") b.setAttribute("aria-pressed", String(b.dataset.rank === S.rank));
 }
 
@@ -1469,7 +1638,7 @@ document.addEventListener("click", (e) => {
   const b = e.target.closest("button[data-ledger]");
   if (!b) return;
   e.preventDefault();
-  returnTo(-1);
+  setStage("events", { manual: true });
 });
 
 // a list shown in part: the rest of it, on request
@@ -1496,18 +1665,20 @@ function folds(root) {
   }
 }
 
-// ---------------------------------------------------------------- the right panel: a trail of steps
+// ---------------------------------------------------------------- workspace topbar, matrix & master-detail navigation
 
-// The trail starts at the ledger. What opens from inside the open view goes a step deeper; what opens from the
-// portfolio or the conversation starts the trail again; what is already on the trail returns to its step. Back
-// returns one step, and a step returned to opens where it was left, at its scroll position, while its figures are
-// read again. Every response is for one navigation: one that a later navigation, Back, a breadcrumb, or a new
-// conversation replaced is dropped. One thing is marked as selected (markOpeners).
-
-const SCOPES = { portfolio: "#portfolio", ledger: "#ledger", detail: "#detail", base: "#base", conversation: "#conversation" };
+const SCOPES = {
+  portfolio: "#portfolio",
+  ledger: "#ledger",
+  matrix: "#matrix",
+  detail: "#detail",
+  eventBg: "#event-bg",
+  conversation: "#conversation",
+  topbar: "#topbar",
+};
 
 function scopeOf(el) {
-  for (const [name, sel] of Object.entries(SCOPES)) if (el.closest(sel)) return name;
+  for (const [name, sel] of Object.entries(SCOPES)) if (el && el.closest(sel)) return name;
   return null;
 }
 
@@ -1515,120 +1686,310 @@ function opener(el) {
   return el ? { el, go: el.dataset.go, scope: scopeOf(el) } : null;
 }
 
-// the view on screen keeps its scroll position: a step its own, the ledger the ledger's
+const isWatchedEvent = (id) => !!(id && $(`#ledger li.event[data-k="${CSS.escape(id)}"]`));
+const activeEventStep = () => (S.shown >= 1 && S.trail[0] && S.trail[0].surface === "event" ? S.trail[0] : null);
+const inDrawer = () => S.shown >= 1 && S.trail[S.shown - 1] && S.trail[S.shown - 1].surface !== "event";
+
+function syncTopbar() {
+  const st = S.state || {};
+  $("#ws-name").textContent = st.store || "New portfolio";
+  $("#tb-chat-dot").classList.toggle("live", !!st.busy);
+  $("#chat-dot").classList.toggle("live", !!st.busy);
+
+  const badge = $("#tb-badge");
+  if (st.read_only) { badge.textContent = "Read-only"; badge.hidden = false; }
+  else if (st.busy) { badge.textContent = "Working…"; badge.hidden = false; }
+  else { badge.textContent = ""; badge.hidden = true; }
+
+  $("#tb-export").hidden = !st.store;
+
+  const ph = $("#portfolio header.ph");
+  const metrics = $("#tb-metrics");
+  if (ph && (ph.dataset.total || ph.dataset.asof)) {
+    metrics.hidden = false;
+    $("#tb-total").textContent = ph.dataset.total || "—";
+    const mv = ph.dataset.move || "";
+    const mvWrap = $("#tb-move-wrap"), mvEl = $("#tb-move");
+    mvWrap.hidden = !mv;
+    mvEl.textContent = mv;
+    mvEl.className = `tb-val ${ph.dataset.moveTone || ""}`.trim();
+    const vol = ph.dataset.vol || "";
+    $("#tb-vol-wrap").hidden = !vol;
+    $("#tb-vol").textContent = vol;
+    $("#tb-asof").textContent = ph.dataset.asof || "";
+    focusable(metrics);
+  } else {
+    metrics.hidden = true;
+  }
+
+  const lh = $("#ledger header.ph");
+  const count = lh && lh.dataset.eventCount ? +lh.dataset.eventCount : $$("#ledger ol.events > li.event").length;
+  const evBadge = $("#ev-count");
+  evBadge.textContent = count ? String(count) : "";
+  evBadge.hidden = !count;
+}
+
+function syncEventRail() {
+  const list = $("#event-rail-list");
+  if (!list) return;
+  const items = $$("#ledger ol.events > li.event");
+  const cur = activeEventStep()?.target || null;
+  $("#rail-count").textContent = items.length ? `${items.length}` : "";
+  list.innerHTML = items.map((li) => {
+    const a = $("a.evline", li);
+    if (!a) return "";
+    const id = li.dataset.k || a.dataset.go || "";
+    const title = a.dataset.title || $(".et", a)?.textContent || id;
+    const prob = a.dataset.prob || "";
+    const yes = a.dataset.yes || "";
+    const tone = a.dataset.tone || "";
+    return `<button type="button" class="rail-item${id === cur ? " active" : ""}" data-rail-event="${esc(id)}">` +
+      `<span class="rail-t">${esc(title)}</span>` +
+      `<span class="rail-figs"><span class="rail-p">${esc(prob)}</span>` +
+      `<span class="${esc(tone)}">${esc(yes)}</span></span></button>`;
+  }).join("");
+}
+
+$("#event-rail-list").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-rail-event]");
+  if (!b) return;
+  const id = b.dataset.railEvent;
+  const title = $(".rail-t", b)?.textContent || id;
+  openStep(id, title, { push: true, from: null });
+});
+
+$("#all-events").addEventListener("click", () => {
+  returnTo(-1);
+});
+
+async function loadMatrix() {
+  if (!S.state.store) return;
+  try {
+    const got = await api("/api/view?id=byholding");
+    const box = $("#matrix");
+    const tpl = document.createElement("template");
+    tpl.innerHTML = got.html || "";
+    const next = document.createElement("div");
+    next.append(tpl.content);
+    morph(box, next);
+    decorate(box);
+    markRank();
+    for (const ol of $$("[data-ranked]", box)) rankList(ol, false);
+    focusable(box);
+  } catch (e) {
+    if (!(e instanceof RequestError)) throw e;
+  }
+}
+
+function setStage(stage, { manual = false } = {}) {
+  if (manual) S.stagePicked = true;
+  S.stage = stage;
+  if (stage === "matrix") loadMatrix();
+  layout();
+}
+
+$("#stage-tabs").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-stage]");
+  if (!b) return;
+  const targetStage = b.dataset.stage;
+  if (targetStage === "events" && S.stage === "events" && activeEventStep()) {
+    returnTo(-1);
+    return;
+  }
+  if (inDrawer() && !activeEventStep()) closeInspector();
+  setStage(targetStage, { manual: true });
+});
+
+function currentScroller() {
+  if (inDrawer()) return $("#inspector-scroll");
+  if (activeEventStep()) return $("#event-stage");
+  return $("#ledger-wrap");
+}
+
 function keepPlace() {
-  const at = $("#right-scroll").scrollTop;
+  const scroller = currentScroller();
+  const at = scroller ? scroller.scrollTop : 0;
   if (S.shown > 0 && S.trail[S.shown - 1]) S.trail[S.shown - 1].scroll = at;
   else S.ledgerScroll = at;
 }
 
 async function openStep(target, title, { push = true, from = null } = {}) {
   if (!S.state.store) return;
+  if (target === "byholding") {
+    if (inDrawer()) closeInspector();
+    setStage("matrix", { manual: true });
+    return;
+  }
   const token = ++S.nav;
   const seq = S.storeSeq;
   keepPlace();
+  const targetIsEvent = isWatchedEvent(target);
   if (push) {
-    // what opens from inside the open view goes a step deeper; what opens from the portfolio or the conversation
-    // starts the trail again, so one thing is selected at a time; and what is already on the trail returns to it
-    // the event kept in view beside its inspector is the trail's first step: what opens from it goes one step deeper
-    const depth = from && scopeOf(from) === "detail" ? S.shown : from && scopeOf(from) === "base" ? 1 : 0;
+    const sc = from ? scopeOf(from) : null;
+    let depth = 0;
+    if (targetIsEvent) {
+      depth = 0;
+    } else if (sc === "detail") {
+      depth = S.shown;
+    } else if (sc === "eventBg") {
+      depth = 1;
+    } else if (activeEventStep() && S.stage === "events") {
+      depth = 1;
+    }
     const again = S.trail.slice(0, depth).findIndex((s) => s.target === target);
     if (again >= 0) { returnTo(again); return; }
     S.trail = S.trail.slice(0, depth);
-    S.trail.push({ target, title: title || target, opener: opener(from) });
+    S.trail.push({
+      target,
+      title: title || target,
+      opener: opener(from),
+      surface: targetIsEvent ? "event" : undefined,
+    });
     S.left = null;
   }
   const step = S.trail[S.trail.length - 1];
   renderTrail();
   markOpeners();
   const seen = S.seen.get(target);
-  if (seen) {  // shown before: at once, as it was last shown, and its figures read again in place
+  if (seen) {
     step.title = seen.title || step.title;
     step.wide = seen.wide;
+    step.surface = seen.surface || step.surface || (targetIsEvent ? "event" : "inspector");
     showStep(step, seen.html, 0);
     refreshStep();
-    if (narrow()) { $("#app").classList.remove("show-left"); $("#app").classList.add("show-right"); }
     return;
   }
-  // a step slow to come: the panel says what is opening, rather than keep the view it leaves under the new crumb
   const opening = setTimeout(() => { if (token === S.nav && S.trail.includes(step)) showOpening(step); }, 250);
+  let got;
   try {
-    const got = await api(`/api/view?id=${encodeURIComponent(target)}`);
-    clearTimeout(opening);
-    if (token !== S.nav) return;  // a later navigation replaced this one
-    step.title = got.title || step.title;
-    step.wide = !!got.wide;
-    showStep(step, got.html, 0);
-    if (seq !== S.storeSeq) refreshStep();  // the store changed while it loaded: its figures are read again
-    else readAgainLater(step, got);
+    got = await api(`/api/view?id=${encodeURIComponent(target)}`);
   } catch (e) {
     clearTimeout(opening);
+    if (!(e instanceof RequestError)) throw e;
     if (token !== S.nav) return;
     notice(e.message);
-    if (push) { S.trail = S.trail.slice(0, S.shown); renderTrail(); markOpeners(); }  // the view on screen stays
+    if (push) { S.trail = S.trail.slice(0, S.shown); renderTrail(); markOpeners(); }
     if (S.opening) restoreShown();
     return;
   }
-  if (narrow()) { $("#app").classList.remove("show-left"); $("#app").classList.add("show-right"); }
+  clearTimeout(opening);
+  if (token !== S.nav) return;
+  if (got.surface === "matrix") {
+    S.trail = S.trail.slice(0, S.shown);
+    setStage("matrix", { manual: true });
+    return;
+  }
+  step.title = got.title || step.title;
+  step.wide = !!got.wide;
+  step.surface = got.surface || (targetIsEvent ? "event" : "inspector");
+  showStep(step, got.html, 0);
+  if (seq !== S.storeSeq) refreshStep();
+  else readAgainLater(step, got);
+}
+
+function mountDetail(inInspector) {
+  const trail = $("#trail");
+  const detail = $("#detail");
+  if (inInspector) {
+    const head = $("#inspector-head");
+    const closeBtn = $("#close-inspector");
+    if (trail.parentElement !== head) head.insertBefore(trail, closeBtn);
+    const sc = $("#inspector-scroll");
+    if (detail.parentElement !== sc) sc.append(detail);
+    $("#inspector").hidden = false;
+  } else {
+    const bar = $("#event-bar");
+    if (trail.parentElement !== bar) bar.append(trail);
+    const stage = $("#event-stage");
+    if (detail.parentElement !== stage) stage.append(detail);
+    $("#inspector").hidden = true;
+  }
+}
+
+function syncEventBackground() {
+  const ev = activeEventStep();
+  const bg = $("#event-bg");
+  if (!ev || !inDrawer() || !ev.html) {
+    if (bg.dataset.target) { bg.innerHTML = ""; delete bg.dataset.target; }
+    bg.hidden = true;
+    return;
+  }
+  if (bg.dataset.target !== ev.target || bg._html !== ev.html) {
+    bg.innerHTML = ev.html;
+    bg._html = ev.html;
+    bg.dataset.target = ev.target;
+    decorate(bg);
+    drawCharts(bg);
+    watchSizes(bg);
+    focusable(bg);
+    requestAnimationFrame(() => {
+      folds(bg);
+      $("#event-stage").scrollTop = ev.scroll || 0;
+    });
+  }
+  bg.hidden = false;
 }
 
 function showOpening(step) {
   const detail = $("#detail");
   S.opening = true;
+  const asEvent = step.surface === "event" && S.trail.indexOf(step) === 0;
+  if (asEvent) S.stage = "events";
+  mountDetail(!asEvent);
   detail.innerHTML = `<p class="opening"><span class="wait" aria-hidden="true"></span><span>Opening ${esc(step.title)}</span></p>`;
   detail.hidden = false;
-  $("#ledger").hidden = true;
   layout();
 }
 
-// the view the trail is at, shown again where a step on its way was dropped or failed
 function restoreShown() {
   S.opening = false;
   if (S.shown > 0) { const s = S.trail[S.shown - 1]; showStep(s, s.html || "", s.scroll || 0); } else showLedger();
 }
 
-// what an inspected figure was opened from, an event, a holding, a factor, a market or a list: the trail's first step,
-// kept in view while a step deeper is shown; a figure's working opened on its own has nothing to keep beside it
-const inspected = () => S.shown > 1 && S.trail[0] && !/^x:/.test(S.trail[0].target) && S.trail[0].html ? S.trail[0] : null;
-
-function showBase() {
-  const ev = inspected(), base = $("#base");
-  if (!ev || narrow()) { if (base.dataset.target) { base.innerHTML = ""; delete base.dataset.target; } return; }
-  if (base.dataset.target === ev.target && base._html === ev.html) return;
-  const keep = base.dataset.target === ev.target ? $("#base-scroll").scrollTop : 0;
-  base.innerHTML = ev.html;
-  base._html = ev.html;
-  base.dataset.target = ev.target;
-  decorate(base);
-  drawCharts(base);
-  watchSizes(base);
-  requestAnimationFrame(() => { folds(base); $("#base-scroll").scrollTop = keep; });
+// Keep a wide calculation table scrollable inside the drawer while its heading and evidence stay in place.
+function detailContent(html, drawer) {
+  const content = document.createElement("div");
+  content.innerHTML = html;
+  if (drawer) {
+    for (const table of $$("table", content)) {
+      const wrap = document.createElement("div");
+      wrap.className = "drawer-table";
+      table.replaceWith(wrap);
+      wrap.append(table);
+    }
+  }
+  return content;
 }
 
 function showStep(step, html, scroll) {
   const detail = $("#detail");
   S.opening = false;
   step.html = html;
-  S.seen.set(step.target, { html, title: step.title, wide: step.wide });
-  detail.innerHTML = html;
+  step.surface = step.surface || (isWatchedEvent(step.target) ? "event" : "inspector");
+  S.seen.set(step.target, { html, title: step.title, wide: step.wide, surface: step.surface });
+  S.shown = S.trail.indexOf(step) + 1;
+  const drawer = step.surface !== "event" || S.shown > 1;
+  if (!drawer) S.stage = "events";
+  mountDetail(drawer);
+  syncEventBackground();
+  layout();
+  detail.replaceChildren(...detailContent(html, drawer).childNodes);
   decorate(detail);
-  layout();  // the panel takes the width its step reads in before anything in it is drawn
   drawCharts(detail);
   watchSizes(detail);
+  focusable(detail);
   requestAnimationFrame(() => folds(detail));
   detail.hidden = false;
-  $("#ledger").hidden = true;
   markRank();
   rankRows(false);
-  S.shown = S.trail.indexOf(step) + 1;
   renderTrail();
-  layout();
-  showBase();
+  syncEventRail();
   markOpeners();
-  const box = $("#right-scroll");
+  const box = drawer ? $("#inspector-scroll") : $("#event-stage");
   box.scrollTop = scroll;
-  requestAnimationFrame(() => { box.scrollTop = scroll; });  // once its charts and folds have their height
-  const mark = !scroll && $("mark", detail);  // a passage, marked in its page, on its first opening
+  requestAnimationFrame(() => { box.scrollTop = scroll; });
+  // a passage opened, where its page's text shows it; a page's text whole, at the first passage quoted from it
+  const mark = !scroll && ($("mark.here", detail) || $(".page mark", detail));
   if (mark) requestAnimationFrame(() => mark.scrollIntoView({ block: "center" }));
   if (S.keyboard) detail.focus({ preventScroll: true });
 }
@@ -1637,15 +1998,26 @@ function showLedger() {
   S.opening = false;
   $("#detail").hidden = true;
   $("#detail").innerHTML = "";
-  $("#ledger").hidden = false;
+  $("#event-bg").hidden = true;
+  $("#event-bg").innerHTML = "";
+  delete $("#event-bg").dataset.target;
+  mountDetail(false);
   S.shown = 0;
   renderTrail();
+  syncEventRail();
   layout();
   markOpeners();
-  const box = $("#right-scroll");
-  box.scrollTop = S.ledgerScroll || 0;
-  if (narrow() && !$("#ledger").innerHTML.trim()) $("#app").classList.remove("show-right");
+  const box = $("#ledger-wrap");
+  if (box) box.scrollTop = S.ledgerScroll || 0;
 }
+
+function closeInspector() {
+  if (!inDrawer()) return;
+  if (activeEventStep()) returnTo(0);
+  else returnTo(-1);
+}
+
+$("#close-inspector").addEventListener("click", closeInspector);
 
 // return to step k of the trail, or to the ledger at -1, as it was left; its figures are then read again
 function returnTo(k) {
@@ -1661,7 +2033,7 @@ function returnTo(k) {
 }
 
 function back() {
-  if (S.trail.length > S.shown) {  // a step still loading: it is dropped, and the view it left shows again
+  if (S.trail.length > S.shown) {
     S.nav++;
     S.trail = S.trail.slice(0, S.shown);
     renderTrail();
@@ -1672,45 +2044,47 @@ function back() {
   returnTo(S.shown - 2);
 }
 
-// a new conversation: the trail goes, and the ledger shows from its top
 function resetTrail() {
   S.nav++;
   S.trail = [];
   S.seen.clear();
   S.left = null;
   S.ledgerScroll = 0;
+  S.stagePicked = false;
   showLedger();
 }
 
 async function refreshStep({ now = false } = {}) {
   const step = S.trail[S.shown - 1];
-  if (!S.shown || !step || S.opening) return;  // a step on its way: the one it leaves is not shown to refresh
+  if (!S.shown || !step || S.opening) return;
   const token = S.nav, seq = ++S.refreshSeq;
+  let got;
   try {
-    const got = await api(`/api/view?id=${encodeURIComponent(step.target)}${now ? "&now=1" : ""}`);
-    if (token !== S.nav || seq !== S.refreshSeq || S.trail[S.shown - 1] !== step) return;  // superseded
-    step.html = got.html;
-    step.title = got.title || step.title;
-    step.wide = !!got.wide;
-    S.seen.set(step.target, { html: got.html, title: step.title, wide: step.wide });
-    const tpl = document.createElement("template");
-    tpl.innerHTML = got.html;
-    const next = document.createElement("div");
-    next.append(tpl.content);
-    morph($("#detail"), next);
-    decorate($("#detail"));
-    for (const ol of $$("#detail [data-ranked]")) rankList(ol, false);
-    drawCharts($("#detail"));
-    watchSizes($("#detail"));
-    requestAnimationFrame(() => folds($("#detail")));
-    renderTrail();
-    markOpeners();
-    readAgainLater(step, got);
-  } catch { /* the step stays as it was */ }
+    got = await api(`/api/view?id=${encodeURIComponent(step.target)}${now ? "&now=1" : ""}`);
+  } catch (e) {
+    if (!(e instanceof RequestError)) throw e;
+    return;
+  }
+  if (token !== S.nav || seq !== S.refreshSeq || S.trail[S.shown - 1] !== step) return;
+  step.html = got.html;
+  step.title = got.title || step.title;
+  step.wide = !!got.wide;
+  step.surface = got.surface || step.surface;
+  S.seen.set(step.target, { html: got.html, title: step.title, wide: step.wide, surface: step.surface });
+  const detail = $("#detail");
+  morph(detail, detailContent(got.html, !!detail.closest("#inspector")));
+  decorate($("#detail"));
+  for (const ol of $$("#detail [data-ranked]")) rankList(ol, false);
+  drawCharts($("#detail"));
+  watchSizes($("#detail"));
+  focusable($("#detail"));
+  requestAnimationFrame(() => folds($("#detail")));
+  renderTrail();
+  syncEventRail();
+  markOpeners();
+  readAgainLater(step, got);
 }
 
-// a view shown with values as last worked out: read again at once working them out (work), or, with a value being
-// worked out apart (later), read again until it is there; each figure changes in place
 let laterTimer = null;
 function readAgainLater(step, got) {
   clearTimeout(laterTimer);
@@ -1720,33 +2094,20 @@ function readAgainLater(step, got) {
   laterTimer = setTimeout(() => { if (S.trail[S.shown - 1] === step) refreshStep(); }, step.laterWait);
 }
 
+// the way back is one step, Back, to where the member came from: what each view is and what it belongs to, its own
+// head says, so no path of the steps above it is drawn
 function renderTrail() {
-  const crumbs = $("#crumbs");
-  // the ledger is one click away from every step
-  const all = [{ title: "Events" }, ...S.trail];
-  crumbs.innerHTML = all.map((s, k) =>
-    `${k ? '<span class="sep">/</span>' : ""}<button type="button" data-crumb="${k - 1}"${k === S.shown ? ' aria-current="page"' : ""}>${esc(s.title)}</button>`).join("");
   $("#trail").hidden = !S.trail.length;
 }
 
-$("#crumbs").addEventListener("click", (e) => {
-  const b = e.target.closest("[data-crumb]");
-  if (!b) return;
-  const k = +b.dataset.crumb;
-  if (k === S.shown - 1 && S.trail.length === S.shown) return;  // the step on screen
-  returnTo(k);
-});
-
 $("#back").addEventListener("click", back);
 
-// One thing is marked as selected: what started the open trail from the portfolio or the conversation, while the
-// trail is open; and, in a view returned to, what opened the step just left there, so the place is kept.
 function markOpeners() {
   for (const el of $$("[data-opened]")) { el.removeAttribute("data-opened"); el.removeAttribute("aria-current"); }
   const shown = S.shown > 0 ? "detail" : "ledger";
   const root = S.shown > 0 && S.trail[0] ? S.trail[0].opener : null;
   const marks = [];
-  if (root && (root.scope === "portfolio" || root.scope === "conversation")) marks.push(root);
+  if (root && (root.scope === "portfolio" || root.scope === "conversation" || root.scope === "matrix" || root.scope === "ledger")) marks.push(root);
   if (S.left && S.left.scope === shown) marks.push(S.left);
   for (const o of marks) {
     const el = findOpener(o);
@@ -1767,12 +2128,11 @@ function focusOpener(o) {
   else ($("#detail").hidden ? $("#ledger") : $("#detail")).focus({ preventScroll: true });
 }
 
-// a pointer to a note shown once, further down the same panel: it scrolls there and marks it a moment
 document.addEventListener("click", (e) => {
   const a = e.target.closest("[data-to]");
   if (!a) return;
   e.preventDefault();
-  const note = $(`#detail [data-note="${CSS.escape(a.dataset.to)}"]`) || $(`#base [data-note="${CSS.escape(a.dataset.to)}"]`);
+  const note = $(`#detail [data-note="${CSS.escape(a.dataset.to)}"]`) || $(`#event-bg [data-note="${CSS.escape(a.dataset.to)}"]`);
   if (!note) return;
   $(".fold", note)?.classList.add("open");
   note.scrollIntoView({ block: "center", behavior: reducedMotion.matches ? "auto" : "smooth" });
@@ -1785,18 +2145,16 @@ document.addEventListener("click", (e) => {
   const a = e.target.closest("[data-go]");
   if (!a || a.closest("#menu")) return;
   e.preventDefault();
-  S.keyboard = e.detail === 0;  // a click the keyboard made
-  // what the breadcrumb says until the step's own title arrives: an event's title, a holding's name, the figure
-  const named = $(".chip-t, .et, .tk, .nm", a);
+  S.keyboard = e.detail === 0;
+  const named = $(".chip-t, .et, .tk, .nm, .drv-nm", a);
   const label = (named ? named.textContent : a.textContent).trim() || a.dataset.go;
   const mark = e.target.closest("[data-outcome]");
   if (mark && a.contains(mark)) S.outcome = { event: a.dataset.go, id: mark.dataset.outcome };
   openStep(a.dataset.go, label.slice(0, 60), { from: a });
 });
 
-// Every figure, name, and event that opens a step is reached and opened from the keyboard: a link with no href is
-// made one, Enter opens it, and focus shows.
 function focusable(root = document) {
+  if (!root) return;
   for (const a of $$("[data-go]", root)) {
     if (a.hasAttribute("href") || a.closest("#menu")) continue;
     if (a.getAttribute("tabindex") !== "0") a.setAttribute("tabindex", "0");
@@ -1815,60 +2173,82 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("pointerdown", () => { S.keyboard = false; }, true);
 document.addEventListener("keydown", (e) => { if (e.key === "Tab" || e.key === "Enter" || e.key === " ") S.keyboard = true; }, true);
 
-// ---------------------------------------------------------------- layout and narrow windows
+// ---------------------------------------------------------------- fixed-geometry layout & controls
 
-// On a window narrower than a laptop's both panels fold into toggles (style.css, max-width 1100px). Where both panels
-// would leave the conversation narrower than a comfortable reading width, about 560px, the portfolio folds into its
-// toggle and the events stay docked: the panels and their padding take 788px, so below 1350px (`fold-left`).
-// Whatever is opened takes the main area (`wide`, as every view says it is) and the conversation narrows beside it
-// (`examining`), the portfolio folded into its toggle; a figure's working opens beside the view it came from
-// (`inspecting`).
-const NARROW = matchMedia("(max-width: 1100px)");
+const NARROW = matchMedia("(max-width: 1080px)");
 const narrow = () => NARROW.matches;
-const wideStep = () => S.shown > 0 && S.trail.slice(0, S.shown).some((s) => s.wide);
 
 function layout() {
   const app = $("#app");
-  const hasLeft = !!$("#portfolio").innerHTML.trim();
-  const hasRight = !!$("#ledger").innerHTML.trim() || S.trail.length > 0;
-  const wide = hasRight && wideStep();
-  app.classList.toggle("has-left", hasLeft);
-  app.classList.toggle("has-right", hasRight);
-  app.classList.toggle("wide", wide);
-  const foldLeft = !narrow() && hasLeft && hasRight && (wide || innerWidth < 1350);
-  app.classList.toggle("examining", !narrow() && wide);
-  const base = inspected();
-  app.classList.toggle("inspecting", !narrow() && !!base);
-  $("#base-scroll").hidden = !base || narrow();
-  app.classList.toggle("fold-left", foldLeft);
-  const left = hasLeft && (narrow() || foldLeft), right = hasRight && narrow();
-  $('[data-toggle="left"]').hidden = !left;
-  $('[data-toggle="right"]').hidden = !right;
-  if (!left) app.classList.remove("show-left");
-  if (!right) app.classList.remove("show-right");
+  const hasPortfolio = !!$("#portfolio").innerHTML.trim();
+  const hasEvents = !!$("#ledger").innerHTML.trim();
+  app.classList.toggle("has-left", hasPortfolio);
+  app.classList.toggle("has-right", hasEvents || S.trail.length > 0);
+  app.classList.toggle("chat-closed", !narrow() && S.chatClosed);
+
+  const stage = S.stage;
+  for (const b of $$("#stage-tabs button[data-stage]")) {
+    b.setAttribute("aria-selected", String(b.dataset.stage === stage));
+  }
+  $("#tab-matrix").hidden = !hasEvents;
+
+  $("#pane-events").hidden = stage !== "events";
+  $("#pane-matrix").hidden = stage !== "matrix";
+  $("#pane-portfolio").hidden = stage !== "portfolio";
+
+  const eventOpen = stage === "events" && (!!activeEventStep() || (S.opening && S.trail[0]?.surface === "event"));
+  $("#event-split").hidden = !eventOpen;
+  $("#ledger-wrap").hidden = eventOpen;
+  $("#ledger-empty").hidden = hasEvents || !hasPortfolio;
+
+  const toggleBtn = $("#toggle-chat");
+  const chatShown = narrow() ? app.classList.contains("show-chat") : !S.chatClosed;
+  toggleBtn.classList.toggle("active", chatShown);
+  toggleBtn.setAttribute("aria-pressed", String(chatShown));
 }
 
-NARROW.addEventListener("change", layout);
-addEventListener("resize", layout);
-const folded = () => narrow() || $("#app").classList.contains("fold-left");
-
-$("#toggles").addEventListener("click", (e) => {
-  const b = e.target.closest("[data-toggle]");
-  if (!b) return;
-  const side = b.dataset.toggle;
-  const app = $("#app");
-  const other = side === "left" ? "right" : "left";
-  app.classList.remove(`show-${other}`);
-  app.classList.toggle(`show-${side}`);
+NARROW.addEventListener("change", () => {
+  if (!narrow()) $("#app").classList.remove("show-chat");
+  layout();
 });
+addEventListener("resize", layout);
+
+function toggleChat() {
+  const app = $("#app");
+  if (narrow()) app.classList.toggle("show-chat");
+  else S.chatClosed = !S.chatClosed;
+  layout();
+}
+
+$("#toggle-chat").addEventListener("click", toggleChat);
+$("#collapse-chat").addEventListener("click", toggleChat);
+// The ledger saves as a file, which the server names; the page stays where it is.
+function downloadLedger() {
+  const a = document.createElement("a");
+  a.href = "/api/download";
+  a.download = "";
+  document.body.append(a);
+  a.click();
+  a.remove();
+}
+
+$("#tb-export").addEventListener("click", downloadLedger);
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { $("#app").classList.remove("show-left", "show-right"); closeMenu(); }
-});
-
-$("#center").addEventListener("click", (e) => {
-  if (!folded() || e.target.closest("#toggles, [data-go]")) return;
-  $("#app").classList.remove("show-left", "show-right");
+  if (viewer && viewer.open) return;  // the viewer over the page takes its own keys, Escape closing it
+  if ((e.metaKey || e.ctrlKey) && e.key === "/") {
+    if (!$("#app").classList.contains("empty")) { e.preventDefault(); toggleChat(); }
+    return;
+  }
+  if (e.key === "Escape") {
+    closeMenu();
+    if (narrow() && $("#app").classList.contains("show-chat")) {
+      $("#app").classList.remove("show-chat");
+      layout();
+      return;
+    }
+    if (inDrawer()) closeInspector();
+  }
 });
 
 // ---------------------------------------------------------------- the menu
@@ -1894,7 +2274,7 @@ menuPop.addEventListener("click", async (e) => {
   e.stopPropagation();
   try {
     if (item.dataset.menu === "new") { closeMenu(); await post("/api/new"); }
-    else if (item.dataset.menu === "download") { closeMenu(); location.href = "/api/download"; }
+    else if (item.dataset.menu === "download") { closeMenu(); downloadLedger(); }
     else if (item.dataset.menu === "open") {
       const list = await api("/api/stores");
       const box = $("#stores");
@@ -1904,6 +2284,7 @@ menuPop.addEventListener("click", async (e) => {
       box.hidden = false;
     } else if (item.dataset.store) { closeMenu(); await post("/api/open", { name: item.dataset.store }); }
   } catch (err) {
+    if (!(err instanceof RequestError)) throw err;
     notice(err.message);
   }
 });
@@ -1921,6 +2302,7 @@ function storeChanged() {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
     if (S.shown) refreshStep();
+    if (S.stage === "matrix") loadMatrix();
     wantChips(true);
   }, 300);
 }
@@ -1941,11 +2323,13 @@ async function start() {
   if (!$("#status").hidden) status("Connecting…");  // trying again
   try {
     await loadAll();
-    S.loaded = true;
-    status("");
-  } catch {
-    status("The page can't reach its server.", { label: "Try again", run: start });
+  } catch (e) {
+    if (!(e instanceof RequestError)) { status(""); throw e; }  // the page's own script failed: the browser reports it
+    status(e.message, { label: "Try again", run: start });  // out of reach, or the server's own words
+    return;
   }
+  S.loaded = true;
+  status("");
 }
 
 let stream = null;

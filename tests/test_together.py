@@ -1,11 +1,13 @@
 """Joint probability direction, row-preserving prices, and executable protection."""
 import itertools
+import re
 
 import numpy as np
 import pytest
 
 from harness import schema
 from harness.derive.markets import order_cost
+from harness.derive.outcomes import named_by
 from harness.derive.together import joint_levels, price_weights, probabilities, read
 from harness.ledger import ledger
 from harness.tools import Tools
@@ -118,6 +120,49 @@ def test_joint_view_uses_the_store_valuation_and_keeps_single_rows(tmp_path):
     assert both["A"] == pytest.approx(10000 * (.9 * 1.2 / (.97 * 1.08) - 1))
     assert w.store.computation(joint["basis"])["derivation"] == "together"
     assert joint["distribution"]["variance"]["total"] >= 0
+
+
+def test_events_read_together_return_their_combination_and_leave_the_rows_to_the_ledger(tmp_path):
+    """ledger(together) returns the events named read as one set of worlds (MATH.md 1.9, TOOLS.md 5), and the rows and each
+    holding under each event stay ledger()'s: each joint world under its id, which names each event's outcome there,
+    with its probability, its weight, each factor's move, the portfolio's P&L and what is stated there, its dollars to
+    the cent and its shares to six places; each event's averages beside its row's; and the distribution on the latest
+    of their dates, each joint world by its mean, variance and quantiles there. get of a joint world returns the same
+    combination."""
+    w = world(tmp_path, g={"SPY": 10000}, coefficients={"SPY": {}})
+    a, b = event(w, "A", .3), event(w, "B", .4)
+    spy = channel(w, "SPY")
+    w.link(a, "consequence", spy, shock=-0.1)
+    w.link(b, "consequence", spy, shock=0.2)
+    got = Tools(w).ledger(together=[a, b])
+    assert list(got) == ["together"]
+    joint, full = got["together"], read(w.store, [a, b])
+    assert [v["id"] for v in joint["worlds"]] == [v["id"] for v in full["worlds"]]
+    for shown, v in zip(joint["worlds"], full["worlds"]):
+        assert "outcomes" not in shown and "side" not in shown and named_by(shown["id"]) == v["outcomes"]
+        assert (shown["A"], shown["p"], shown["factors"][spy]) == (round(v["A"], 2), round(v["p"], 6),
+                                                                   round(v["factors"][spy], 6))
+    assert {k for x in joint["distribution"]["worlds"].values() for k in x} == {"mean", "variance", "quantiles"}
+    assert [(e["event"], e["alone"]["full_impact"]) for e in joint["events_read"]] == \
+        [(e["event"], round(e["alone"]["full_impact"], 2)) for e in full["events_read"]]
+    assert Tools(w).get(joint["worlds"][0]["id"])["together"] == joint
+
+
+def test_events_read_together_are_drawn_on_the_latest_of_their_dates(tmp_path):
+    """MATH.md 1.8, 1.9: a joint world values the portfolio once, when every one of its events is known, so the joint
+    view's distribution is drawn on the latest of the events' dates, over the sessions to it, whichever event was made
+    first; each event alone is drawn on its own."""
+    from harness.derive import series
+    w = world(tmp_path, g={"SPY": 10000}, coefficients={"SPY": {}})
+    late, soon = event(w, "Late", .3, end="2027-02-15"), event(w, "Soon", .4, end="2026-12-15")
+    spy = channel(w, "SPY")
+    w.link(late, "consequence", spy, shock=-0.1)
+    w.link(soon, "consequence", spy, shock=0.2)
+    for order in ([late, soon], [soon, late]):
+        drawn = ledger(w.store, order)["together"]["distribution"]
+        assert drawn["drawn_on"] == "2027-02-15"
+        assert drawn["sessions_ahead"] == series.sessions_after("2026-11-04", "2027-02-15")
+    assert w.store.engine.value("distribution", soon).output["drawn_on"] == "2026-12-15"
 
 
 def test_single_event_joint_view_preserves_a_company_shock_inside_a_fund(tmp_path):
@@ -254,12 +299,18 @@ def test_a_stated_joint_world_moves_the_portfolio_and_the_others_stay_where_the_
         both = w.prop("both")
         w.link(both, "and", a)
         w.link(both, "and", b)
-        w.link(both, "consequence", spy, shock=stated)
+        joint = f"joint:{a}=yes|{b}=yes"  # one outcome has one name: a composite of the two is refused with it
+        with pytest.raises(StoreError, match=re.escape(f"{both} stands for the joint world {joint}. State the "
+                                                       f"consequence on that joint world: link({joint}, consequence, ")):
+            w.link(both, "consequence", spy, shock=stated)
+        w.link(f"joint:{b}=yes|{a}=yes", "consequence", spy, shock=stated)  # named in any order, kept in one
+        assert w.store.type_of(joint) == "JointWorld"
         got = read(w.store, [a, b])
         pnl = {tuple(state["outcomes"][e] for e in (a, b)): state["A"] for state in got["worlds"]}
         assert [round(pnl[k], 2) for k in (("yes", "yes"), ("yes", "no"), ("no", "yes"), ("no", "no"))] == figures
         # what is stated of the joint world is shown as stated; every other world as the rows give it
-        assert all(isinstance(state["by"], dict) == (set(state["outcomes"].values()) == {"yes"}) for state in got["worlds"])
+        assert all((state["set"] != "nothing" and any("link" in v for v in state["set"].values()))
+                   == (set(state["outcomes"].values()) == {"yes"}) for state in got["worlds"])
         assert read(w.store, [b, a])["basis"] == got["basis"]  # the set of events, in any order, is one reading
 
 
@@ -286,10 +337,8 @@ def test_absolute_worth_on_a_joint_world_leaves_the_other_worlds_at_the_rows(tmp
     a, b = event(w, "A", .3), event(w, "B", .4)
     w.link(a, "consequence", channel(w, "SPY"), shock=-0.1)
     w.link(b, "consequence", channel(w, "SPY"), shock=0.2)
-    both = w.prop("both")
-    w.link(both, "and", a)
-    w.link(both, "and", b)
-    w.store.link(both, "worth", "name:COMPANY", {"value": {"value": {"amount": 150}, "note": "the joint value"}})
+    w.store.link(f"joint:{a}=yes|{b}=yes", "worth", "name:COMPANY",
+                 {"value": {"value": {"amount": 150}, "note": "the joint value"}})
     got = read(w.store, [a, b])
     assert "why" not in got
     for state in got["worlds"]:
@@ -345,9 +394,9 @@ def test_considered_protection_runs_through_the_tool_and_uses_book_and_curve(tmp
     assert 0 < protection["discount"] < 1
     for state in joint["worlds"]:
         value = protection["worlds"][state["id"]]
-        expected = 1000 * protection["discount"] if state["outcomes"][a] == "yes" else 0
-        assert value["payout"] == pytest.approx(expected)
-        assert value["combined"] == pytest.approx(state["A"] + expected - 320)
+        expected = 1000 * protection["discount"] if named_by(state["id"])[a] == "yes" else 0
+        assert value["payout"] == pytest.approx(expected, abs=0.01)  # its dollars to the cent (TOOLS.md 9)
+        assert value["combined"] == pytest.approx(state["A"] + expected - 320, abs=0.02)
 
 
 def test_a_contract_that_cannot_be_valued_leaves_the_joint_view_and_one_held_returns_its_event(tmp_path):
@@ -407,23 +456,26 @@ def test_analyst_can_build_ways_joint_values_and_protection_through_tool_receipt
     for side, amount in (("yes", 40), ("no", 20)):
         receipt = call("link", from_id=b, relation="worth", to_id="name:DEAL",
                        fields={"world": side, "value": {"value": {"amount": amount}, "note": "The consideration."}})
-    assert receipt["events"][0]["levels"]["name:DEAL"]["worlds"] == {"yes": 40, "no": 20}
+    assert receipt["events"][0]["row"]["full_impact"] is not None
+    assert call("get", id=b)["levels"]["name:DEAL"]["worlds"] == {"yes": 40, "no": 20}
     joint = prop("A and B")
     for e in (a, b):
         call("link", from_id=joint, relation="and", to_id=e)
-    call("link", from_id=joint, relation="worth", to_id="name:DEAL",
+    both = f"joint:{a}=yes|{b}=yes"  # A's Yes side, which has ways, holds each joint world beneath it
+    call("link", from_id=both, relation="worth", to_id="name:DEAL",
          fields={"value": {"value": {"amount": 50}, "note": "The joint consideration."}})
     call("link", from_id=joint, relation="asks", to_id=market,
          fields={"side": "yes", "taken": {"value": False, "note": "The stated event assessments give the probability."}})
     call("link", from_id="portfolio", relation="holds", to_id=market, fields={"side": "yes", "quantity": 20})
     call("note", text="The developments and payment are read as one state.", about_ids=[a, b, joint])
-    for e in (a, b, joint, "portfolio"):
+    for e in (a, b, joint, both, "portfolio"):
         call("get", id=e)
     considering = {"market": market, "side": "yes", "quantity": 100}
     found = call("ledger", together=[a, b], considering=considering)["together"]
     assert "why" not in found and len(found["worlds"]) == 6
-    overridden = [v for v in found["worlds"] if v["outcomes"][a] in (severe, mild) and v["outcomes"][b] == "yes"]
-    assert len(overridden) == 2 and all(isinstance(v["by"], dict) for v in overridden)
+    overridden = [v for v in found["worlds"]
+                  if named_by(v["id"])[a] in (severe, mild) and named_by(v["id"])[b] == "yes"]
+    assert len(overridden) == 2 and all(any("link" in x for x in v["set"].values()) for v in overridden)
     assert found["considering"]["cost"] == pytest.approx(14)
     assert found["distribution"]["variance"]["total"] > 0
     call("check")
@@ -527,3 +579,83 @@ def test_a_fund_no_event_states_moves_by_its_response_alone_when_dependent_event
     for e in got["events_read"]:
         for side in ("yes", "no", "full_impact"):
             assert e["together"][side] == pytest.approx(e["alone"][side], abs=1e-6)
+
+
+def covered_call(path):
+    """A store holding $1,000 of a fund that holds a company, AAA, and has written a call on it expiring 2027-01-15,
+    with the Treasury's curve on the option's quote day; and its market factor."""
+    from rows_fixture import cash, holding as equity
+    from test_name_window import with_history
+    from test_value_and_exposure import store_with
+    option = {"net_assets": 100, "market_value": -5, "report_date": "2026-11-03", "exposure": -.5,
+              "kind": "derivative", "payoff": {"option": {
+                  "right": "call", "style": "european", "side": "written", "strike": 100,
+                  "expiry": "2027-01-15", "contracts": 1, "underlying_per_contract": 1,
+                  "value": -5, "symbol": "O:AAA270115C00100000"}},
+              "quote": {"underlying": "AAA", "price": 5, "underlying_price": 100,
+                        "at": "2026-11-03T21:00:00+00:00", "delta": .5},
+              "to": {"company": {"constituent_ticker": "AAA"}}}
+    path.mkdir()
+    store = store_with(path, {"FUND": [option, equity("AAA", 1.0), cash(.05)]},
+                       [{"ticker": "FUND", "dollars": 1000}], {"FUND": "ETF", "AAA": "CS"})
+    with_history(store)  # the option's underlying, read to its quote's day
+    for year, rows_ in ((2025, []), (2026, [{"date": d, "curve": [[.5, .04], [1, .04]]} for d in ("2026-11-03", "2026-11-04")]), (2027, [])):
+        store.put_data("yield_curve", str(year), {"results": rows_}, {"url": "test"},
+                       retrieved_at="2026-11-04T15:00:00+00:00", range=("2026-11-01", "2026-11-04"))
+    return store, next(c["id"] for c in store.query("Factor") if c["stated"]["proxy"] == "SPY")
+
+
+def test_a_funds_contract_expiring_before_a_way_decided_after_its_event_is_replaced_by_then(tmp_path):
+    """MATH.md 1.1, 1.6: an event's date is the date by which all its outcomes are known. A way decided after the event
+    moves it, and a contract a fund holds that expires between the event's own date and its way's is replaced by then:
+    the event values the fund by its contracts while its outcomes are all known by their expiry, and by its response
+    once a way is decided after it."""
+    from breakdown import stated
+    store, spy = covered_call(tmp_path / "store")
+
+    def prop(title, end, **more):
+        return store.add("Proposition", {"title": title, "text": f"{title} happens", "comparison": "occurs",
+                                         "kind": "hitting", "window_end": end, **more})["id"]
+    e = prop("Approved", "2026-12-15", chances=[stated(.4)], baseline="no")
+    store.link("portfolio", "watches", e)
+    store.link(e, "consequence", spy, {"shock": stated(.15)})
+    books = lambda: store.engine.value("impact", e).output["valuation_terms"]["options"]  # noqa: E731
+    assert "name:FUND" in books()  # the call, expiring 2027-01-15, outlives the event's date
+    for title, end, weight in (("Approved, and it closes", "2027-02-15", .6), ("Approved, and it lapses", "2026-12-15", .4)):
+        way = prop(title, end)
+        store.link(e, "way", way, {"side": "yes"})
+        store.edit(way, "chances", [{"given": [e], **stated(weight)}])
+    assert store.engine.value("distribution", e).output["drawn_on"] == "2027-02-15"
+    assert "name:FUND" not in books()  # replaced by the date its outcomes are all known
+    store.close()
+
+
+def test_a_funds_contract_expiring_before_the_views_date_is_replaced_whichever_event_was_made_first(tmp_path):
+    """MATH.md 1.6, 1.9: events read together are drawn on the latest of their dates, when every joint world is known, and
+    a contract a fund holds that expires before that date is replaced by then, so the fund moves by its response in
+    every joint world. Each event alone values the fund by its contracts where they outlive its own date. So the view is
+    one, whichever event was made first, where it took the first-made event's contracts."""
+    from breakdown import stated
+    dates, chances, shocks = {"Soon": "2026-12-15", "Late": "2027-02-15"}, {"Soon": .4, "Late": .3}, \
+        {"Soon": .15, "Late": -.2}
+    views = []
+    for first, then in (("Soon", "Late"), ("Late", "Soon")):
+        store, spy = covered_call(tmp_path / first)
+        made = {}
+        for title in (first, then):
+            e = store.add("Proposition", {"title": title, "text": f"{title} happens", "comparison": "occurs",
+                                          "kind": "hitting", "window_end": dates[title],
+                                          "chances": [stated(chances[title])], "baseline": "no"})["id"]
+            store.link("portfolio", "watches", e)
+            store.link(e, "consequence", spy, {"shock": stated(shocks[title])})
+            made[title] = e
+        books = {t: store.engine.value("impact", e).output["valuation_terms"]["options"] for t, e in made.items()}
+        assert "name:FUND" in books["Soon"] and "name:FUND" not in books["Late"]  # each event on its own date
+        view = ledger(store, [made["Soon"], made["Late"]])["together"]
+        assert view["distribution"]["drawn_on"] == "2027-02-15"
+        views.append({(w["outcomes"][made["Soon"]], w["outcomes"][made["Late"]]): w["A"] for w in view["worlds"]})
+        store.close()
+    soon_first, late_first = views
+    assert soon_first.keys() == late_first.keys() and len(soon_first) == 4
+    for k in soon_first:
+        assert soon_first[k] == pytest.approx(late_first[k], rel=1e-9, abs=1e-6)

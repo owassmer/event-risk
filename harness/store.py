@@ -62,17 +62,18 @@ from harness import credentials, schema, touches
 from harness.derive.engine import Engine, Registry, Unavailable, Waiting, canonical, text_hash
 from harness.derive.portfolio import pseudo, unpriced
 from harness.venues import NAMES as VENUE_NAMES
-from harness.venues.http import for_later
+from harness.venues.http import VenueRefused, for_later
 
 log = logging.getLogger("harness.store")
 
-SCHEMA_VERSION = "14"  # a store of another schema is not opened: its stated fields are not this schema's
+SCHEMA_VERSION = "15"  # a store of another schema is not opened: its stated fields are not this schema's
 # The schemas a store is brought from to this one on opening, each a step to the next (Store._converted): 12 stated
 # what an event does to a price as a percent of it; 13 stated a factor's move beyond the factors before it as a field of
-# its own, `own_part`, where 14 states it as a `shock` measured against what the factor follows. A store of any other
-# schema is not opened.
+# its own, `own_part`, where 14 states it as a `shock` measured against what the factor follows; 14's object table keeps
+# no joint world, which 15 keeps once a statement names it. A store of any other schema is not opened.
 PERCENT_SCHEMA = "12"
 OWN_PART_SCHEMA = "13"
+JOINT_SCHEMA = "14"
 STORE_FILE = "store.sqlite"
 TRACE_FILE = "trace.jsonl"
 
@@ -132,7 +133,7 @@ CREATE TABLE seq (prefix TEXT PRIMARY KEY, n INTEGER NOT NULL);
 
 CREATE TABLE object (
     id TEXT PRIMARY KEY,
-    type TEXT NOT NULL CHECK (type IN ('Portfolio', 'Proposition', 'Metric', 'Factor', 'Note')),
+    type TEXT NOT NULL CHECK (type IN ('Portfolio', 'Proposition', 'Metric', 'Factor', 'Note', 'JointWorld')),
     stated TEXT NOT NULL CHECK (json_valid(stated)),
     stated_at TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(stated_at)),
     origin TEXT NOT NULL CHECK (origin IN ('initial', 'analyst')),
@@ -416,7 +417,7 @@ def store_dir(name: str, root: str | Path = "stores") -> Path:
     return Path(root) / name
 
 
-MUTABLE_OBJECT_TYPES = ("Portfolio", "Proposition", "Metric", "Factor", "Note")
+MUTABLE_OBJECT_TYPES = ("Portfolio", "Proposition", "Metric", "Factor", "Note", "JointWorld")
 # Requests side by side when the store fetches many series at once. Massive allows a paid plan's asset class any
 # number of requests and its free tier five a minute, and its client waits out a 429 either way
 # (https://massive.com/knowledge-base/article/what-is-the-request-limit-for-massives-restful-apis).
@@ -437,9 +438,9 @@ AHEAD_WORKERS = 16
 AHEAD_KINDS = frozenset(("ticker_ref", "ticker_on", "ticker_events", "listings", "company_listings", "cusip_listing",
                          "bars", "dividends", "splits", "constituents", "holdings_history", "holdings_processed", "nport", "home", "hourly", "rates", "figi",
                          "figi_cusip", "figi_ticker", "figi_class", "figi_listing", "figi_isin", "isin_listings",
-                         "figi_index",
+                         "figi_index", "lei", "ticker_isin",
                          "sec_tickers", "sec_funds", "bills",
-                         "money_market", "ncen", "listing_sector", "listing_symbol", "profile", "tracker", "closed_at", "pair", "yield_curve", "news", "option_at",
+                         "money_market", "ncen", "equity", "listing_symbol", "profile", "tracker", "closed_at", "pair", "yield_curve", "news", "option_at",
                          "option_contract",
                          "minutes", "option_listings"))
 # What says which Names exist and which funds reach them: the look-through's products. The betas give the same Names
@@ -475,8 +476,9 @@ DATA_WORDS = {"ticker_ref": "the reference for {}", "listings": "the US listings
               "pair": "whether Coinbase Exchange lists the pair {}",
               "yield_curve": "the Treasury's par yield curve over {}",
               "venue_rate": "the rate {} pays on a position, from its page",
-              "ncen": "the Form N-CEN census of {}",
-              "listing_sector": "the sector and industry of the listing {}",
+              "ncen": "the Form N-CEN census of {}", "lei": "the legal entity GLEIF names the issuer of {}",
+              "ticker_isin": "the ISIN the funds' holdings give the US listing {}",
+              "equity": "FinanceDatabase's record of {}",
               "listing_symbol": "the symbol of the listing {}", "profile": "the company profile of {}",
               "company_record": "the results and ratings of {}", "sec_filings": "the SEC filings of CIK {}",
               "sec_document": "the SEC filing {}", "bills": "the Treasury's record of the bills it has sold",
@@ -521,12 +523,18 @@ def _absent(oid) -> str:
     return f"{oid} is not in the store"
 
 class StoreError(Exception):
-    """A call the store refuses. It wrote nothing."""
+    """A call the store refuses. It wrote nothing. Where what it lacks is a part the analyst can state, `wants` names
+    it, `("field", id, field)` or `("link", id, relation, other)`; where it repeats a link one already states,
+    `("once", that link)`; and `reason` is the refusal without its remedy: a statement of several parts
+    (harness.tools, a proposition stated whole) says that part as one of its own."""
 
-    def __init__(self, message: str, dependents: Iterable[str] = ()):
+    def __init__(self, message: str, dependents: Iterable[str] = (), *, wants: tuple | None = None,
+                 reason: str | None = None):
         super().__init__(message)
         self.message = message
         self.dependents = list(dependents)
+        self.wants = wants
+        self.reason = reason if reason is not None else message
 
     def as_dict(self) -> dict:
         return {"error": self.message, "dependents": self.dependents}
@@ -749,6 +757,7 @@ class Store:
         self._fetched: list[tuple[str, tuple]] = []  # data read and Judgments answered inside the open transaction
         self._estimable: list[str | None] = []  # the open transaction's writes the channels' estimability is decided for
         self._shocked_names: list[str] = []  # the names the open transaction's consequences run to, each to have a price
+        self._windowed: list[str] = []  # the open transaction's consequences whose shocks are sized from past windows
         self._answers: dict[str, dict] = {}  # each reading's status and currency, by its id: fetched data never changes
         # each name's answer with the keys it read, until the store next changes (stamp) or a write rolls back
         self._unpriced_at: tuple[tuple[int, int], dict[str, tuple[bool, tuple[str, ...]]]] = ((-1, -1), {})
@@ -789,7 +798,8 @@ class Store:
             store._set_meta("created_at", _now())
         store._watch()
         store._reserve_ids()  # after _watch: its commit is the store's own, and no version
-        store.trace_path.touch()
+        if not store.trace_path.exists():  # its trace, made where there is none; a trace it shares is its conversation's
+            store.trace_path.touch()
         if initial is not None:
             try:
                 store.load_initial(initial)
@@ -811,7 +821,7 @@ class Store:
             store.close()
             raise StoreError(f"{d} holds no store: its {STORE_FILE} has none of a store's tables")
         version = store.meta("schema_version")
-        if version in (PERCENT_SCHEMA, OWN_PART_SCHEMA):
+        if version in (PERCENT_SCHEMA, OWN_PART_SCHEMA, JOINT_SCHEMA):
             try:
                 store._converted(version)
             except BaseException:
@@ -833,6 +843,34 @@ class Store:
         store._reserve_ids()  # after _watch: its commit is the store's own, and no version
         return store
 
+    def _declare_joint_worlds(self) -> None:
+        """14 to 15: the object table's declaration takes JointWorld beside the types it held. A CHECK that only loosens
+        changes no stored row, so the declaration is edited in place, inside the conversion's transaction, as SQLite
+        documents for a change that leaves the on-disk content as it is (https://www.sqlite.org/lang_altertable.html,
+        "Making Other Kinds Of Table Schema Changes"): the schema version read, schema editing on, the table's text
+        rewritten, the schema version one higher, schema editing off, and the integrity checked; a store that is not
+        then whole is not opened."""
+        old = "CHECK (type IN ('Portfolio', 'Proposition', 'Metric', 'Factor', 'Note'))"
+        new = "CHECK (type IN ('Portfolio', 'Proposition', 'Metric', 'Factor', 'Note', 'JointWorld'))"
+        sql = self.db.execute("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'object'").fetchone()[0]
+        if new in sql:
+            return
+        if sql.count(old) != 1:
+            raise StoreError(f"{self.dir} is a store of schema {JOINT_SCHEMA} whose object table is not declared as that "
+                             f"schema declares it, so it is not brought to schema {SCHEMA_VERSION}")
+        before = self.db.execute("PRAGMA schema_version").fetchone()[0]
+        self.db.execute("PRAGMA writable_schema = ON")
+        try:
+            self.db.execute("UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'object'",
+                            (sql.replace(old, new),))
+            self.db.execute(f"PRAGMA schema_version = {int(before) + 1}")
+        finally:
+            self.db.execute("PRAGMA writable_schema = OFF")
+        whole = self.db.execute("PRAGMA integrity_check").fetchone()[0]
+        if whole != "ok":
+            raise StoreError(f"{self.dir} is not whole after its object table took JointWorld ({whole}), so it is not "
+                             f"brought to schema {SCHEMA_VERSION}")
+
     def _converted(self, version: str) -> None:
         """A store of a schema before this one, brought to it once, on opening, a step at a time, in one transaction:
         - from 12, each shock and own part on a name or on a factor quoted as its proxy's price, and each worth's return
@@ -840,7 +878,8 @@ class Store:
           form every move the store returns takes; a figure on a factor quoted as the yield its proxy pays stays in
           points of that yield, which is fixed when the factor is added;
         - from 13, a factor's own part, `own_part`, becomes its `shock` measured against what it follows
-          (schema.FOLLOWS), the same figure with its basis: what it tells the store is the same (MATH.md 1.3).
+          (schema.FOLLOWS), the same figure with its basis: what it tells the store is the same (MATH.md 1.3);
+        - from 14, the object table's declaration takes JointWorld; no row changes (_declare_joint_worlds).
         Each step rewrites the links as they stand and each reverse the undo log holds, so that a rewind restores a
         figure in the terms the store now reads. Nothing else changes: when each figure was stated, its basis, and what
         the record and the trace keep as they were written. The conversion is no statement: it leaves nothing in the
@@ -890,7 +929,7 @@ class Store:
             out = {k: v for k, v in stated.items() if k != "own_part"}
             return {**out, "shock": {**stated["own_part"], schema.AGAINST: schema.FOLLOWS}}
 
-        steps = {PERCENT_SCHEMA: (OWN_PART_SCHEMA, fractions), OWN_PART_SCHEMA: (SCHEMA_VERSION, references)}
+        steps = {PERCENT_SCHEMA: (OWN_PART_SCHEMA, fractions), OWN_PART_SCHEMA: (JOINT_SCHEMA, references)}
         first = version
         with self.transaction():
             for t, name in scratch.items():
@@ -928,6 +967,9 @@ class Store:
                         self.db.execute("UPDATE undo SET statement = ? WHERE n = ?",
                                         (statement.replace(old, "'" + canonical(new).replace("'", "''") + "'"), n))
                     version = to
+                if version == JOINT_SCHEMA:
+                    self._declare_joint_worlds()
+                    version = SCHEMA_VERSION
                 self._set_meta("schema_version", SCHEMA_VERSION)
                 self._set_meta("schema_converted", json.dumps({"from": first, "to": SCHEMA_VERSION, "at": _now()}))
             finally:
@@ -1193,12 +1235,15 @@ class Store:
         self._fetched = []
         self._estimable = []
         self._shocked_names = []
+        self._windowed = []
         try:
             yield
             if self._estimable:  # decided at the commit, once the call's other reads are done (TOOLS.md 5)
                 self._check_estimable(next((c for c in self._estimable if c), None))
             if self._shocked_names:
                 self._check_named(self._shocked_names)
+            if self._windowed:
+                self._check_windows(self._windowed)
         except BaseException as e:
             self._depth = 0
             self._tx_answers, self._tx_kept = set(), set()  # what it wrote of the pending set stays pending
@@ -1431,6 +1476,8 @@ class Store:
             return "object" if self._object_row(oid) else None
         if schema.MARKET_ID_RE.match(oid):
             return "market" if self._market_kept(oid) else None
+        if schema.JOINT_ID_RE.match(oid):  # a joint world, kept while a statement names it
+            return "object" if self._object_row(oid) else None
         if schema.NAME_ID_RE.match(oid):
             return "name" if self._name_exists(oid) else None
         if schema.CASH_ID_RE.match(oid):  # cash in a currency, while the portfolio holds it
@@ -1962,23 +2009,30 @@ class Store:
                             range=got.get("range"))
         return self._data_row(did)
 
-    def missing(self, since: bool = False) -> list[str]:
-        """The reads this thread's call could not obtain, in the words of what each reads (reading_words), each once in
-        the order they failed: those that failed past their clients' retries. `since` starts the record anew for a
-        call."""
+    def missing(self, since: bool = False) -> list[dict]:
+        """The reads this thread's call could not obtain, each once in the order they first failed: those that failed
+        past their clients' retries, each `{what, seconds, refused}`, in the words of what it reads (reading_words),
+        the longest it was asked for, and whether every read of it was its source's refusal (VenueRefused). `since`
+        starts the record anew for a call."""
         if since:
             self._unread.names = []
             return []
-        return list(dict.fromkeys(getattr(self._unread, "names", None) or []))
+        out: dict[str, dict] = {}
+        for what, seconds, refused in getattr(self._unread, "names", None) or []:
+            got = out.setdefault(what, {"what": what, "seconds": seconds, "refused": refused})
+            got["seconds"], got["refused"] = max(got["seconds"], seconds), got["refused"] and refused
+        return list(out.values())
 
-    def _missed(self, what: str) -> None:
+    def _missed(self, what: str, seconds: float, refused: bool) -> None:
         names = getattr(self._unread, "names", None)
         if names is not None:
-            names.append(what)
+            names.append((what, seconds, refused))
 
     def _read(self, fetcher, subject: str, covering, what: str) -> dict:
         """One client's read, as the seam has it: its answer; a refusal or an absence where the source says the thing
-        does not exist; Waiting where it failed past its retries."""
+        does not exist; Waiting where it failed past its retries, with how long its source was asked and whether it
+        answered with a refusal."""
+        started = time.monotonic()
         try:
             return fetcher(subject, covering)
         except (Waiting, Unavailable, StoreError):
@@ -1988,7 +2042,8 @@ class Store:
                 raise StoreError(str(e.args[0]) if e.args else str(e)) from None
             raise Unavailable(f"{what}: {e}") from None
         except Exception as e:  # a read that failed past its client's retries: the value waits, and the cause is logged
-            self._missed(what)
+            seconds, refused = time.monotonic() - started, isinstance(e, VenueRefused)
+            self._missed(what, seconds, refused)
             raise Waiting(f"{what} could not be read: {e}") from e
 
     def fetch_data(self, kind: str, subject: str, *, covering: tuple[str, str] | None = None,
@@ -2955,11 +3010,15 @@ class Store:
             for sid in cites.values():
                 self._citable(sid)
             values = self._noted(oid, type_name, values, {}, call)
+            if type_name == "Proposition" and values.get("chances") is not None:  # none to take away yet
+                values["chances"] = self._merged_chances(oid, [], values["chances"])
             self._insert_object(oid, type_name, values, origin, call)
             for field, sid in cites.items():
                 self._cite(oid, field, sid, origin, call)
             if type_name == "Proposition":
                 self._check_priced_in(oid, values)
+                if values.get("priced_in") is not None or values.get("episode") is not None:
+                    self._check_band_world(oid)
                 self._check_follow(oid, values)
                 self._check_baseline(oid, values.get("baseline"))
                 self._cite_basis(oid, "Proposition", values, call)
@@ -3264,6 +3323,13 @@ class Store:
         source = self._prefetch_named([{"given": [from_id]}]) if relation == "implies" else {}  # a market at its source
         with self.transaction():
             self._enter_named(source, call)
+            if relation in ("consequence", "worth") and isinstance(from_id, str) and schema.JOINT_ID_RE.match(from_id):
+                from_id = self._keep_joint(from_id, call)
+            elif relation in ("consequence", "worth") and isinstance(from_id, str):
+                joint = self._stands_for_joint(from_id)
+                if joint is not None:
+                    raise StoreError(f"{from_id} stands for the joint world {joint}. State the {relation} on that joint "
+                                     f"world: link({joint}, {relation}, {to_id}, ...)")
             ft = self.type_of(from_id) if isinstance(from_id, str) else None
             if ft is None:
                 raise StoreError(_absent(from_id))
@@ -3283,8 +3349,9 @@ class Store:
                                                           [values["ticker"]] if relation == "holds" and tt != "Cash" else
                                                           [values.get("world", "")] if relation == "worth" else []))
             if existing:
-                raise StoreError(f"{existing['id']} links {from_id} {relation} {to_id}; edit it instead",
-                                 [existing["id"]])
+                reason = f"{existing['id']} already links {from_id} to {to_id} by {relation}"
+                raise StoreError(f"{reason}: edit it instead", [existing["id"]], wants=("once", existing["id"]),
+                                 reason=reason)
             if relation == "holds" and "weight" in values:
                 self._require_total()
             if relation == "holds" and tt == "Name":
@@ -3298,6 +3365,8 @@ class Store:
             if relation in ("consequence", "worth") and tt == "Name":
                 self._check_company_id(to_id)
                 self._check_not_proxy(to_id, relation)
+            if relation in ("consequence", "worth"):
+                self._check_band_world(from_id)
             if relation == "worth":
                 self._check_worth(from_id, to_id, values)
             if relation == "watches" and self._way_parent(to_id):
@@ -3314,11 +3383,13 @@ class Store:
                 self._cite_basis(lid, relation, values, call)
                 self._tie_notes(lid, relation, values, {}, call)
             if relation == "consequence":
-                self._check_shocked(from_id)
+                self._check_joint_shocked(from_id) if ft == "JointWorld" else self._check_shocked(from_id)
             if relation == "watches":
                 self._check_horizon()
             if relation == "consequence":
                 self._check_shocks(to_id)
+                if (values.get("shock") or {}).get(schema.WINDOWS):
+                    self._windowed.append(lid)
                 if tt == "Name":
                     self._shocked_names.append(to_id)
             if relation == "worth":
@@ -3481,6 +3552,8 @@ class Store:
         named = self._prefetch_named(value) if field == "chances" and self.type_of(id) == "Proposition" else {}
         with self.transaction():
             self._enter_named(named, call)
+            if isinstance(id, str) and schema.JOINT_ID_RE.match(id):
+                id = self._keep_joint(id, call)
             kind = self._kind(id)
             if kind == "object" and field == schema.DEFINITION_FIELD:
                 self._edit_definition(id, value, source_id)
@@ -3492,6 +3565,8 @@ class Store:
                 self._edit_dated(id, field, value, source_id)
             else:
                 raise StoreError(self._not_editable(id, kind))
+        if kind == "object" and self.type_of(id) is None:  # a joint world whose last statement this edit cleared
+            return {"id": id, "type": "JointWorld", "stated": {}, "released": [{"id": id, "type": "JointWorld"}]}
         return self.get(id, exclude_derived=("distribution",)) if derived else self.describe(id)
 
     def _not_editable(self, oid: str, kind: str | None) -> str:
@@ -3587,14 +3662,14 @@ class Store:
                 if source_id is None:
                     raise StoreError(f"{t.name}.{field} is a fact about the world; it takes a source_id")
                 self._citable(source_id)
-                new[field] = _check(t.name, f, value)
+                new[field] = _check(oid, f, value)
         else:
             if source_id is not None and f.kind in schema.BASED:
                 raise StoreError(f"{t.name}.{field} is a stated assumption, and its basis is stated in its value: "
                                  f"{schema.BASIS_SHAPE}")
             if source_id is not None:
                 raise StoreError(f"{t.name}.{field} is not a fact about the world; it takes no source")
-            v = _check(t.name, f, value)
+            v = _check(oid, f, value)
             if v is None and f.default is not None:
                 v = list(f.default) if isinstance(f.default, tuple) else f.default
             if v is None:
@@ -3614,12 +3689,14 @@ class Store:
                 raise
             raise StoreError(f"{e.message}; its definition's fields change together with edit({oid}, "
                              f"\"{schema.DEFINITION_FIELD}\", {{...}})", e.dependents) from None
-        if t.name == "Proposition" and field in ("chances", "episode"):
+        if t.name in ("Proposition", "JointWorld") and field in ("chances", "episode"):
             self._check_chances(oid, new)
         if t.name == "Proposition" and field == "baseline":
             self._check_baseline(oid, new.get("baseline"))
         if t.name == "Proposition" and field == "priced_in":
             self._check_priced_in(oid, new)
+        if t.name == "Proposition" and field in ("priced_in", "episode") and new.get(field) is not None:
+            self._check_band_world(oid)
         if t.name == "Proposition" and field == "chances":
             self._check_follow(oid, new)
         if t.name == "Factor" and field in ("name", "order", "proxy"):
@@ -3628,6 +3705,11 @@ class Store:
             self._refuse_weights_without_total()
         if f.kind in schema.BASED:
             new = self._noted(oid, t.name, new, stated, call)
+        if t.name == "Proposition" and field == "chances" and new.get(field) is not None:
+            # each chance given replaces the one given the same propositions, or is added (ONTOLOGY.md 2.1): read and noted
+            # above at the places it was written, so a refusal names the chance as it was given
+            merged = self._merged_chances(oid, stated.get(field) or [], new[field])
+            new = {**new, field: merged} if merged else {k: v for k, v in new.items() if k != field}
         self.db.execute("UPDATE object SET stated = ?, stated_at = ? WHERE id = ?",
                         (canonical(new), _stamped(row["stated_at"], new, _written(stated, new, field)), oid))
         if f.cited:
@@ -3650,6 +3732,8 @@ class Store:
             self._estimable.append(oid)
         if t.name == "Proposition" and field == "chances":  # a market no chance names any longer is not kept
             self._release(_chance_markets(stated) - _chance_markets(new))
+        if t.name == "JointWorld" and new.get("episode") is None:  # kept while a statement names it
+            self._release([oid])
 
     def _check_estimable(self, cid: str | None) -> None:
         """A channel, or the portfolio, is written only where the channels can still be estimated (TOOLS.md 5): the
@@ -3731,6 +3815,8 @@ class Store:
             self.db.execute("UPDATE link SET stated = ?, stated_at = ? WHERE id = ?", (canonical(new), at, lid))
         if r.name == "consequence":
             self._check_shocks(row["to_id"])
+            if (new.get("shock") or {}).get(schema.WINDOWS):
+                self._windowed.append(lid)
         if f.kind in schema.BASED:
             self._cite_basis(lid, r.name, new, call)
             self._tie_notes(lid, r.name, new, old, call)
@@ -3742,11 +3828,38 @@ class Store:
         reads, and nothing a note or a page's evidence adds."""
         return self.links_of(oid, schema.BREAKDOWN, "both")
 
+    @staticmethod
+    def _merged_chances(pid: str, old: list[dict], written: list[dict]) -> list[dict]:
+        """A proposition's chances with those written (ONTOLOGY.md 2.1): each takes the place of the chance given the same
+        propositions, which keeps its place in the list, or is added after the others, in the order written; one
+        written with its value null removes that chance. The store keeps one chance for each set of propositions
+        a chance is given (schema.condition)."""
+        out: list[dict | None] = list(old)
+        at = {schema.condition(c): i for i, c in enumerate(old)}
+        for i, c in enumerate(written):
+            k = schema.condition(c)
+            if schema.taken_away(c):
+                if k in at and out[at[k]] is not None:
+                    out[at[k]] = None
+                    continue
+                held = [f"one {schema.said(x['given'], x['given_not'])}" for x in old]  # as they stood before the call
+                said = schema.said(c["given"], c["given_not"])
+                raise StoreError(f"{pid}.chances[{i}] removes the chance of {pid} {said}"
+                                 + (f", and {pid} has none. Its chances: {'; '.join(held)}." if held else
+                                    f", and {pid} has no chances."), [pid])
+            if k in at:
+                out[at[k]] = c
+            else:
+                at[k] = len(out)
+                out.append(c)
+        return [c for c in out if c is not None]
+
     def _check_chances(self, pid: str, values: dict) -> None:
         """Each chance is given propositions in the store, other than the one it is the chance of (MATH.md 1.2)."""
         ep = (values.get("episode") or {}).get("value")
-        if ep and self.meta("asof") and ep["end"] > self.meta("asof"):
-            raise StoreError("an episode ends on or before the portfolio's as-of")
+        if ep and self.meta("asof") and ep["end"] > self.meta("asof"):  # refused by its dates, as every window is
+            from harness.derive.channels import past_window
+            raise StoreError(f"{pid}.episode: {past_window(ep['end'], self.meta('asof'))}", [pid])
         if ep and "episode_covariance" in self.engine.registry.versions() and self._kind("portfolio") is not None:
             from harness.derive.episode import subject
             found = self.engine.value("episode_covariance", subject(ep["start"], ep["end"]))
@@ -3771,8 +3884,9 @@ class Store:
 
     def _check_worth(self, pid: str, nid: str, values: dict, *, editing: str | None = None) -> None:
         """A value is on one outcome; its terms carry no inference about which outcome it describes."""
-        way = self._way_parent(pid) or self._joint_baselines(pid) or any(pid in self._ways_below(r["to_id"]) for r in self._all(
-            "SELECT to_id FROM link WHERE relation='watches' AND from_id='portfolio'"))
+        way = self._way_parent(pid) or schema.JOINT_ID_RE.match(pid) or bool(self._banded_by(pid)) or any(
+            pid in self._ways_below(r["to_id"]) for r in self._all(
+                "SELECT to_id FROM link WHERE relation='watches' AND from_id='portfolio'"))
         if not way and values.get("world") not in ("yes", "no"):
             raise StoreError("worth on an event names its world, yes or no; on a way the way is the world")
         if way and values.get("world") is not None:
@@ -3781,8 +3895,9 @@ class Store:
                               "AND coalesce(stated ->> '$.world', '')=? AND id<>?", pid, nid,
                               values.get("world", ""), editing or "")
         if duplicate:
-            raise StoreError(f"{duplicate['id']} already gives this holding's value in that world; edit it instead",
-                             [duplicate["id"]])
+            reason = f"{duplicate['id']} already gives this holding's value in that world"
+            raise StoreError(f"{reason}: edit it instead", [duplicate["id"]], wants=("once", duplicate["id"]),
+                             reason=reason)
         value = values["value"]["value"]
         asof = self.meta("asof")
         if "return" in value and asof and value["date"] >= asof:
@@ -4020,8 +4135,9 @@ class Store:
         return self._one("SELECT id, from_id, stated FROM link WHERE relation = 'way' AND to_id = ?", pid)
 
     def _event_of(self, pid: str) -> str:
-        """The event at the top of pid's tree of ways: pid itself where it is no way, or, for a ladder's band that is
-        a world of a watched level and no event itself, the first such level (structure.bands)."""
+        """The event pid is an outcome of: the event at the top of its tree of ways, pid itself where it is no way, or,
+        for a ladder's band that is no event itself, the first watched level whose side it is one of the bands of
+        (outcomes.event_of), so that the first statement on a band finds its event."""
         seen = {pid}
         while (up := self._way_parent(pid)) is not None and up["from_id"] not in seen:
             pid = up["from_id"]
@@ -4029,32 +4145,42 @@ class Store:
         if not self.watched(pid):
             held = self._banded_by(pid)
             if held:
-                return held[0]
+                return held[0][0]
         return pid
 
-    def _bands(self, pid: str, *, possible: bool = False) -> dict[str, list[str]]:
-        """The worlds a ladder's bands give pid, by side, where pid is a watched level (structure.bands); `possible`, the
-        bands that make each side up, whether or not anything is stated of them yet (structure.possible_bands)."""
+    def _sides(self, pid: str) -> dict[str, dict]:
+        """What makes up each side of an event (outcomes.sides): its linked ways, a ladder's bands, or nothing."""
         from harness.derive.engine import Inputs
-        from harness.derive.structure import bands, possible_bands
-        if not self.watched(pid) or "structure" not in self.engine.registry.versions():
-            return {}
-        return (possible_bands if possible else bands)(Inputs(self.engine), pid)
+        from harness.derive.outcomes import sides
+        if self.watched(pid) and "structure" in self.engine.registry.versions():
+            return sides(Inputs(self.engine), pid)
+        linked: dict[str, list[dict]] = {"yes": [], "no": []}
+        for r in self._all("SELECT id, to_id, stated ->> '$.side' AS side FROM link WHERE relation = 'way' AND "
+                           "from_id = ? ORDER BY rowid", pid):
+            if r["side"] in linked:
+                linked[r["side"]].append({"id": r["to_id"], "link": r["id"]})
+        return {s: {"by": "links" if ws else None, "ways": ws} for s, ws in linked.items()}
 
-    def _banded_by(self, pid: str) -> list[str]:
-        """The watched levels pid can be a world of as one of a ladder's bands: a statement on a band is checked against
-        its level's baseline before the side it lies on is its bands."""
+    def _banded_by(self, pid: str) -> list[tuple[str, str]]:
+        """Each watched level and side whose bands pid is one of (structure.possible_bands), whether or not that side is
+        its bands yet: a statement on a band is checked against its level's baseline, and against the ways its side is
+        made of, before the side it lies on is its bands."""
+        from harness.derive.engine import Inputs
+        from harness.derive.structure import possible_bands
+        if "structure" not in self.engine.registry.versions():
+            return []
         watched = [r["to_id"] for r in self._all("SELECT to_id FROM link WHERE relation = 'watches' ORDER BY rowid")]
-        return [e for e in watched if pid in {b for ids in self._bands(e, possible=True).values() for b in ids}]
+        return [(e, side) for e in watched for side, ids in possible_bands(Inputs(self.engine), e).items()
+                if pid in ids]
 
     def _ways_below(self, pid: str) -> list[str]:
-        """Every way under pid, at any depth, a ladder's bands among them where they are a watched level's worlds on
-        a side it links no way on."""
+        """Every outcome under pid, at any depth: an event's tree (outcomes.tree), its bands among them where a side is
+        made of them; a way's ways, by their links."""
+        if self.watched(pid) and "structure" in self.engine.registry.versions():
+            from harness.derive.engine import Inputs
+            from harness.derive.outcomes import tree
+            return [w["id"] for w in tree(Inputs(self.engine), pid, self._sides(pid))]
         out, todo = [], [pid]
-        sided = {r["side"] for r in self._all("SELECT stated ->> '$.side' AS side FROM link WHERE relation = 'way' AND "
-                                              "from_id = ?", pid)}
-        out += [b for side, ids in self._bands(pid).items() if side not in sided for b in ids]
-        todo += list(out)
         while todo:
             for r in self._all("SELECT to_id FROM link WHERE relation = 'way' AND from_id = ? ORDER BY rowid",
                                todo.pop()):
@@ -4062,6 +4188,17 @@ class Store:
                     out.append(r["to_id"])
                     todo.append(r["to_id"])
         return out
+
+    def _check_band_world(self, pid: str) -> None:
+        """What is stated of a band as of a way (a shock, a value, a weight, an episode, or that it is the baseline)
+        makes it a world of each watched level whose side it is one of the bands of, unless that side is made of other
+        ways the analyst linked (MATH.md 1.2): a side's ways are one set."""
+        for event, side in self._banded_by(pid):
+            made = self._sides(event)[side]
+            if made["by"] == "links":
+                ways = [w["id"] for w in made["ways"]]
+                raise StoreError(f"{pid} is no world of {event}: its {side.capitalize()} side is made up of "
+                                 f"{', '.join(ways)}", [w["link"] for w in made["ways"]])
 
     def _check_way(self, parent: str, way: str, values: dict) -> None:
         """A way has one parent, lies under no way of its own, and is no event the portfolio watches; it states its
@@ -4079,6 +4216,20 @@ class Store:
         if (self.stated_of(way) or {}).get("baseline") is not None:
             raise StoreError(f"{way} names a baseline, and a way's worlds are measured from its event's: clear it "
                              f"first", [f"{way}.baseline"])
+        side = values.get("side")
+        if side in ("yes", "no") and self.watched(parent):  # a side's ways are one set (MATH.md 1.1, 1.2)
+            made = self._sides(parent)[side]
+            possible = any(e == parent and s == side for e, s in self._banded_by(way))
+            if made["by"] == "bands" and way not in {w["id"] for w in made["ways"]}:
+                ways = [w["id"] for w in made["ways"]]
+                raise StoreError(f"{way} is not one of the bands that make up {parent}'s {side.capitalize()} side "
+                                 f"({', '.join(ways)}): a way of that side is one of its bands, and a way within a band "
+                                 f"is linked from it")
+            if made["by"] == "links" and possible:
+                ways = [w["id"] for w in made["ways"]]
+                raise StoreError(f"{parent}'s {side.capitalize()} side is made up of {', '.join(ways)}, and {way} is "
+                                 f"one of the bands its fields place on it: a side's ways are one set, its linked ways "
+                                 f"or its bands", [w["link"] for w in made["ways"]])
         sided = [r["id"] for r in self._all("SELECT id FROM link WHERE relation = 'way' AND from_id = ? AND "
                                             "stated ->> '$.side' IS NOT NULL ORDER BY rowid", way)]
         if sided:
@@ -4098,27 +4249,109 @@ class Store:
         its baseline, and a way that holds it states no shock."""
         event = self._event_of(pid)
         base = (self.stated_of(event) or {}).get("baseline")
-        if base is None and self._joint_baselines(pid):
-            return
         if base is None:
-            raise StoreError(f"a shock is stated against its event's baseline, and {event} names none: "
-                             f"edit({event}, baseline, ...) names it")
+            reason = f"a shock is stated against its event's baseline, and {event} states none"
+            raise StoreError(f"{reason}. State it with edit({event}, baseline, ...)", wants=("field", event, "baseline"),
+                             reason=reason)
         if pid != event and (base == pid or base in self._ways_below(pid)):
             raise StoreError(f"{pid} holds {event}'s baseline, {base}, and a shock says how another world stands "
                              f"against the baseline", [f"{event}.baseline"])
 
-    def _joint_baselines(self, pid: str, seen: frozenset[str] = frozenset()) -> bool:
-        """A conjunction's shock compares its joint world with its events' baselines together."""
-        if pid in seen:
-            return False
-        parts = self._all("SELECT to_id FROM link WHERE from_id=? AND relation IN ('and','then') ORDER BY rowid", pid)
+    def joint_name(self, oid: Any) -> Any:
+        """A joint world's id written with its events in the order they were made, the one name it is kept under (ONTOLOGY.md
+        2): a joint world names its events in any order. Any other id as given."""
+        if isinstance(oid, str) and schema.JOINT_ID_RE.match(oid):
+            from harness.derive.outcomes import joint_id, named_by
+            named = named_by(oid)
+            if len(named) == oid.count("|") + 1:  # an event named twice is no joint world: the id stays as given
+                return joint_id(named)
+        return oid
+
+    def unstated_joint(self, oid: Any) -> str | None:
+        """A joint world of watched events that nothing is stated of, by its id (MATH.md 1.9, ONTOLOGY.md 2): a thing whether or not
+        anything is stated of it, read with nothing stated and no links. None for any other id, or a joint world
+        something is stated of; an id that names no joint world is refused, saying why (outcomes.joint_world)."""
+        if not (isinstance(oid, str) and schema.JOINT_ID_RE.match(oid)) or self._object_row(self.joint_name(oid)):
+            return None
+        from harness.derive.engine import Inputs
+        from harness.derive.outcomes import joint_world
+        try:
+            return joint_world(Inputs(self.engine), oid)[0]
+        except ValueError as e:
+            raise StoreError(str(e)) from None
+
+    def _keep_joint(self, jid: str, call: int | None) -> str:
+        """A joint world a statement names (outcomes.joint_world), in its one order, kept from then on while a
+        statement names it; refused, saying why, where its id names no joint world of the events the portfolio
+        watches."""
+        from harness.derive.engine import Inputs
+        from harness.derive.outcomes import joint_world
+        try:
+            canonical, _ = joint_world(Inputs(self.engine), jid)
+        except ValueError as e:
+            raise StoreError(str(e)) from None
+        if self._object_row(canonical) is None:
+            self._insert_object(canonical, "JointWorld", {}, schema.ANALYST, call)
+        return canonical
+
+    def _check_joint_shocked(self, jid: str) -> None:
+        """A shock on a joint world is stated against the joint world in which each event it names is at its baseline,
+        and every other turns out as it does there (MATH.md 1.9): each event it names names its baseline, and the joint
+        world is not that one."""
+        from harness.derive.engine import Inputs
+        from harness.derive.outcomes import holds, named_by, sides, tree
+        named = named_by(jid)
+        for event in named:
+            if (self.stated_of(event) or {}).get("baseline") is None:  # as _check_shocked says it
+                reason = f"a shock is stated against its event's baseline, and {event} states none"
+                raise StoreError(f"{reason}. State it with edit({event}, baseline, ...)",
+                                 wants=("field", event, "baseline"), reason=reason)
+        ctx = Inputs(self.engine)
+        at_base = []
+        for event, outcome in named.items():
+            base = self.stated_of(event)["baseline"]
+            nodes = {w["id"]: {"parent": w["parent"]} for w in tree(ctx, event, sides(ctx, event))}
+            nodes.update({"yes": {"parent": None}, "no": {"parent": None}})
+            at_base.append(outcome == base or holds(nodes, outcome, base))
+        if all(at_base):
+            raise StoreError(f"A shock cannot be stated on {jid}: it includes the joint world the shock is measured "
+                             f"against, where each of its events is at its baseline. State it on a joint world that "
+                             f"excludes that one.")
+
+    def _stands_for_joint(self, pid: str) -> str | None:
+        """The joint world a proposition stands for (MATH.md 1.9, ONTOLOGY.md 2): a composite of outcomes of watched events that is no
+        outcome of a watched event itself, so that what it does is that joint world's, stated on its id. A composite
+        the portfolio watches, or a way of a watched event, is an outcome of its own event, and what it does is that
+        event's."""
+        if self.type_of(pid) != "Proposition" or self.watched(self._event_of(pid)):
+            return None
+        return self._composite_joint(pid)
+
+    def _composite_joint(self, pid: str, seen: frozenset[str] = frozenset()) -> str | None:
+        """The joint world an `and` composite of outcomes of events is, where it is one: each part an outcome of a
+        watched event, or itself such a composite, no two of one event. A `then` composite, where the second part
+        follows the first, lies within that joint world and is not it."""
+        from harness.derive.outcomes import joint_id
+        if pid in seen or self.type_of(pid) != "Proposition":
+            return None
+        parts = [r["to_id"] for r in self._all("SELECT to_id FROM link WHERE from_id = ? AND relation = 'and' "
+                                               "ORDER BY rowid", pid)]
         if len(parts) != 2:
-            return False
+            return None
+        named: dict[str, str] = {}
         for part in parts:
-            root = self._event_of(part["to_id"])
-            if (self.stated_of(root) or {}).get("baseline") is None and not self._joint_baselines(root, seen | {pid}):
-                return False
-        return True
+            inner = self._composite_joint(part, seen | {pid})
+            if inner is not None:
+                got = dict(x.split("=", 1) for x in inner.removeprefix("joint:").split("|"))
+            else:
+                event = self._event_of(part)
+                if not self.watched(event):
+                    return None
+                got = {event: "yes" if part == event else part}
+            if set(got) & set(named):
+                return None
+            named.update(got)
+        return joint_id(named)
 
     def _check_baseline(self, pid: str, base: str | None) -> None:
         """An event's baseline names one of its worlds: a side with no ways, yes or no, or a way with nothing under it,
@@ -4136,16 +4369,16 @@ class Store:
                                  f"{', '.join(shocks)}; remove them, or name another world", shocks)
             return
         if base in ("yes", "no"):
-            sided = [r["id"] for r in self._all("SELECT id FROM link WHERE relation = 'way' AND from_id = ? AND "
-                                                "stated ->> '$.side' = ? ORDER BY rowid", pid, base)] or \
-                self._bands(pid).get(base, [])
+            sided = [w["link"] or w["id"] for w in self._sides(pid)[base]["ways"]]
             if sided:
                 raise StoreError(f"{pid}'s {base} side has ways: the baseline is one world, a side left whole or a "
                                  f"way left whole", sided)
             return
-        if base not in tree and base not in {b for ids in self._bands(pid, possible=True).values() for b in ids}:
+        if base not in tree and not any(e == pid for e, _ in self._banded_by(base)):
             raise StoreError(f"{base} is not a way of {pid}: the baseline is one of {pid}'s worlds, yes or no for a "
                              f"side left whole, or a way left whole")
+        if base not in tree:  # a band named the baseline: its side is then its bands, unless other ways make it up
+            self._check_band_world(base)
         below = self._ways_below(base)
         if below:
             raise StoreError(f"{base} has ways of its own: the baseline is one world, a way left whole", below)
@@ -4175,21 +4408,26 @@ class Store:
             worlds = {pid, *self._ways_below(pid)}
             if not any(r["from_id"] in worlds for r in self._all(
                     "SELECT from_id FROM link WHERE relation='worth' AND to_id=?", mid)):
-                raise StoreError(f"a chance follows {mid}'s price through its values in the event's worlds; "
-                                 "state those values with worth first")
+                reason = f"a chance that follows {mid} reads the weight its price implies from its values in the " \
+                         f"worlds of {pid}, and none is stated"
+                raise StoreError(f"{reason}. State them with link({pid}, worth, {mid}, ...)",
+                                 wants=("link", pid, "worth", mid),
+                                 reason=reason)
             return
         if mid and not self._one("SELECT id FROM link WHERE relation = 'asks' AND from_id = ? AND to_id = ?",
                                  pid, mid):
-            raise StoreError(f"a chance follows a market that asks {pid}, and {mid} is not linked to it: "
-                             f"link({pid}, asks, {mid}) first")
+            reason = f"a chance follows a market that asks {pid}, and {mid} is not linked to it"
+            raise StoreError(f"{reason}. Link it with link({pid}, asks, {mid})", wants=("link", pid, "asks", mid),
+                             reason=reason)
 
     def _check_priced_in(self, pid: str, values: dict) -> None:
         """A weight read from a market is that of a market that asks the proposition (MATH.md 1.5)."""
         mid = schema.weight_market(values.get("priced_in"))
         if mid and not self._one("SELECT id FROM link WHERE relation = 'asks' AND from_id = ? AND to_id = ?",
                                  pid, mid):
-            raise StoreError(f"priced_in reads the probability of a market that asks {pid}, and {mid} is not "
-                             f"linked to it: link({pid}, asks, {mid}) first")
+            reason = f"priced_in reads the probability of a market that asks {pid}, and {mid} is not linked to it"
+            raise StoreError(f"{reason}. Link it with link({pid}, asks, {mid})", wants=("link", pid, "asks", mid),
+                             reason=reason)
 
     def _check_shocks(self, target: str) -> None:
         """A shock is a fraction of the price at the place it is measured from, and a price is never below zero: no
@@ -4204,6 +4442,19 @@ class Store:
         if below:
             raise StoreError(f"a shock on {target} is a fraction of its price at the place it is measured from, and no "
                              f"price is below zero: {', '.join(below)} would put it there; -1 is worth nothing", below)
+
+    def _check_windows(self, lids: list[str]) -> None:
+        """Each past window a shock is sized from (ONTOLOGY.md 2, MATH.md 3.2) ends on or before the as-of, and the price has a move
+        over it: the derivation that measures it decides (impact.SHOCK_WINDOWS), read at the write's commit once the
+        call's other reads are done, and a window it cannot measure is refused with why, as an episode is."""
+        if "shock_windows" not in self.engine.registry.versions() or self._kind("portfolio") is None:
+            return
+        for lid in dict.fromkeys(lids):
+            if self._kind(lid) != "link" or not ((self.stated_of(lid) or {}).get("shock") or {}).get(schema.WINDOWS):
+                continue
+            found = self.engine.value("shock_windows", lid)
+            if found.refused is not None:
+                raise StoreError(found.cause, list(found.refused))
 
     def _check_valued_once(self, pid: str) -> None:
         """A holding an event values by what it is worth in its worlds is not also moved by a shock there (MATH.md 1.6,
@@ -4307,6 +4558,7 @@ class Store:
         """Remove an object or link the analyst created or received as initial contents,
         with its links; refuse what is derived, a market, and what would strand a stated
         fact or reference, or a chance the propositions it is given, naming it. Returns the record of what went."""
+        id = self.joint_name(id)
         with self.transaction(), self._keeping_baselines():
             kind = self._kind(id)
             if kind == "object":
@@ -4390,20 +4642,20 @@ class Store:
                          if c.get("follow") == row["to_id"]]
             if following:
                 raise StoreError(f"{row['from_id']}'s chance follows {row['to_id']} through {lid}: restate the chance "
-                                 f"first", [f"{row['from_id']}.chances[{i}]" for i in following])
+                                 f"first", [self._said_of(f"{row['from_id']}.chances[{i}]") for i in following])
         if row["relation"] == "worth":
             resting = []
             for prop in self._all("SELECT id, stated FROM object WHERE type='Proposition'"):
                 if row["from_id"] not in {prop["id"], *self._ways_below(prop["id"])}:
                     continue
-                resting += [f"{prop['id']}.chances[{i}]"
+                resting += [self._said_of(f"{prop['id']}.chances[{i}]")
                             for i, c in enumerate(json.loads(prop["stated"]).get("chances") or [])
                             if c.get("follow") == row["to_id"]]
             if resting:
                 raise StoreError(f"{', '.join(resting)} follows {row['to_id']}'s price through its world values: "
                                  "restate the chance before removing a value", resting)
         if row["relation"] == "about":
-            resting = [r for r in self._resting_on(row["from_id"]) if r.startswith(f"{row['to_id']}.")]
+            resting = [self._said_of(r) for r in self._resting_on(row["from_id"]) if r.startswith(f"{row['to_id']}.")]
             if resting:
                 raise StoreError(f"{row['from_id']} is the basis of {', '.join(resting)}, and stays a note about "
                                  f"{row['to_id']} while it is: restate {'them' if len(resting) > 1 else 'it'} with "
@@ -4421,6 +4673,16 @@ class Store:
         gone = self._drop_notes(named)
         return {"notes": gone} if gone else {}
 
+    def _said_of(self, key: str) -> str:
+        """A stated field a refusal names, as the analyst knows it: a chance by its proposition and what it is given
+        (ONTOLOGY.md 2.1), never its place in the list; any other field by its owner and its name."""
+        m = re.fullmatch(r"(.+)\.chances\[(\d+)\]", key)
+        held = (self.stated_of(m[1]) or {}).get("chances") or [] if m else []
+        if not m or int(m[2]) >= len(held):
+            return key
+        c = held[int(m[2])]
+        return f"the chance of {m[1]} {schema.said(c['given'], c['given_not'])}"
+
     def _references_to(self, oid: str) -> list[str]:
         if self._kind(oid) == "object" and self._object_row(oid)["type"] == "Note":
             return self._resting_on(oid)
@@ -4437,7 +4699,7 @@ class Store:
 
     def _remove_object(self, oid: str) -> dict:
         row = self._object_row(oid)
-        refs = self._references_to(oid)
+        refs = [self._said_of(r) for r in self._references_to(oid)]
         if refs and row["type"] == "Note":
             raise StoreError(f"{oid} is the basis of {', '.join(refs)}: restate {'them' if len(refs) > 1 else 'it'} "
                              f"with another basis, or remove {'them' if len(refs) > 1 else 'it'}, first", refs)
@@ -4482,7 +4744,12 @@ class Store:
         held under its id and citable."""
         released: list[dict] = []
         for x in sorted(i for i in ids if isinstance(i, str)):
-            if schema.MARKET_ID_RE.match(x) and self._market_kept(x):  # kept while a link or a chance names it
+            if schema.JOINT_ID_RE.match(x) and self._object_row(x) is not None:  # kept while a statement names it
+                if self._one("SELECT 1 FROM link WHERE from_id = ? LIMIT 1", x) is None and \
+                        (self.stated_of(x) or {}).get("episode") is None:
+                    self.db.execute("DELETE FROM object WHERE id = ?", (x,))
+                    released.append({"id": x, "type": "JointWorld"})
+            elif schema.MARKET_ID_RE.match(x) and self._market_kept(x):  # kept while a link or a chance names it
                 if self._one("SELECT 1 FROM link WHERE to_id = ? OR from_id = ? LIMIT 1", x, x) is None \
                         and not self.given_by(x):
                     self.db.execute("DELETE FROM market WHERE id = ?", (x,))
@@ -4507,6 +4774,7 @@ class Store:
     def get(self, id: str, text: str | None = None, *, derived_fields=None, exclude_derived=()) -> dict:
         """The object or link with its stated fields, derived fields (each with its basis),
         and links; a page, given text, as the passages that contain it (`find`)."""
+        id = self.joint_name(id)
         kind = self._kind(id)
         if kind is None:
             raise StoreError(_absent(id))
@@ -4788,7 +5056,10 @@ class Store:
         return out
 
     def neighbors(self, id: str, relation: str | None = None, direction: str = "both") -> list[dict]:
-        """The objects linked to an id, by relation and direction."""
+        """The objects linked to an id, by relation and direction; a joint world nothing is stated of has none."""
+        if self.unstated_joint(id) is not None:
+            return []
+        id = self.joint_name(id)
         if self._kind(id) is None:
             raise StoreError(f"{id} is not in the store")
         if direction not in ("out", "in", "both"):

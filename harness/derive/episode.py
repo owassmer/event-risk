@@ -7,11 +7,10 @@ covariance is not substituted for the ordinary variation around a world.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
-
 import numpy as np
 
 from harness.derive import estimate, history, series
+from harness.derive.channels import window_reach
 from harness.derive.engine import Derivation, Inputs, Refused, Unavailable
 from harness.derive.portfolio import closes, dividend_inputs
 
@@ -22,9 +21,8 @@ def subject(start: str, end: str) -> str:
 
 def _inputs(ctx: Inputs, key: str) -> dict:
     _, start, end = key.split(":")
-    # The last close before the episode is needed for its first completed return.
-    begin = (date.fromisoformat(start) - timedelta(days=14)).isoformat()
-    window = (begin, end)
+    # its last close on or before its start, which its first completed return runs from, as every window's (3.2)
+    window = (window_reach(start), end)
     channels = history.ordered_channels(ctx)
     if not channels:
         raise Unavailable("a past episode needs the factors whose co-movement it supplies")

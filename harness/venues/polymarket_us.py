@@ -36,7 +36,10 @@ events with their markets. Books: `GET /markets/{slug}/book` (https://docs.polym
 the YES instrument; `stats` carries the last trade, `lastTradePx` and `lastTradeSetTime`, in YES terms. One market to a
 request: the venue has no batch read of books. Its edge answers httpx's default User-Agent with 429 (`Retry-After: 10`)
 after five book reads in a row; named as this client (harness.venues.markets.USER_AGENT), the reads go at Synpath's
-pace, within the documented 25 a second (https://docs.polymarket.us/api-reference/rate-limits).
+pace, within the documented 25 a second for the API, per source IP, across its endpoints
+(https://docs.polymarket.us/api-reference/rate-limits). A market's books are read BOOK_READS at a time, so a search's
+hundred-odd books arrive at that pace and not one round trip after another: Synpath's limiter (su.LIMITER), one bucket
+for the process, sets when each read starts, whatever reads at once.
 
 History: `GET /price-history?symbol={slug}&fixedInterval=INTERVAL_ALL&fidelity=1440`
 (https://docs.polymarket.us/api-reference/price-history/get-price-history), `{history: [{timestamp, longPrice,
@@ -53,6 +56,7 @@ the store keeps says how the market settled, as Kalshi's and Polymarket's record
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -68,6 +72,7 @@ EVENT_FIELDS = ("id", "slug", "title", "category", "endDate", "seriesSlug")  # w
 OPEN = ("MARKET_STATUS_OPEN",)
 FINAL = ("MARKET_STATUS_RESOLVED", "MARKET_STATUS_SETTLED")
 SEARCH_PAGE = 20  # the events one search page holds when a market's event is looked for
+BOOK_READS = 8  # books read at once; Synpath's limiter sets the pace they start at
 PAID = {"url": "https://docs.polymarket.us/incentives/overview", "label": None, "paid": None}  # nothing on a position
 
 
@@ -175,16 +180,26 @@ def last_trade(payload: dict, record: dict) -> dict | None:
             if moment else when}
 
 
+def began(market: dict) -> str | None:
+    """The New York day a market began: its start date, `startDate` ("Market start date"), or, where it states none,
+    the day it was created, `createdAt` ("Creation timestamp"), both nullable
+    (https://docs.polymarket.us/api-reference/markets/get-market-by-id). Read live (Nov 16, 2026): both on 964 of 964
+    markets of ten searches with closed events, within an hour of each other, and each market's price history beginning
+    within a day of its start."""
+    return ny_date(market.get("startDate")) or ny_date(market.get("createdAt"))
+
+
 def is_open(record: dict, asof: str | None, past: bool) -> bool | None:
     """Whether the market trades on the as-of date: its status on a record read that day; for a past as-of, whether
-    it had started by then and had not yet ended."""
+    it had begun by then (`began`) and had not yet ended. A market that states no beginning is not established as open
+    on any past day."""
     m = record.get("market") or {}
     if not past:
         return m["status"] in OPEN if m.get("status") else None
     if asof is None:
         return None
-    started, ended = ny_date(m.get("startDate")), ny_date(m.get("endDate"))
-    return (started is None or started <= asof) and (ended is None or ended >= asof)
+    started, ended = began(m), ny_date(m.get("endDate"))
+    return started is not None and started <= asof and (ended is None or ended >= asof)
 
 
 def settlement(market: dict) -> dict:
@@ -212,6 +227,12 @@ def daily(payload: dict) -> dict[str, float]:
             continue
         out[datetime.fromtimestamp(p["timestamp"] - 1, NY).date().isoformat()] = ((1.0 - short) + ask) / 2
     return out
+
+
+def midpoints(payload: dict) -> list[tuple[str, float]]:
+    """None: its history keeps each day's closing quotes (daily_quotes), whose midpoint is the price where both sides
+    quote, and no midpoint apart from them."""
+    return []
 
 
 def daily_quotes(payload: dict) -> dict[str, dict]:
@@ -348,13 +369,18 @@ class PolymarketUS:
         return {"series": found, "title": found.get("title"), "families": families}
 
     def books(self, records: dict[str, dict], *, last: bool = True) -> dict[str, dict]:
-        """Each market's book with its last trade, by market id, a market to a request."""
-        out: dict[str, dict] = {}
-        for mid, r in records.items():
-            slug = (r.get("market") or {}).get("slug")
-            if slug:
-                out[mid] = self._get(f"book of {slug}", f"/markets/{slug}/book")
-        return out
+        """Each market's book with its last trade, by market id in the order of `records`, a market to a request and
+        BOOK_READS requests at once. A book that cannot be read fails the call, as the first in that order to fail would
+        one at a time, and the reads not yet begun are not made."""
+        wanted = [(mid, slug) for mid, r in records.items() if (slug := (r.get("market") or {}).get("slug"))]
+        if not wanted:
+            return {}
+        pool = ThreadPoolExecutor(max_workers=min(BOOK_READS, len(wanted)), thread_name_prefix="polymarket-us-book")
+        try:
+            reads = [pool.submit(self._get, f"book of {slug}", f"/markets/{slug}/book") for _, slug in wanted]
+            return {mid: read.result() for (mid, _), read in zip(wanted, reads)}
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def book(self, record: dict) -> dict:
         slug = (record.get("market") or {}).get("slug")

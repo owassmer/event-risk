@@ -242,16 +242,25 @@ def last_trade(payload: dict, record: dict) -> dict | None:
     return {"price": price, "time": t.get("created_time")} if price is not None and t.get("created_time") else None
 
 
+def began(market: dict) -> str | None:
+    """The New York day a market began: the day its trading opened, `open_time`, or, where it states none, the day it
+    was created, `created_time`, before which it could not trade. Every market states both
+    (https://docs.kalshi.com/api-reference/market/get-market: both required), and its opening is never before its
+    creation (read on the 26 markets the stores keep: opened 0 to 9 days after it was created)."""
+    return ny_date(market.get("open_time")) or ny_date(market.get("created_time"))
+
+
 def is_open(record: dict, asof: str | None, past: bool) -> bool | None:
     """Whether the market trades on the as-of date: its status on a record read that day; for a past as-of, whether
-    it had opened by then and its close time had not passed."""
+    it had begun by then (`began`) and its close time had not passed. A market that states no beginning is not
+    established as open on any past day."""
     m = record.get("market") or {}
     if not past:
         return m["status"] in OPEN if m.get("status") else None
     if asof is None:
         return None
-    opened, closed = ny_date(m.get("open_time")), ny_date(m.get("close_time"))
-    return (opened is None or opened <= asof) and (closed is None or closed >= asof)
+    opened, closed = began(m), ny_date(m.get("close_time"))
+    return opened is not None and opened <= asof and (closed is None or closed >= asof)
 
 
 def settlement(market: dict) -> dict:
@@ -281,6 +290,12 @@ def daily(payload: dict) -> dict[str, float]:
         day = datetime.fromtimestamp(c["end_period_ts"] - 1, NY).date().isoformat()
         out[day] = (float(bid) + float(ask)) / 2
     return out
+
+
+def midpoints(payload: dict) -> list[tuple[str, float]]:
+    """None: its history keeps each day's closing quotes (daily_quotes), whose midpoint is the price where both sides
+    quote, and no midpoint apart from them."""
+    return []
 
 
 def daily_quotes(payload: dict) -> dict[str, dict]:

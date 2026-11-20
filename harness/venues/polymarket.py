@@ -203,18 +203,31 @@ def last_trade(payload: dict, record: dict) -> dict | None:
     return {"price": price if str(t.get("token_id")) == token else round(1.0 - price, 6), "time": when}
 
 
+def began(market: dict) -> str | None:
+    """The New York day a market began: the day its trading started, `startDate`, or, where it states none, the day it
+    was created, `createdAt`, before which it could not trade. The documentation gives both as nullable and says neither
+    what it is (https://docs.polymarket.com/api-reference/markets/get-market-by-id). Read live (Nov 16, 2026): on 332
+    markets of six searches with closed events, `createdAt` on all and `startDate` on 330, one of the two without it
+    created in August 2026 and the other in June 2022; `startDate` never before `createdAt`, and where it is days
+    after it (up to 122), `acceptingOrdersTimestamp` and the price history's first point fall on `startDate`; and no
+    market's history begins before its `createdAt` by more than its history's grain. `acceptingOrdersTimestamp`, the
+    moment its book first took orders, is missing on a quarter of them."""
+    return ny_date(market.get("startDate")) or ny_date(market.get("createdAt"))
+
+
 def is_open(record: dict, asof: str | None, past: bool) -> bool | None:
     """Whether the market trades on the as-of date: `closed` on a record read that day; for a past as-of, whether it
-    had started by then and had not yet closed (closedTime, else its end date)."""
+    had begun by then (`began`) and had not yet closed (closedTime, else its end date). A market that states no
+    beginning is not established as open on any past day."""
     m = record.get("market") or {}
     if not past:
         return (not m["closed"]) if isinstance(m.get("closed"), bool) else None
-    started = ny_date(m.get("startDate"))
+    started = began(m)
     ended = (ny_date(m.get("closedTime")) if m.get("closed") else None) or \
         ny_date(m.get("endDate") or (record.get("event") or {}).get("endDate"))
     if asof is None:
         return None
-    return (started is None or started <= asof) and (ended is None or ended >= asof)
+    return started is not None and started <= asof and (ended is None or ended >= asof)
 
 
 def settlement(market: dict) -> dict:
@@ -250,6 +263,14 @@ def daily(payload: dict) -> dict[str, float]:
 def daily_quotes(payload: dict) -> dict[str, dict]:
     """None: the token's price history is its midpoint, with no bid or ask (the module's docstring)."""
     return {}
+
+
+def midpoints(payload: dict) -> list[tuple[str, float]]:
+    """Each point of the token's price history, oldest first: its moment, in UTC, and the price there, the book's
+    midpoint at that moment (the module's docstring)."""
+    return [(datetime.fromtimestamp(p["timestamp"], timezone.utc).isoformat(timespec="seconds"), float(p["price"]))
+            for p in sorted((payload or {}).get("data") or [], key=lambda p: p["timestamp"])
+            if p.get("timestamp") is not None and p.get("price") is not None]
 
 
 def record_of(market: Market, found: Event) -> dict:

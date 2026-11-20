@@ -146,7 +146,7 @@ def test_store_exposes_an_actual_horizon_distribution_and_its_holding_means(tmp_
     got = w.store.engine.value("distribution", e)
     assert got.output is not None, got.cause
     out = got.output
-    assert out["horizon_end"] == w.store.horizon_end()
+    assert out["drawn_on"] == "2027-03-31"  # the event's own date, before the horizon's end, 2027-05-03
     assert out["sample_count"] == distribution.SAMPLES
     assert out["variance"]["total"] == pytest.approx(out["variance"]["between"] + out["variance"]["within"])
     for world_id, row in out["worlds"].items():
@@ -401,3 +401,136 @@ def test_a_fund_valued_by_its_terms_with_a_statement_on_it_is_drawn_by_its_terms
     assert yes == pytest.approx(0.9 * means[False]["yes"][0], rel=1e-9)
     assert yes_var == pytest.approx(0.81 * means[False]["yes"][1], rel=1e-9)  # every draw 0.9 of its terms', not
     assert (no, no_var) == pytest.approx(means[False]["no"], rel=1e-9)  # the fund's own draws around its centre
+
+
+# ---------------------------------------------------------------- the date an event's outcomes are drawn on (MATH.md 1.8)
+
+
+def test_the_date_drawn_on_is_the_latest_of_the_events_dates_and_never_before_the_as_of():
+    """MATH.md 1.8, 1.9: an event's outcomes are drawn on the date it is decided on or by, its window_end; events read
+    together on the latest of theirs, when every joint world is known; a date already passed, on the as-of."""
+    from harness.derive.distribution import drawn_on
+    assert drawn_on("2026-11-04", "2027-03-31") == "2027-03-31"
+    assert drawn_on("2026-11-04", "2027-03-31", "2026-12-15", "2027-01-20") == "2027-03-31"
+    assert drawn_on("2026-11-04", "2026-10-30") == "2026-11-04"
+    assert drawn_on("2026-11-04T15:30:00-05:00", "2026-12-15") == "2026-12-15"
+
+
+def test_an_events_outcomes_are_drawn_on_the_date_all_of_them_are_known_a_way_after_the_horizon_on_its_own(tmp_path):
+    """MATH.md 1.1, 1.8: an event's date is the date by which all its outcomes are known, the latest window_end of the
+    event and its ways. A way decided after its event (a step, and what follows it) moves the date to its own, by the
+    horizon's end or after it: the horizon holds the event and not its ways, so a way past it is drawn on its date,
+    with nothing refused. The page names the same date (ledger.drawn_on)."""
+    from harness.ledger import drawn_on as ledger_drawn_on
+    from test_impact import world, event, channel
+    w = world(tmp_path, g={"SPY": 10_000.0})
+    e = event(w, "Approved", p=0.3, end="2026-12-04")
+    w.link(e, "consequence", channel(w, "SPY"), shock=-0.1)
+
+    def drawn() -> str:
+        got = w.store.engine.value("distribution", e)
+        assert got.output is not None, got.cause
+        assert ledger_drawn_on(w.store, e) == got.output["drawn_on"]
+        return got.output["drawn_on"]
+
+    def way(parent, title, end, weight, side=None) -> str:
+        pid = w.prop(title, end=end)
+        w.link(parent, "way", pid, **({"side": side} if side else {}))
+        w.chances(pid, {"given": [parent], "value": weight})
+        return pid
+
+    assert drawn() == "2026-12-04"
+    closes = way(e, "Approved, and the deal closes", "2027-02-15", 0.6, side="yes")
+    way(e, "Approved, and the deal lapses", "2026-12-04", 0.4, side="yes")
+    assert drawn() == "2027-02-15"  # after the event's date and by the horizon's end, 2027-05-03
+    assert w.store.horizon_end() < "2027-12-31"
+    way(closes, "It closes in the second year", "2027-12-31", 0.5)
+    way(closes, "It closes in the first year", "2027-02-15", 0.5)
+    assert drawn() == "2027-12-31"  # a way decided after the horizon's end, on its own date
+
+
+def test_an_event_is_drawn_over_the_sessions_to_its_own_date_and_its_row_is_the_same_on_any_date(tmp_path):
+    """MATH.md 1.8: the state varies around each world's centre over the sessions to the event's own date. An event decided
+    on the horizon's last day is drawn over the sessions to the horizon's end, as every event was before, and one decided
+    sooner over fewer: with the same seed, each world's own variance is in the proportion of the sessions, to the draws'
+    compounding. The row reads each world at its centre, as of today (1.1), the same whatever the date."""
+    from harness.derive import series
+    from harness.ledger import drawn_on as ledger_drawn_on
+    from test_impact import world, event, channel
+    w = world(tmp_path, g={"SPY": 10_000.0})
+    horizon = w.store.horizon_end()
+    late, soon = event(w, "Late", p=0.3, end=horizon), event(w, "Soon", p=0.3, end="2026-12-04")
+    out, row = {}, {}
+    for e in (late, soon):
+        w.link(e, "consequence", channel(w, "SPY"), shock=-0.1)
+        got = w.store.engine.value("distribution", e)
+        assert got.output is not None, got.cause
+        out[e] = got.output
+        row[e] = w.store.engine.value("impact", e).output
+        assert ledger_drawn_on(w.store, e) == got.output["drawn_on"]
+        assert w.store.get(e)["derived"]["distribution"]["value"]["drawn_on"] == got.output["drawn_on"]
+    assert out[late]["drawn_on"] == horizon
+    assert out[late]["sessions_ahead"] == series.sessions_after("2026-11-04", horizon)
+    assert out[soon]["drawn_on"] == "2026-12-04"
+    assert out[soon]["sessions_ahead"] == series.sessions_after("2026-11-04", "2026-12-04") == 21
+    share = out[soon]["sessions_ahead"] / out[late]["sessions_ahead"]
+    for wid in ("yes", "no"):
+        assert out[soon]["worlds"][wid]["variance"] / out[late]["worlds"][wid]["variance"] == pytest.approx(share, rel=0.05)
+        assert out[soon]["worlds"][wid]["centre"] == out[late]["worlds"][wid]["centre"]
+    for key in ("yes", "no", "full_impact", "volatility", "expected"):
+        assert row[soon][key] == row[late][key]
+    assert ledger_drawn_on(w.store, soon, late) == horizon
+
+
+def test_an_event_whose_window_has_ended_by_the_as_of_is_drawn_on_the_as_of_each_world_a_point(tmp_path):
+    """MATH.md 1.8: an event whose date has passed is decided; drawn on the as-of, over no sessions, each world is its
+    centre."""
+    from test_impact import world, event, channel
+    w = world(tmp_path, g={"SPY": 10_000.0})
+    e = event(w, p=0.3, end="2026-10-30", start=None)
+    w.link(e, "consequence", channel(w, "SPY"), shock=-0.1)
+    got = w.store.engine.value("distribution", e)
+    assert got.output is not None, got.cause
+    assert got.output["drawn_on"] == "2026-11-04" and got.output["sessions_ahead"] == 0
+    for row in got.output["worlds"].values():
+        assert row["variance"] == pytest.approx(0, abs=1e-9)
+        assert row["mean"] == pytest.approx(row["centre"], abs=1e-6)
+
+
+def test_a_held_contract_the_event_does_not_decide_and_that_pays_after_its_date_stays_at_its_mark(tmp_path):
+    """MATH.md 1.8, 1.6: a contract the event does not decide is no part of its worlds, and the row leaves it at its mark;
+    on the event's date one that closes later has not paid, so it stays at its mark there too, a point, where one that
+    pays by then is drawn at its payoff (the test above, closing on the event's date). The contract here closes on
+    2027-03-31; the event is decided on 2027-02-15."""
+    from test_impact import world, event, channel
+    from test_worth import government_curve
+    w = world(tmp_path)
+    e = event(w, p=.3, end="2027-02-15")
+    w.link(e, "consequence", channel(w, "SPY"), shock=-0.1)
+    other = w.prop("Unrelated", chance=.8)
+    market = w.market("other", "Will unrelated occur?", .3, .4)
+    w.link(other, "asks", market, taken={"value": False, "note": "Use the stated forecast."})
+    w.store.link("portfolio", "holds", market, {"side": "yes", "quantity": 100})
+    government_curve(w)
+    got = w.store.engine.value("distribution", e)
+    assert got.output is not None, got.cause
+    assert got.output["drawn_on"] == "2027-02-15"
+    assert not w.store.computation(got.basis)["inputs"]["valuation"]["contracts"]
+    for side in ("yes", "no"):
+        assert got.output["worlds"][side]["mean"] == pytest.approx(0, abs=1e-9)
+        assert got.output["worlds"][side]["variance"] == pytest.approx(0, abs=1e-9)
+
+
+def test_each_holding_is_valued_at_each_draw_on_the_events_date(tmp_path, monkeypatch):
+    """MATH.md 1.6, one valuation read twice: the chart reads each holding's valuation at each draw on the event's date,
+    the date a contract's remaining life and a fund's resets run to."""
+    from harness.derive import valuation
+    from test_impact import world, event, channel
+    w = world(tmp_path, g={"SPY": 10_000.0})
+    e = event(w, p=0.3, end="2027-01-15")
+    w.link(e, "consequence", channel(w, "SPY"), shock=-0.1)
+    dates = []
+    value_state = valuation.value_state
+    monkeypatch.setattr(valuation, "value_state", lambda *a, **k: dates.append(a[7]) or value_state(*a, **k))
+    assert w.store.engine.value("distribution", e).output is not None
+    assert dates and set(dates) == {"2027-01-15"}

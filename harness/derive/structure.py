@@ -84,6 +84,76 @@ def lines(ctx: Inputs, pids: list[str]) -> dict[str, tuple[tuple, list]]:
     return out
 
 
+class InStore:
+    """A structure's statements as the engine reads them from the store (statements): each object's links, the
+    propositions whose chances are given it, and each proposition's line."""
+
+    def __init__(self, ctx: Inputs):
+        self.ctx = ctx
+
+    def breakdown(self, oid: str) -> list[dict]:
+        return self.ctx.links(oid, schema.BREAKDOWN, "both")
+
+    def asks_in(self, mid: str) -> list[dict]:
+        return self.ctx.links(mid, "asks", direction="in")
+
+    def links(self, oid: str, direction: str) -> list[dict]:
+        return self.ctx.links(oid, direction=direction)
+
+    def chances(self, oid: str) -> list[dict]:
+        return self.ctx.object(oid)["stated"].get("chances") or []
+
+    def given_by(self, oid: str) -> list[str]:
+        return [p for p, _ in self.ctx.given_by(oid)]
+
+    def placed(self) -> dict[str, tuple[tuple, list]]:
+        return lines(self.ctx, [o["id"] for o in self.ctx.objects("Proposition")])
+
+
+def statements(r, first: str, *, chances: bool = True) -> dict:
+    """A structure's statements, the cases they allow before any chance or book (MATH.md 1.2): the propositions related to
+    `first` by a link of the breakdown, a chance or the fields that place them on one line, and the markets they are
+    related through; each market a proposition asks standing as that proposition; the links among them, each deadline
+    reading's order of its rungs among them (_rungs); and each line the fields place two or more of them on. `r` reads
+    them, from the store (InStore) or from a record's copy of what the analyst had written (record.Frozen), so the
+    store's probabilities and the record's outcomes are read through one structure. The probabilities read every
+    chance, so the structure reaches through each (`chances`); what the statements decide alone, as an outcome is, is
+    read through the chances whose placing is a condition, a deadline reading's, and a chance given another
+    proposition relates nothing it decides. A reading keeps its place among the proposition's chances either way."""
+    placed = r.placed()
+    if chances:
+        chances_of, given_by = r.chances, r.given_by
+    else:
+        def chances_of(o: str) -> list[dict]:
+            return [c for c in r.chances(o) if "reading" in c]
+
+        def given_by(o: str) -> list[str]:
+            return [p for p in r.given_by(o) if any(o in (*c.get("given", ()), *c.get("given_not", ()))
+                                                    for c in chances_of(p))]
+    props, mids = reach(r.breakdown, chances_of, given_by, first, _partners(placed))
+    members = set(props)
+    stands = standing(r.asks_in, mids, members)
+    links = breakdown_links([link for here in (*props, *mids)
+                             for link in r.links(here, "both" if market(here) else "out")], members, mids, stands)
+    # a side's ways are one set (MATH.md 1.1, 1.2): where one way linked on a side is one of the bands that make it up, the
+    # side is its bands, each a way of it whether linked or not, the unlinked ones there by their fields
+    for parent, side in dict.fromkeys((x["from"], x.get("side")) for x in links if x["relation"] == "way"):
+        bands = (bands_of(placed, parent).get(side) or []) if side else []
+        linked = {x["to"] for x in links if x["relation"] == "way" and x["from"] == parent and x.get("side") == side}
+        if linked & set(bands):
+            links += [{"id": f"{b}.fields", "relation": "way", "from": parent, "to": b, "side": side}
+                      for b in bands if b not in linked and b in members]
+    for pid in props:
+        for i, c in enumerate(r.chances(pid)):
+            links += _rungs(stands, f"{pid}.chances[{i}]", pid, c)
+    by_line: dict[tuple, dict[str, list]] = {}
+    for p in props:
+        if p in placed:
+            by_line.setdefault(placed[p][0], {})[p] = placed[p][1]
+    return {"props": props, "mids": mids, "standing": stands, "nodes": [m for m in mids if m not in stands],
+            "links": links, "lines": [{"members": line} for line in by_line.values() if len(line) > 1]}
+
+
 def _complement(s: list) -> list[list]:
     """The values a set leaves out, as one or two sets."""
     lo, lo_c, hi, hi_c = s
@@ -121,17 +191,24 @@ def bands(ctx: Inputs, root: str) -> dict[str, list[str]]:
 
 
 def _said_of(ctx: Inputs, pid: str) -> bool:
-    """Whether the analyst states something of a band as it would of a way (MATH.md 1.2)."""
+    """Whether the analyst states something of a band as it would of a way (MATH.md 1.2): of the band, or of a joint world
+    it is one of the outcomes of, which the store keeps while a statement names it."""
     stated = ctx.object(pid)["stated"]
     return bool(ctx.links(pid, "consequence") or ctx.links(pid, "worth") or stated.get("priced_in")
-                or stated.get("episode"))
+                or stated.get("episode") or any(pid in (part.split("=", 1)[1] for part in
+                                                        j["id"].removeprefix("joint:").split("|"))
+                                                for j in ctx.objects("JointWorld")))
 
 
 def possible_bands(ctx: Inputs, root: str) -> dict[str, list[str]]:
     """On each side of a level on a date, the propositions its line holds that make that side up exactly, in order, the
     bands between two thresholds and the rungs beyond them, the finest such set (MATH.md 1.2). A side they do not make up
     whole has none."""
-    placed = lines(ctx, [o["id"] for o in ctx.objects("Proposition")])
+    return bands_of(lines(ctx, [o["id"] for o in ctx.objects("Proposition")]), root)
+
+
+def bands_of(placed: dict[str, tuple[tuple, list]], root: str) -> dict[str, list[str]]:
+    """possible_bands, from the lines the fields place each proposition on (lines, or a reader's `placed`)."""
     if root not in placed or placed[root][0][0] != "level":
         return {}
     key, mine = placed[root]
@@ -169,10 +246,8 @@ def ctx_component(ctx: Inputs, pid: str) -> list[str]:
 
 
 def ctx_reach(ctx: Inputs, pid: str) -> tuple[list[str], list[str]]:
-    placed = lines(ctx, [o["id"] for o in ctx.objects("Proposition")])
-    return reach(lambda o: ctx.links(o, schema.BREAKDOWN, "both"),
-                 lambda o: ctx.object(o)["stated"].get("chances") or [],
-                 lambda o: [p for p, _ in ctx.given_by(o)], pid, _partners(placed))
+    r = InStore(ctx)
+    return reach(r.breakdown, r.chances, r.given_by, pid, _partners(r.placed()))
 
 
 def subject(store, pid: str) -> str:
@@ -217,25 +292,28 @@ def followed(c_then: float, r: float, q_then: float, q_now: float) -> float:
     return 1.0 / (1.0 + math.exp(-z)) if z >= 0 else math.exp(z) / (1.0 + math.exp(z))
 
 
-def _reading(ctx: Inputs, pid: str, c: dict) -> dict:
+def _reading(ctx: Inputs, pid: str, c: dict, stands: dict[str, tuple[str, bool]]) -> dict:
     """A reading of a ladder of deadlines (MATH.md 1.2), as its dates give it: theta, how far the deadline t lies from the
     earlier rung t1 (or the line's start, before the first rung) toward the later rung t2; and, even through time or
     by the calendar, the share s itself. At a constant hazard the share reads the rungs' probabilities, so it is worked
-    out with the structure (_hazard)."""
+    out with the structure (_hazard). The rungs are the chance's as stated, the later given and the earlier given not
+    (ONTOLOGY.md 2.1), each read as the proposition it stands as (`t1`, `t2`), and where it stands as that proposition false,
+    a market a proposition asks through its No side, said so (`t1_true`, `t2_true`)."""
     from datetime import date as day
     asof = ev.asof(ctx)
     through = c.get("through") or {}  # a market's date as a rung: the day its question counts through, as stated
     on = lambda x: (day.fromisoformat(through[x]).toordinal() if x in through  # noqa: E731
-                    else day.fromisoformat(ctx.object(x)["stated"]["window_end"]).toordinal())  # a deadline's date
+                    else day.fromisoformat(ctx.object(_as(stands, x)[0])["stated"]["window_end"]).toordinal())
     stated = ctx.object(pid)["stated"]
-    t2 = on(c["given"][0])
-    t1 = on(c["given_not"][0]) if c["given_not"] else \
-        day.fromisoformat(stated.get("window_start") or asof).toordinal()
+    later, earlier = c["given"][0], (c["given_not"][0] if c["given_not"] else None)
+    t2 = on(later)
+    t1 = on(earlier) if earlier else day.fromisoformat(stated.get("window_start") or asof).toordinal()
     t = on(pid)
     theta = (t - t1) / (t2 - t1)
     r = c["reading"]
-    out = {"kind": "calendar" if isinstance(r, dict) else r, "theta": theta, "first": not c["given_not"],
-           "t1": c["given_not"][0] if c["given_not"] else None, "t2": c["given"][0]}
+    (p2, yes2), (p1, yes1) = _as(stands, later), (_as(stands, earlier) if earlier else (None, True))
+    out = {"kind": "calendar" if isinstance(r, dict) else r, "theta": theta, "first": earlier is None,
+           "t1": p1, "t2": p2, **({} if yes1 else {"t1_true": False}), **({} if yes2 else {"t2_true": False})}
     if r == "even":
         out["share"] = theta
     elif isinstance(r, dict):
@@ -251,12 +329,16 @@ def _hazard(reading: dict, p: dict) -> float | None:
     the chance given it, (1 - (1 - F1)^theta) / F1. Where the rungs leave nothing between them, any share gives the
     same, and the share is theta; None where a rung's probability is open."""
     theta = reading["theta"]
+
+    def rung(t: str) -> float | None:  # a rung that stands as a proposition false has one less its probability
+        q = p.get(reading[t])
+        return None if q is None else q if reading.get(f"{t}_true", True) else 1.0 - q
     if reading["first"]:
-        f1 = p.get(reading["t2"])
+        f1 = rung("t2")
         if f1 is None:
             return None
         return theta if f1 <= 1e-12 else (1.0 - (1.0 - f1) ** theta) / f1
-    f1, f2 = p.get(reading["t1"]), p.get(reading["t2"])
+    f1, f2 = rung("t1"), rung("t2")
     if f1 is None or f2 is None:
         return None
     if f2 - f1 <= 1e-12 or f1 >= 1.0 - 1e-12:
@@ -265,14 +347,17 @@ def _hazard(reading: dict, p: dict) -> float | None:
     return (f - f1) / (f2 - f1)
 
 
-def _chance(ctx: Inputs, pid: str, i: int, c: dict) -> dict:
-    """A stated chance as the structure reads it; where it follows a market, the market's probability when the chance
-    was stated and now, each at its latest priced reading, with that reading's time (markets.probability); where it
-    names a reading of a ladder, the reading as its dates give it."""
-    out = {"key": f"{pid}.chances[{i}]", "of": pid, "given": list(c["given"]), "given_not": list(c["given_not"]),
-           "value": c.get("value")}
+def _chance(ctx: Inputs, pid: str, i: int, c: dict, stands: dict[str, tuple[str, bool]]) -> dict:
+    """A stated chance as the structure reads it, each market it is given as the proposition it stands as
+    (_standing_as); where it follows a market, the market's probability when the chance was stated and now, each at
+    its latest priced reading, with that reading's time (markets.probability); where it names a reading of a ladder,
+    the reading as its dates give it."""
+    held = _standing_as(stands, c)
+    out = {"key": f"{pid}.chances[{i}]", "of": pid, "given": list(held["given"]),
+           "given_not": list(held["given_not"]), "value": c.get("value"),
+           "as_stated": {"given": list(c.get("given") or []), "given_not": list(c.get("given_not") or [])}}
     if "reading" in c:
-        got = _reading(ctx, pid, c)
+        got = _reading(ctx, pid, c, stands)
         return {**out, "value": got.get("share"), "reading": got}
     mid = c.get("follow")
     if not mid:
@@ -307,8 +392,9 @@ def breakdown_links(candidates: list[dict], members: set[str], mids: list[str],
                     stands: dict[str, tuple[str, bool]]) -> list[dict]:
     """The links of the breakdown among a structure's propositions and the markets it reaches, as the one form reads
     them (MATH.md 1.2): each end that is a market a proposition asks is that proposition, true or, through the asks
-    link's No side, false (`from_true`, `to_true`); a market no proposition asks is itself. Each link once, in the
-    order given. The store's structure and the record's outcomes read market ends through this one construction."""
+    link's No side, false (`from_true`, `to_true`); a market no proposition asks is itself. A link that says of an
+    end that it is false (`from_true`, `to_true`) says it of what the end stands as. Each link once, in the order
+    given. The store's structure and the record's outcomes read market ends through this one construction."""
     out, seen = [], set()
     for link in candidates:
         rel = link["relation"]
@@ -319,6 +405,7 @@ def breakdown_links(candidates: list[dict], members: set[str], mids: list[str],
             continue
         seen.add(link["id"])
         (a, fa), (b, tb) = (_as(stands, x) for x in ends)
+        fa, tb = fa == link.get("from_true", True), tb == link.get("to_true", True)
         out.append({"id": link["id"], "relation": rel, "from": a, "to": b,
                     **({} if fa else {"from_true": False}), **({} if tb else {"to_true": False}),
                     **({"step": link["stated"].get("step")} if rel == "then" else {}),
@@ -345,18 +432,13 @@ def _market_book(ctx: Inputs, mid: str) -> dict:
 
 
 def _structure_inputs(ctx: Inputs, first: str) -> dict:
-    props, mids = ctx_reach(ctx, first)
-    members = set(props)
-    stands = standing(lambda mid: ctx.links(mid, "asks", direction="in"), mids, members)
-    nodes = [m for m in mids if m not in stands]  # a market no proposition asks stands as itself
+    found = statements(InStore(ctx), first)
+    props, stands, nodes = found["props"], found["standing"], found["nodes"]  # a market no proposition asks: itself
     chances, books, listed = [], [], {}
-    links = breakdown_links([link for here in (*props, *mids)
-                             for link in ctx.links(here, direction="both" if market(here) else "out")],
-                            members, mids, stands)
     for mid in nodes:
         book = _market_book(ctx, mid)
         listed[mid] = [book]
-        if book["bid"] is not None or book["ask"] is not None:
+        if any(book[k] is not None for k in ("bid", "ask", "price")):  # a price alone is a book of 0 to 1 (3.3)
             books.append({k: book[k] for k in ("bid", "ask", "price", "depth")} | {"link": mid, "on": mid})
     for pid in props:
         stated = ctx.object(pid)["stated"]
@@ -364,26 +446,19 @@ def _structure_inputs(ctx: Inputs, first: str) -> dict:
         here = markets(ctx, pid)
         listed[pid] = [{**m, **({"followed": True} if m["market"] in following else {})} for m in here]
         for m in here:  # a taken book bounds its proposition; one a chance follows informs it through that chance
-            if m["taken"] and m["market"] not in following and (m["bid"] is not None or m["ask"] is not None):
+            if m["taken"] and m["market"] not in following and \
+                    any(m[k] is not None for k in ("bid", "ask", "price")):
                 books.append({"link": m["link"], "on": pid, "bid": m["bid"], "ask": m["ask"], "price": m["price"],
                               "depth": m["depth"]})
         for i, c in enumerate(stated.get("chances") or []):
-            got = _chance(ctx, pid, i, _standing_as(stands, c))
-            chances.append(got)
-            links += _rungs(stands, got, c)
-    placed = lines(ctx, props)
-    by_line: dict[tuple, dict[str, list]] = {}
-    for p in props:
-        if p in placed:
-            by_line.setdefault(placed[p][0], {})[p] = placed[p][1]
-    on_lines = [{"members": line} for line in by_line.values() if len(line) > 1]
-    return {"props": [*props, *nodes], "links": links, "chances": chances, "books": books, "markets": listed,
-            **({"lines": on_lines} if on_lines else {}), **({"standing": stands} if stands else {})}
+            chances.append(_chance(ctx, pid, i, c, stands))
+    return {"props": [*props, *nodes], "links": found["links"], "chances": chances, "books": books, "markets": listed,
+            **({"lines": found["lines"]} if found["lines"] else {}), **({"standing": stands} if stands else {})}
 
 
 def _standing_as(stands: dict[str, tuple[str, bool]], c: dict) -> dict:
-    """A chance given markets, each as the proposition it stands as: given a market a proposition asks through its No
-    side is given not that proposition. A market's date as a rung goes with it."""
+    """A chance given markets, as a condition: each market as the proposition it stands as, so that given a market a
+    proposition asks through its No side is given not that proposition."""
     if not stands:
         return c
     given, given_not = [], []
@@ -393,22 +468,27 @@ def _standing_as(stands: dict[str, tuple[str, bool]], c: dict) -> dict:
     for x in c["given_not"]:
         p, yes = _as(stands, x)
         (given_not if yes else given).append(p)
-    through = {_as(stands, m)[0]: d for m, d in (c.get("through") or {}).items()}
-    return {**c, "given": given, "given_not": given_not, **({"through": through} if through else {})}
+    return {**c, "given": given, "given_not": given_not}
 
 
-def _rungs(stands: dict[str, tuple[str, bool]], got: dict, c: dict) -> list[dict]:
+def _rungs(stands: dict[str, tuple[str, bool]], key: str, pid: str, c: dict) -> list[dict]:
     """A deadline reading states that the proposition and its rungs concern the same occurrence or threshold, counted
     from the same start, by their dates (MATH.md 1.2): so the earlier rung implies the proposition, the proposition the
-    later, and the earlier the later. That order is structure, part of the range the markets imply as every link is;
-    only the share the reading chooses is the analyst's number. Each is named by the reading's chance (`{key}.rungs`),
-    so that what cannot hold names it, and kept apart from the chance's own value, which the range leaves out."""
-    if "reading" not in got:
+    later, and the earlier the later. The rungs are the chance's as stated, the later given and the earlier given not
+    (ONTOLOGY.md 2.1), each a proposition or a market, and a market as the proposition it stands as, true or false: a market a
+    proposition asks through its No side stands as that proposition false (`from_true`, `to_true`). That order is
+    structure, part of the range the markets imply as every link is; only the share the reading chooses is the
+    analyst's number. Each is named by the reading's chance (`{key}.rungs`), so that what cannot hold names it, and
+    kept apart from the chance's own value, which the range leaves out."""
+    if "reading" not in c:
         return []
-    later = got["given"][0]
-    earlier = got["given_not"][0] if got["given_not"] else None
-    pairs = [(got["of"], later)] + ([(earlier, got["of"]), (earlier, later)] if earlier else [])
-    return [{"id": f"{got['key']}.rungs", "relation": "implies", "from": a, "to": b} for a, b in pairs]
+    of = (pid, True)
+    later = _as(stands, c["given"][0])
+    earlier = _as(stands, c["given_not"][0]) if c["given_not"] else None
+    pairs = [(of, later)] + ([(earlier, of), (earlier, later)] if earlier else [])
+    return [{"id": f"{key}.rungs", "relation": "implies", "from": a, "to": b,
+             **({} if fa else {"from_true": False}), **({} if tb else {"to_true": False})}
+            for (a, fa), (b, tb) in pairs]
 
 
 def _now(c: dict) -> float | None:
@@ -448,9 +528,14 @@ def _figure(m: dict, statement: str) -> dict:
         for line in m.get("lines") or []:
             if pid in line["members"]:
                 return {"id": statement, "of": pid, "on_line": line["members"][pid]}
-    for c in m["chances"]:
+    for c in m["chances"]:  # a chance by what it is given as it was stated, a market by its id (ONTOLOGY.md 2.1)
+        stated = c.get("as_stated") or c
         if c["key"] == statement:
-            return {"id": statement, "of": c["of"], "given": c["given"], "given_not": c["given_not"], "value": _now(c)}
+            return {"id": statement, "of": c["of"], "given": stated["given"], "given_not": stated["given_not"],
+                    "value": _now(c)}
+        if f"{c['key']}.rungs" == statement:  # the order the reading's dates give its rungs: the reading's chance
+            return {"id": statement, "of": c["of"], "given": stated["given"], "given_not": stated["given_not"],
+                    "reading": (c.get("reading") or {}).get("kind")}
     for link in m["links"]:
         if link["id"] == statement:
             return {"id": statement, **{k: v for k, v in link.items() if k != "id" and v is not None}}
@@ -513,7 +598,9 @@ def _structure_compute(m: dict, load) -> dict:
                 break
             found = read()
         else:
-            dependent = ", ".join(c["key"] for c in (*hazards, *names))
+            dependent = ", ".join(chance_words(c["of"], **c.get("as_stated", {"given": c["given"],
+                                                                                "given_not": c["given_not"]}))
+                                  for c in (*hazards, *names))
             raise Refused(f"{m['props'][0]}'s structure could not be read: {dependent} each take their value from the "
                           f"probabilities they help set, a constant hazard's or a holding's price, and no set of "
                           f"probabilities holds them all", m["props"])
@@ -546,8 +633,34 @@ def _pick(out: dict, pid: str) -> dict:
     return got
 
 
-STRUCTURE = Derivation("structure", 7, "Proposition", _structure_inputs, _structure_compute,
+STRUCTURE = Derivation("structure", 11, "Proposition", _structure_inputs, _structure_compute,
                        fields=("range", "probability", "left_open"), subject_of=subject, pick=_pick)
+
+
+def _ranges_inputs(ctx: Inputs, first: str) -> dict:
+    """What the range each chance of a structure can take reads (MATH.md 1.2): the structure's propositions, links, taken
+    books and lines, and its reading, whose chances carry each figure as it now stands (a following chance's carried
+    forward, a constant hazard's read with the rungs)."""
+    m = _structure_inputs(ctx, first)
+    return {"props": m["props"], "links": m["links"], "books": m["books"], **({"lines": m["lines"]} if m.get("lines") else {}),
+            "structure": ctx.value("structure", first, ref=True)}
+
+
+def _ranges_compute(m: dict, load) -> dict:
+    """Each chance's range: the least and the most its figure can be with every link and every other chance kept and
+    each taken book within its bid and ask, or within the stretch the other statements need (oneform.chance_ranges).
+    Within it the chance holds with no book stretched and no statement waiting. None where the other statements cannot
+    hold among themselves, or leave what it is given no probability, as the structure's cannot_hold then says."""
+    read = load(m["structure"])
+    chances = [{"key": c["key"], "of": p, "given": c["given"], "given_not": c["given_not"], "value": c["value"]}
+               for p, node_ in read["props"].items() for c in node_.get("chances") or [] if c.get("value") is not None]
+    got = oneform.chance_ranges({k: m[k] for k in ("props", "links", "books", "lines") if k in m} | {"chances": chances})
+    return {"chances": {k: None if "why" in r else [r["lo"], r["hi"]] for k, r in got.items()}}
+
+
+# the range each chance can take, read by a statement's return for the chances it writes; a field of no proposition
+CHANCE_RANGES = Derivation("chance_ranges", 1, "Proposition", _ranges_inputs, _ranges_compute,
+                           applies=lambda store, pid: False)
 
 
 def node(ctx: Inputs, pid: str) -> dict:
@@ -560,14 +673,15 @@ def node(ctx: Inputs, pid: str) -> dict:
 # ---------------------------------------------------------------- the words for what a structure leaves
 
 
-def _said(of: str, given, given_not) -> str:
-    cond = [*given, *(f"not {x}" for x in given_not)]
-    return f"the chance of {of} given {' and '.join(cond)}"
+def chance_words(of: str, given, given_not) -> str:
+    """A chance in words, by what it is given (ONTOLOGY.md 2.1): the chance of E given D and not F, or stated on its own."""
+    return f"the chance of {of} {schema.said(given, given_not)}"
 
 
 def settlers(o: dict) -> str:
     """What would settle a probability left open, in words: each alternative, and what it rests on that is open."""
-    ways = [" and ".join(_said(c["of"], c["given"], c["given_not"]) for c in alt) for alt in o.get("settled_by") or []]
+    ways = [" and ".join(chance_words(c["of"], c["given"], c["given_not"]) for c in alt)
+            for alt in o.get("settled_by") or []]
     if o.get("with"):
         ways.append(f"what settles {' and '.join(o['with'])}, which it rests on")
     return ", or ".join(ways)
@@ -583,11 +697,37 @@ def left_open_text(pid: str, o: dict) -> str:
     return out
 
 
+def statement_words(figure: dict) -> str:
+    """A statement of a set that cannot hold, in words: a chance by what it is given, a reading of a ladder by its
+    chance, a link and a proposition's fields by their ids."""
+    if "given" not in figure:
+        return figure["id"]
+    words = chance_words(figure["of"], figure["given"], figure["given_not"])
+    return f"the reading of {words}" if "reading" in figure else words
+
+
+def statement_shown(figure: dict) -> dict | str:
+    """A statement of a set that cannot hold, as the analyst reads it (MATH.md 1.10): a chance by its proposition, what it
+    is given and its figure now, or its reading of a ladder; a link by its id, with its relation and its ends; a
+    proposition's fields with the values they place it at. A chance's place in its list is the structure's own key."""
+    if "given" in figure:
+        return {k: v for k, v in figure.items() if k != "id"}
+    return figure
+
+
+def cannot_hold_shown(sets: list[dict]) -> list[dict]:
+    """What cannot hold together in a structure as the analyst reads it, in a statement's return and in check(): each
+    set with each of its statements as statement_shown gives it, and the case it leaves no probability, where it
+    does."""
+    return [{"statements": [statement_shown(f) for f in s.get("figures") or [{"id": x} for x in s["statements"]]],
+             **{k: v for k, v in s.items() if k not in ("statements", "figures")}} for s in sets]
+
+
 def cannot_hold_text(sets: list[dict]) -> str:
-    """What cannot hold together in a structure, in words."""
+    """What cannot hold together in a structure, in words: each statement as statement_words names it."""
     out = []
     for s in sets:
-        named = ", ".join(s["statements"])
+        named = ", ".join(statement_words(f) for f in s.get("figures") or [{"id": x} for x in s["statements"]])
         if s.get("leaves_no_probability"):
             case = " and ".join(p if v else f"not {p}" for p, v in s["leaves_no_probability"].items())
             out.append(f"{named}: the case {case} has no probability where they hold, and a chance given it is "
@@ -597,4 +737,4 @@ def cannot_hold_text(sets: list[dict]) -> str:
     return "; ".join(out)
 
 
-DERIVATIONS = (STRUCTURE,)
+DERIVATIONS = (STRUCTURE, CHANCE_RANGES)

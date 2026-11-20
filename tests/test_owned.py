@@ -1,7 +1,7 @@
 """Where the portfolio's weight is (MATH.md 3.1; harness.derive.owned): by company, by industry and by country, each
-summing to the portfolio's value, every row of every fund counted; a company's industry from its listing in its region's
-listings, else its profile; its home its ISIN's country where it trades there, else its profile's; what is not a company
-under its kind. The sources' answers are put in the store in each one's kept shape; nothing reaches the network."""
+summing to the portfolio's value, every row of every fund counted; a company's industry from its row in
+FinanceDatabase's file; its home its ISIN's country where it trades there, else the file's, else its profile's; what is
+not a company under its kind. The sources' answers are put in the store in each one's kept shape; nothing reaches the network."""
 
 from __future__ import annotations
 
@@ -36,22 +36,24 @@ def test_a_coin_is_one_kind_of_asset_however_its_source_writes_it():
     assert [Kinds().of(r) for r in other] == ["commodity", "commodity", "other"]
 
 
-def listings(store, region, rows):
-    """The listings the screener holds in a region, each with its sector and industry: what it answers a symbol by
-    (harness.venues.yahoo.sectors), absent for any symbol no test lists."""
-    held = store.__dict__.setdefault("screened", {})
-    held.update({s: {"name": n, "sector": sec, "industry": ind} for s, n, sec, ind in rows})
+EXCHANGE = {"us": "NYQ", "tw": "TAI", "hk": "HKG", "gb": "LSE", "ca": "TOR"}  # Yahoo's code for an exchange there
+
+
+def equities(store, rows):
+    """The rows FinanceDatabase's file holds, each (symbol, name, sector, industry, isin, country): what it answers a
+    listing's symbol and an ISIN by (harness.venues.equities), none for any no test lists."""
+    held = store.__dict__.setdefault("equities_held", [])
+    held += [{"symbol": sym, "name": n, "sector": sec, "industry": ind, "isin": isin, "country": country,
+              "exchange": EXCHANGE.get(region_of(sym)), "delisted": False} for sym, n, sec, ind, isin, country in rows]
 
     def answer(subject, covering):
-        symbol = subject.rsplit("@", 1)[0]
-        r = held.get(symbol)
-        payload = {"status": "OK", "symbol": symbol, "exchange": None, **r} if r else \
-            {"status": "NOT_FOUND", "symbol": symbol}
-        return {"payload": payload, "request": {"method": "POST", "url": "screener", "ticker": symbol},
-                "retrieved_at": FETCHED, "range": (ASOF, ASOF)}
+        how, _, value = subject.partition(":")
+        found = [r for r in held if r[how] == value]
+        return {"payload": {"status": "OK" if found else "NOT_FOUND", "subject": subject, "rows": found},
+                "request": {"method": "GET", "url": "equities"}, "retrieved_at": FETCHED, "range": (ASOF, ASOF)}
 
-    answer.many = lambda subjects, covering: {s: answer(s, covering) for s in subjects}
-    store.fetchers["listing_sector"] = answer
+    answer.many = lambda subjects, covering: {x: answer(x, covering) for x in subjects}
+    store.fetchers["equity"] = answer
 
 
 def profile(store, symbol, country, sector=None, industry=None, name=None):
@@ -77,11 +79,14 @@ def test_the_three_lists_sum_to_the_portfolio_every_row_counted_each_company_cla
         {"constituent_ticker": "700", "isin": "KYG875721634", "country_of_exchange": "HK", "weight": 0.15},
         {"constituent_ticker": "XYZ", "isin": "US9999999999", "weight": 0.001},  # below the floor, no name
         {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.049}])
-    listings(store, "us", [("AAPL", "Apple Inc.", "Technology", "Consumer Electronics"),
-                           ("XYZ", "Xyz Corp", "Industrials", "Railroads")])
-    listings(store, "tw", [("2330.TW", "Taiwan Semiconductor", "Technology", "Semiconductors")])
-    listings(store, "hk", [("0700.HK", "Tencent Holdings", "Communication Services", "Internet Content & Information")])
-    profile(store, "0700.HK", "China")  # registered in the Cayman Islands, it trades in Hong Kong: its own record's
+    equities(store, [("AAPL", "Apple Inc.", "Information Technology", "Computers & Hardware", "US0378331005",
+                      "United States"),
+                     ("XYZ", "Xyz Corp", "Industrials", "Rail & Road Transport", "US9999999999", "United States"),
+                     ("2330.TW", "Taiwan Semiconductor", "Information Technology", "Semiconductors", "TW0002330008",
+                      "Taiwan"),
+                     # registered in the Cayman Islands, it trades in Hong Kong: its own record's
+                     ("0700.HK", "Tencent Holdings", "Communication Services", "Internet Media & Services",
+                      "KYG875721634", "China")])
     store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 10000.0}]})
     w = store.engine.value("weights", "portfolio").output
     for listed in ("by_company", "by_industry", "by_country"):
@@ -89,9 +94,10 @@ def test_the_three_lists_sum_to_the_portfolio_every_row_counted_each_company_cla
     countries = {c.get("country") or c.get("kind"): c["dollars"] for c in w["by_country"]}
     assert countries == pytest.approx({"US": 5010.0, "TW": 3000.0, "CN": 1500.0, "cash": 490.0})
     industries = {c.get("industry") or c.get("kind"): c["dollars"] for c in w["by_industry"]}
-    assert industries["Semiconductors"] == pytest.approx(3000.0) and industries["Railroads"] == pytest.approx(10.0)
+    assert industries["Semiconductors"] == pytest.approx(3000.0)
+    assert industries["Rail & Road Transport"] == pytest.approx(10.0)
     xyz = next(c for c in w["by_company"] if c.get("company") == "Xyz Corp")
-    assert xyz["name"] is None and xyz["industry"] == "Railroads"  # counted, though no name stands for it
+    assert xyz["name"] is None and xyz["industry"] == "Rail & Road Transport"  # counted, though no name stands for it
     assert w["unclassified"] == {"industry": 0, "country": 0}
 
 
@@ -102,6 +108,8 @@ def test_a_listings_symbol_is_built_by_its_exchanges_rule_and_a_country_named_as
     assert symbols_for("BRK.B", "US") == ["BRK-B"] and region_of("BRK-B") == "us" and region_of("600519.SS") == "cn"
     assert [country_code(n) for n in ("South Korea", "Turkey", "Macau", "Curacao", "Cayman Islands")] == \
         ["KR", "TR", "MO", "CW", "KY"]
+    assert [country_code(n) for n in ("Macedonia", "Sint Maarten", "Falkland Islands", "Taiwan")] == \
+        ["MK", "SX", "FK", "TW"]  # FinanceDatabase's names
     assert country_code("Atlantis") is None and country_name("TW") == "Taiwan"
 
 
@@ -125,8 +133,8 @@ def symbol(store, listing, found):
 
 def test_a_row_whose_own_ticker_matches_nothing_where_it_trades_is_found_by_its_identifiers(store):
     """A US exchange's code after a ticker is read as that code; a ticker since changed, or a when-issued line, is found
-    by searching its ISIN, or the one its US CUSIP makes; a company its fund names as trading in the US is found where
-    its ISIN says it is registered."""
+    by its ISIN, or the one its US CUSIP makes; a company its fund names as trading in the US is found where its ISIN
+    says it is registered."""
     ref(store, "F", "ETF")
     ref(store, "AAPL", "CS")
     fund(store, "F", [
@@ -136,19 +144,20 @@ def test_a_row_whose_own_ticker_matches_nothing_where_it_trades_is_found_by_its_
         {"constituent_ticker": "HONIV", "us_code": "438516205", "weight": 0.001},  # when-issued, its CUSIP alone
         {"constituent_ticker": "8210", "isin": "TW0008210006", "weight": 0.001},  # named as trading in the US
         {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.496}])
-    listings(store, "us", [("AAPL", "Apple Inc.", "Technology", "Consumer Electronics"),
-                           ("OKE", "ONEOK", "Energy", "Oil & Gas Midstream"),
-                           ("GAP", "Gap", "Consumer Cyclical", "Apparel Retail"),
-                           ("HON", "Honeywell", "Industrials", "Conglomerates")])
-    listings(store, "tw", [("8210.TW", "Chenbro Micom", "Technology", "Computer Hardware")])
-    symbol(store, "US3647601083:US", "GAP")
-    symbol(store, "US4385162056:US", "HON")  # the ISIN its CUSIP makes, searched
+    equities(store, [("AAPL", "Apple Inc.", "Information Technology", "Computers & Hardware", "US0378331005",
+                      "United States"),
+                     ("OKE", "ONEOK", "Energy", "Oil, Gas & Fuels", "US6826801036", "United States"),
+                     ("GAP", "Gap", "Consumer Discretionary", "Specialty Retail", "US3647601083", "United States"),
+                     ("HON", "Honeywell", "Industrials", "Conglomerates", "US4385161066", "United States"),
+                     ("HON", "Honeywell", "Industrials", "Conglomerates", "US4385162056", "United States"),
+                     ("8210.TW", "Chenbro Micom", "Information Technology", "Computers & Hardware", "TW0008210006",
+                      "Taiwan")])
     store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 100000.0}]})
     w = store.engine.value("weights", "portfolio").output
     industries = {c["company"]: (c["industry"], c["country"]) for c in w["by_company"] if "company" in c}
-    assert industries == {"Apple Inc.": ("Consumer Electronics", "US"),
-                          "ONEOK": ("Oil & Gas Midstream", "US"), "Gap": ("Apparel Retail", "US"),
-                          "Honeywell": ("Conglomerates", "US"), "Chenbro Micom": ("Computer Hardware", "TW")}
+    assert industries == {"Apple Inc.": ("Computers & Hardware", "US"),
+                          "ONEOK": ("Oil, Gas & Fuels", "US"), "Gap": ("Specialty Retail", "US"),
+                          "Honeywell": ("Conglomerates", "US"), "Chenbro Micom": ("Computers & Hardware", "TW")}
     assert w["unclassified"] == {"industry": 0, "country": 0}
 
 
@@ -163,7 +172,8 @@ def test_securities_no_identifier_names_stand_apart_and_a_cusip_reaches_the_comp
         {"constituent_name": "WIDGET CO CVR", "weight": 0.0005},
         {"constituent_name": "APPLE INC", "us_code": "037833100", "weight": 0.001},  # Apple, by its CUSIP alone
         {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.4975}])
-    listings(store, "us", [("AAPL", "Apple Inc.", "Technology", "Consumer Electronics")])
+    equities(store, [("AAPL", "Apple Inc.", "Information Technology", "Computers & Hardware", "US0378331005",
+                      "United States")])
     store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 10000.0}]})
     owned = looked(store)["owned"]
     assert owned["row::ACME WARRANT"]["dollars"] == pytest.approx(10.0)
@@ -191,35 +201,37 @@ def test_a_row_below_the_floor_named_by_its_cusip_alone_reaches_the_company_the_
     assert "looks_through_to:name:F>name:AAPL" in out["links"]
 
 
-def test_a_company_no_regions_listings_hold_is_classified_by_the_first_of_its_listings_whose_profile_answers(store):
-    """Where a region's listings leave a company out (a region they do not reach, a listing they omit) and its ISIN's
-    search finds nothing, its profile is read under the listings it has: its own ticker where it trades, then each US
-    line OpenFIGI maps its ISIN to."""
+def test_a_company_the_file_holds_by_none_of_its_listings_has_the_home_its_profile_gives_and_no_industry(store):
+    """Where FinanceDatabase's file holds a company by none of its symbols or its ISIN, its home is its ISIN's where
+    its fund names that it trades there, and else the first profile that answers of the listings it has: its ISIN's
+    search, its own ticker where it trades, then each US line OpenFIGI maps its ISIN to. Its industry is the file's
+    classification's, and it stands under none: one classification for every market."""
     ref(store, "F", "ETF")
     ref(store, "AAPL", "CS")
     fund(store, "F", [{"constituent_ticker": "AAPL", "figi": "FIGIAAPL", "isin": "US0378331005", "weight": 0.5},
-                      {"constituent_ticker": "QRVO", "isin": "US74736K1016", "weight": 0.001},
-                      {"constituent_ticker": "ICT", "isin": "PHY411571011", "country_of_exchange": "PH",
-                       "weight": 0.002},
-                      {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.497}])
-    listings(store, "us", [("AAPL", "Apple Inc.", "Technology", "Consumer Electronics")])  # Qorvo left out
-    listings(store, "ph", [])  # a region the listings do not reach
-    symbol(store, "US74736K1016:US", None)
-    symbol(store, "PHY411571011:PH", None)
-    profile(store, "QRVO", "United States", "Technology", "Semiconductors", "Qorvo, Inc.")
-    store.put_data("profile", f"ICT.PS@{MONTH}", {"status": "NOT_FOUND", "symbol": "ICT.PS"},
+                      {"constituent_ticker": "QRVO", "constituent_name": "QORVO INC", "isin": "US74736K1016",
+                       "weight": 0.001},
+                      {"constituent_ticker": "ICT", "constituent_name": "INTL CONTAINER TERMINAL",
+                       "isin": "PHY411571011", "country_of_exchange": "PH", "weight": 0.002},
+                      {"constituent_ticker": "KZX", "constituent_name": "KAZAX CORP", "isin": "KZ0000000001",
+                       "country_of_exchange": "US", "weight": 0.002},
+                      {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.495}])
+    equities(store, [("AAPL", "Apple Inc.", "Information Technology", "Computers & Hardware", "US0378331005",
+                      "United States")])  # Qorvo, ICT and Kazax left out
+    symbol(store, "KZ0000000001:US", None)
+    store.put_data("profile", f"KZX@{MONTH}", {"status": "NOT_FOUND", "symbol": "KZX"},
                    {"method": "GET", "url": "profile"}, retrieved_at=FETCHED, range=(ASOF, ASOF))
-    store.put_data("figi", "PHY411571011", {"status": "OK", "isin": "PHY411571011", "composites": [],
-                                            "listings": [{"ticker": "ICTEF", "exchCode": "US"}]},
+    store.put_data("figi", "KZ0000000001", {"status": "OK", "isin": "KZ0000000001", "composites": [],
+                                            "listings": [{"ticker": "KZXGF", "exchCode": "US"}]},
                    {"method": "POST", "url": "openfigi"}, retrieved_at=FETCHED, range=(ASOF, ASOF))
-    profile(store, "ICTEF", "Philippines", "Industrials", "Marine Shipping",
-            "International Container Terminal Services, Inc.")
+    profile(store, "KZXGF", "Kazakhstan", "Energy", "Oil & Gas", "Kazax Corporation")
     store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 10000.0}]})
     w = store.engine.value("weights", "portfolio").output
     got = {c["company"]: (c["industry"], c["country"]) for c in w["by_company"] if "company" in c}
-    assert got["Qorvo, Inc."] == ("Semiconductors", "US")
-    assert got["International Container Terminal Services, Inc."] == ("Marine Shipping", "PH")  # registered, trades there
-    assert w["unclassified"] == {"industry": 0, "country": 0}
+    assert got["QORVO INC"] == (None, "US")  # its fund's holdings say it trades in the US: no profile read
+    assert got["INTL CONTAINER TERMINAL"] == (None, "PH")  # registered there and traded there: no profile read
+    assert got["Kazax Corporation"] == (None, "KZ")  # by the US line OpenFIGI maps its ISIN to
+    assert w["unclassified"] == {"industry": 3, "country": 0}
 
 
 def test_a_portfolio_naming_no_company_beyond_the_floors_reads_no_cusips_listing(store):
@@ -256,20 +268,66 @@ def test_a_company_met_by_its_receipt_has_the_home_its_own_record_gives_and_a_ho
     ref(store, "AAPL", "CS", name="Apple Inc. Common Stock")
     fund(store, "F", [{"constituent_ticker": "TSM", "figi": "FIGITSM", "isin": "US8740391003", "weight": 0.6},
                       {"constituent_ticker": "AAPL", "figi": "FIGIAAPL", "isin": "US0378331005", "weight": 0.4}])
-    listings(store, "us", [("TSM", "Taiwan Semiconductor Manufacturing Company Limited", "Technology",
-                            "Semiconductors"), ("AAPL", "Apple Inc.", "Technology", "Consumer Electronics")])
-    profile(store, "TSM", "Taiwan")
+    equities(store, [("TSM", "Taiwan Semiconductor Manufacturing Company Limited", "Information Technology",
+                      "Semiconductors", "US8740391003", "Taiwan"),
+                     ("AAPL", "Apple Inc.", "Information Technology", "Computers & Hardware", "US0378331005",
+                      "United States")])
     store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 5000.0},
                                                        {"ticker": "TSM", "dollars": 5000.0}]})
     w = store.engine.value("weights", "portfolio").output
     homes = {c["company"]: c["country"] for c in w["by_company"]}
     assert homes == {"Taiwan Semiconductor Manufacturing Company Limited": "TW", "Apple Inc.": "US"}
     held = next(h for h in holdings(store)["holdings"] if h["ticker"] == "TSM")
-    assert held["company"] == {"name": "Taiwan Semiconductor Manufacturing Company Limited",
-                               "industry": "Semiconductors", "country": "TW"}  # not the receipt's name, nor its SIC
-    fund_row = next(h for h in holdings(store)["holdings"] if h["ticker"] == "F")  # its holdings in the same words
-    assert {r["priced_as"]: r["industry"] for r in fund_row["fund"]["largest"]} == {
-        "name:TSM": "Semiconductors", "name:AAPL": "Consumer Electronics"}
+    assert held["company"] == "Taiwan Semiconductor Manufacturing Company Limited"  # not the receipt's name
+    tsm = next(c for c in w["by_company"] if c["name"] == "name:TSM")  # nor its SIC: the one classification's
+    assert (tsm["industry_id"], tsm["country_id"]) == ("industry:semiconductors", "country:TW")
+    from harness.ledger import group
+    groups = {g["id"]: group(store, g["id"])["companies"] for g in holdings(store)["by_industry"] if g.get("id")}
+    assert groups == {"industry:semiconductors": 1, "industry:computers-hardware": 1}  # each group by its id
+
+
+def test_a_company_is_classified_by_its_own_securities_before_a_symbol_built_from_a_rows_ticker(store):
+    """A company's industry follows the identifiers it is known by. AngloGold Ashanti's row names its Johannesburg
+    ticker, ANG, under a US exchange, beside its British ISIN; its share class's US listing is AU, by which its
+    identifiers confirm the company. ANG on London is Angling Direct, which the screener holds: the company is
+    AngloGold, classified by AU, its own listing, never by a symbol built from the row's ticker and a country. Its
+    home, where it trades in the country of its ISIN neither by a listing of it nor by its fund's word, is its
+    record's."""
+    ref(store, "F", "ETF")
+    ref(store, "AU", "CS", cik="0001973832")
+    au = [{"ticker": "AU", "exchCode": "US", "compositeFIGI": "FIGIAU", "shareClassFIGI": "SCAU"}]
+    store.put_data("figi", "GB00BRXH2664", {"status": "OK", "isin": "GB00BRXH2664", "listings": au,
+                                           "composites": ["FIGIAU"]},
+                   {"method": "POST", "url": "figi"}, retrieved_at=FETCHED, range=(ASOF, ASOF))
+    fund(store, "F", [{"constituent_name": "ANGLOGOLD ASHANTI PLC", "constituent_ticker": "ANG", "isin": "GB00BRXH2664",
+                       "country_of_exchange": "US", "weight": 0.5},
+                      {"constituent_ticker": "USD", "asset_class": "Cash", "weight": 0.5}])
+    equities(store, [("AU", "AngloGold Ashanti plc", "Materials", "Mining & Metals", "GB00BRXH2664", "United Kingdom"),
+                     ("ANG.L", "Angling Direct PLC", "Consumer Discretionary", "Specialty Retail", "GB00BD3VFW73",
+                      "United Kingdom")])
+    store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 1000.0}]})
+    w = store.engine.value("weights", "portfolio").output
+    [company] = [c for c in w["by_company"] if c.get("name")]
+    assert (company["name"], company["company"], company["industry"], company["country"]) == \
+        ("name:AU", "AngloGold Ashanti plc", "Mining & Metals", "GB")
+
+
+def test_a_company_trading_where_its_isin_is_registered_by_its_funds_word_has_that_home():
+    """MATH.md 3.1: a company's home is the country it is registered in where it also trades there. Met through a fund's
+    row on an exchange in the country of its ISIN, and classified by its own US listing, it has that home from its
+    fund's word that it trades there; met by a row on an exchange elsewhere, with no listing of it there in the file,
+    its home is its own record's, the file's country."""
+    from harness.derive.owned import classify
+    shop = [{"symbol": "SHOP", "name": "Shopify Inc.", "sector": "Information Technology", "industry": "Software",
+             "isin": "CA82509L1076", "country": "Canada", "exchange": "NYQ", "delisted": False}]
+    held = {"symbol:SHOP": shop, "isin:CA82509L1076": shop}
+    readers = (lambda subject: held.get(subject, []), lambda listing: "", lambda s: None, lambda isin: [])
+    at_home = {"row": {"constituent_ticker": "SHOP", "isin": "CA82509L1076", "country_of_exchange": "CA"}}
+    elsewhere = {"row": {"constituent_ticker": "SHOP", "isin": "CA82509L1076", "country_of_exchange": "DE"}}
+    got = classify({"name:SHOP": at_home, "name:OTHER": elsewhere},
+                   {"name:SHOP": {"SHOP": 1.0}, "name:OTHER": {"SHOP": 1.0}}, *readers)
+    assert [got["name:SHOP"][k] for k in ("industry", "home", "home_named", "wants")] == ["Software", "CA", None, []]
+    assert [got["name:OTHER"][k] for k in ("home", "home_named", "wants")] == ["CA", "Canada", []]
 
 
 def test_a_row_no_label_names_in_a_fund_the_sec_classes_as_a_commodity_trust_is_a_commodity(store):
@@ -335,10 +393,10 @@ def test_what_a_commodity_pools_rows_leave_unstated_is_its_commodity_exposure(st
 def test_a_report_row_named_by_its_isin_alone_is_matched_by_where_the_funds_holdings_say_it_trades():
     """MATH.md 3.1: every row of every fund is counted by its company's industry and home. A fund's report names a share
     by its ISIN alone; where the funds' holdings say it trades (its `listing`) gives its ticker and exchange's country,
-    by which its region's listings classify it, where its own fields give neither."""
-    from harness.derive.owned import candidates, traded
+    by which the file's rows classify it, where its own fields give neither."""
+    from harness.derive.owned import built_symbols, traded
     row = {"isin": "KYG875721634", "constituent_name": "TENCENT", "listing": {"ticker": "700", "country": "HK"}}
     assert traded(row) == ("700", "HK")
-    assert candidates("row:x", {"row": row}, {}) == ["0700.HK"]
+    assert built_symbols({"row": row}) == ["0700.HK"]
     stated = {**row, "constituent_ticker": "700", "country_of_exchange": "HK"}
     assert traded({**stated, "listing": {"ticker": "X", "country": "US"}}) == ("700", "HK")  # the fund's own first

@@ -1,10 +1,12 @@
-"""The horizon distribution of an event's holdings (MATH.md 1.8).
+"""The distribution of an event's holdings on its own date (MATH.md 1.8).
 
-One joint state is sampled for each draw. Factors, companies, currencies and fund
-remainders share it, and every occurrence of a company sees the same price. The
-state's covariance over completed moves is estimated as the portfolio's volatility is
-(3.2). Probabilities mix the conditional distributions; they do not change their
-ordinary width.
+An event's outcomes are drawn on the date by which all of them are known (`event_date`):
+the portfolio as it stands once all its outcomes are known. One joint state is sampled for each
+draw. Factors, companies, currencies and fund remainders share it, and every
+occurrence of a company sees the same price. The state's covariance over completed
+moves is estimated as the portfolio's volatility is (3.2), and varies over the
+sessions to that date. Probabilities mix the conditional distributions; they do not
+change their ordinary width.
 """
 
 from __future__ import annotations
@@ -12,7 +14,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import Future
 from copy import deepcopy
-from datetime import date, timedelta
 from hashlib import sha256
 import json
 import math
@@ -20,7 +21,7 @@ from threading import Lock
 
 import numpy as np
 
-from harness.derive import estimate, history, series
+from harness.derive import estimate, history, outcomes, series
 from harness.derive.engine import Derivation, Inputs, Unavailable
 from harness.derive.portfolio import ticker_of
 
@@ -260,11 +261,32 @@ def summarize(samples: dict[str, np.ndarray], worlds: dict, *, centres: dict | N
             "sample_count": len(next(iter(samples.values())))}
 
 
-def _inputs(ctx: Inputs, pid: str) -> dict:
+def drawn_on(asof: str, *ends: str) -> str:
+    """The date a set of worlds is drawn on (MATH.md 1.8): the date they are all known, the latest of the `window_end`s
+    given, each the date its proposition is decided on, or by where it can happen at any time through its window. A
+    date that has passed by the as-of is the as-of: what it decides is already known, and its worlds are drawn over no
+    sessions."""
+    return max(asof[:10], *(e[:10] for e in ends))
+
+
+def event_date(ctx: Inputs, *events: str) -> str:
+    """The date watched events' outcomes are drawn on (MATH.md 1.1, 1.8): the date by which all their outcomes are known,
+    the latest `window_end` of each event and its ways at any depth (outcomes.tree). A way can be decided after its
+    event, a step and what follows it, and after the horizon's end, which holds the event and not its ways; its
+    outcomes are drawn on its own date. A band shares its rung's date. Events read together are drawn on the latest of
+    their dates (1.9). It also decides which of a fund's contracts outlive them (1.6)."""
+    return drawn_on(ctx.object("portfolio")["stated"]["asof"],
+                    *(ctx.object(p)["stated"]["window_end"]
+                      for e in events for p in (e, *(w["id"] for w in outcomes.tree(ctx, e)))))
+
+
+def _inputs(ctx: Inputs, pid: str, *, on: str | None = None) -> dict:
+    """What an event's distribution reads: its valued worlds, the state, and the held contracts that pay by the date it
+    is drawn on, `on` where events read together name it (their latest date), and otherwise the event's own."""
     from harness.derive import impact, valuation
     portfolio = ctx.object("portfolio")["stated"]
     asof = portfolio["asof"]
-    end = (date.fromisoformat(asof) + timedelta(days=portfolio["horizon_days"])).isoformat()
+    end = on or event_date(ctx, pid)
     centre = ctx.value("impact", pid, ref=True)
     fitted = ctx.value("betas", "portfolio", ref=True)
     fitted_output = ctx.payload(fitted)
@@ -283,7 +305,7 @@ def _inputs(ctx: Inputs, pid: str) -> dict:
         ctx, pid, ctx.value("outcomes", pid)["output"], through=end, receipt=contract_receipt)
     valued = impact._without({**valued, "contracts": contracts, "contract_states": contract_states},
                              contract_receipt.get("waiting"))
-    return {"event": pid, "asof": asof, "horizon_end": end, "sample_count": SAMPLES, "seed": SEED,
+    return {"event": pid, "asof": asof, "drawn_on": end, "sample_count": SAMPLES, "seed": SEED,
             "impact": centre, "valuation": valued, "contract_receipt": contract_receipt,
             "factors": ctx.value("factors", "market", ref=True), "betas": fitted,
             "series": {n: found[t] for n, t in names.items()}}
@@ -420,6 +442,8 @@ def _state_uncached(m: dict, load) -> tuple[dict, np.ndarray, dict, dict]:
     names, covariance, cohorts = state_covariance(x, residuals, memory=settings.memory,
                                                  own_lean=settings.own_lean, kappa=settings.kappa)
     for n, anchor in detached.items():
+        if anchor["state_covariance"] is None:  # its history to its date gives no covariance to draw it by
+            raise Unavailable("the company on its own needs at least two observed sessions to carry its uncertainty")
         covariance = append_dated_residual(covariance, np.asarray(anchor["state_covariance"]), mdl.k)
         names.append(n)
         cohorts.append({"names": [n], "sessions": len(anchor["sessions"]) - 1,
@@ -453,7 +477,7 @@ def _compute(m: dict, load) -> dict:
         raise Unavailable("the event has no valued worlds to draw its distribution from")
     st = _state(m, load)
     state, covariance = st.about, st.covariance
-    ahead = series.sessions_after(m["asof"], m["horizon_end"])
+    ahead = series.sessions_after(m["asof"], m["drawn_on"])
     factor_ids = state["channels"]
     dimension = len(covariance)
     sample_count = m["sample_count"]
@@ -505,35 +529,14 @@ def _compute(m: dict, load) -> dict:
         variances["__factor_covariance__"] = covariance[:len(factor_ids), :len(factor_ids)] * sessions
         return factors, names, variances
 
-    terms = centre.get("valuation_terms") or {}
-    expiries = sorted({s["expiry"] for group in (terms.get("options") or {}).values()
-                       for s in (group.get("contracts") or [])
-                       if s.get("expiry") and m["asof"] < s["expiry"] < m["horizon_end"]})
-    expiry_increments = {}
-    # Conditional Brownian bridges retain the same joint path for early expiry
-    # and the horizon. Generate dates in chronological order, not independently.
-    previous = np.zeros_like(increments)
-    previous_time = 0
-    for expiry in expiries:
-        t = series.sessions_after(m["asof"], expiry)
-        fraction = (t - previous_time) / (ahead - previous_time) if ahead > previous_time else 0.0
-        bridge_variance = (t - previous_time) * (ahead - t) / (ahead - previous_time) if ahead > previous_time else 0.0
-        noise = rng.standard_normal(increments.shape) @ (st.root.T * math.sqrt(bridge_variance))
-        previous = previous + fraction * (increments - previous) + noise
-        previous_time = t
-        expiry_increments[expiry] = (previous.copy(), t)
     samples, sample_weights, holding_means, valuation_receipts = {}, {}, {}, {}
     contracts = {c["holding"]: c for c in m["valuation"].get("contracts") or []
-                 if c.get("close") and c["close"][:10] <= m["horizon_end"]}
+                 if c.get("close") and c["close"][:10] <= m["drawn_on"]}
     for world in centre["worlds"]:
         factors, names, variances = moved(world, increments, ahead)
-        expiry_states = {}
-        for expiry, (bridge, t) in expiry_increments.items():
-            fs, ns, vs = moved(world, bridge, t)
-            expiry_states[expiry] = {"factors": fs, "names": ns, "variances": vs}
         receipt = {}
         values = valuation.value_state(m["valuation"], load, centre, world, factors, names, variances,
-                                       m["horizon_end"], expiry_states=expiry_states, receipt=receipt)
+                                       m["drawn_on"], receipt=receipt)
         if receipt:
             valuation_receipts[world] = receipt
         total = np.zeros(sample_count)
@@ -557,7 +560,7 @@ def _compute(m: dict, load) -> dict:
         else:
             samples[world] = total
     return {**summarize(samples, centre["worlds"], sample_weights=sample_weights),
-            "sample_count": sample_count, "horizon_end": m["horizon_end"],
+            "sample_count": sample_count, "drawn_on": m["drawn_on"],
             "sessions_ahead": ahead, "state": state,
             "holding_means": holding_means, "valuation_receipts": valuation_receipts,
             "contract_receipt": m.get("contract_receipt") or {},
@@ -570,7 +573,7 @@ def receipt(out: dict, pid: str) -> dict:
     The page reads the complete Computation. A default object read carries the
     forecast's quantities and method without repeating its plotting coordinates.
     """
-    keys = ("horizon_end", "sessions_ahead", "sample_count", "mean", "variance", "quantiles", "drift")
+    keys = ("drawn_on", "sessions_ahead", "sample_count", "mean", "variance", "quantiles", "drift")
     world_keys = ("p", "side", "mean", "variance", "centre", "quantiles")
     summary = {k: out[k] for k in keys}
     summary["worlds"] = {w: {k: row[k] for k in world_keys} for w, row in out["worlds"].items()}
@@ -582,7 +585,7 @@ def receipt(out: dict, pid: str) -> dict:
     return {"distribution": summary}
 
 
-DISTRIBUTION = Derivation("distribution", 3, "Proposition", _inputs, _compute,
+DISTRIBUTION = Derivation("distribution", 5, "Proposition", _inputs, _compute,
                           fields=("distribution",), applies=lambda store, pid: store.watched(pid),
                           pick=receipt, stage="distribution")
 DERIVATIONS = (DISTRIBUTION,)

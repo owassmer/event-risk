@@ -19,17 +19,23 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from harness import schema
-from harness.derive.checks import disputed, implication_question, market_question
+from harness.derive import distribution
+from harness.derive.checks import disputed, implication_question, market_question, way_question
 from harness.derive.engine import Inputs, Unavailable, Waiting
-from harness.derive.outcomes import ways_under
-from harness.derive.portfolio import NAME_TYPES, pseudo, reference_ticker, ticker_of
+from harness.derive.impact import baseline_parts
+from harness.derive.outcomes import tree as outcome_tree
+from harness.derive.portfolio import FLOOR, NAME_TYPES, pseudo, reference_ticker, ticker_of
 from harness.derive.markets import taken
-from harness.derive.structure import bands, store_component, subject
+from harness.derive import structure
+from harness.derive.structure import store_component, subject
 from harness.derive.oneform import same_worlds
 from harness.derive.worlds import in_its_terms, side_mean
 from harness.store import Store, StoreError
 from harness.trace import Trace
+from harness.derive import series
+from harness.derive.identity import store_lookup
 from harness.venues.massive import answered
+from harness.venues.sec import REPORTS
 
 log = logging.getLogger("harness.ledger")  # a read that failed past its retries, for us: the analyst never sees it
 
@@ -86,7 +92,7 @@ def _company(store: Store, nid: str) -> str | None:
 
 def _ways_of(store: Store, pid: str) -> list[str]:
     """Every way of an event, at any depth, each parent's in the order they were linked."""
-    return [w["id"] for w in ways_under(store.read_links, pid, lambda r: bands(Inputs(store.engine), r))]
+    return [w["id"] for w in outcome_tree(Inputs(store.engine), pid)]
 
 
 def outcomes(store: Store, pid: str, impact: dict | None = None) -> list[dict] | None:
@@ -220,8 +226,7 @@ def row(store: Store, pid: str) -> dict:
     """One watched proposition with every field the ledger's sentences read, each null where it has no value."""
     obj = store.get(pid, derived_fields=ROW_FIELDS)
     stated, derived = obj["stated"], obj["derived"]
-    out: dict[str, Any] = {"id": pid, **{k: stated.get(k) for k in (
-        "title", "text", "metric", "comparison", "value", "window_start", "window_end", "kind", "resolution_source")}}
+    out: dict[str, Any] = {"id": pid, **{k: stated.get(k) for k in schema.DEFINITION}}
     for f in ROW_FIELDS:
         out[f] = _value(derived, f)
     out["basis"] = {f: derived[f].get("basis") for f in ROW_FIELDS if derived.get(f, {}).get("basis")}
@@ -235,7 +240,8 @@ def row(store: Store, pid: str) -> dict:
     out["baseline"] = stated.get("baseline")
     out["outcomes"] = outcomes(store, pid, impact) if store.watched(pid) else None
     out["spread"] = impact.get("spread")  # each side's spread across its ways, the variance's part within it
-    out["priced_in"] = impact.get("priced_in")  # each weight stated for the event or a way, where prices carry another
+    # each weight stated for the event or a way, where prices carry another, read whether or not they hold together
+    out["priced_in"] = impact.get("priced_in") if impact else _impact_output(store, pid).get("priced_in")
     # each fund's remainder: what its own move comes to beyond what its rows reach moving as each does (MATH.md 1.7)
     out["remainders"] = impact.get("remainders")
     out["names"] = len(out["contributors"]) if out["contributors"] is not None else None
@@ -370,6 +376,16 @@ MOVES_WITH = "moves with the stated ones"
 TODAY = "against_today"
 
 
+def drawn_on(store: Store, *events: str) -> str | None:
+    """The date the outcomes of watched events are drawn on (MATH.md 1.1, 1.8), as their distribution names it once worked
+    out (`drawn_on`): the date by which all of an event's outcomes are known, the latest of their dates for events read
+    together, never before the as-of. One function with the derivation's (distribution.event_date), so the page names
+    the date before the draws are made."""
+    if not store.type_of("portfolio") or not events:
+        return None
+    return distribution.event_date(Inputs(store.engine), *events)
+
+
 def event_now(store: Store, pid: str) -> dict:
     """What a watched event now does, from its impact, in every world (TOOLS.md 5): each world with its probability, the
     weight today's prices put on it, and the portfolio's P&L there, in the outcome tree; in each world, each price a
@@ -474,7 +490,8 @@ def event_now(store: Store, pid: str) -> dict:
                     for h in sorted(moved, key=lambda h: (-max(abs(v) for v in h["against_baseline"].values()),
                                                           h["name"] or ""))]
         return {"id": pid, "watched": True, "basis": basis, "baseline": impact["baseline"],
-                "outcomes": _open_outcomes(store, pid, impact), "factors": factors, "names": names,
+                "outcomes": _with_parts(_open_outcomes(store, pid, impact), impact, channels), "factors": factors,
+                "names": names,
                 "holdings": holdings, **_waiting(store, impact), **({"why": why} if why else {})}
     levels = {}
     for c in (impact.get("consequences") or {}).values():
@@ -501,8 +518,36 @@ def event_now(store: Store, pid: str) -> dict:
                 if _moves(h)]
     got = row_figures(store, pid)
     return {"id": pid, "watched": True, "basis": basis, "baseline": impact["baseline"],
-            "outcomes": outcomes(store, pid, impact), "factors": factors, "names": names, "levels": levels,
-            "holdings": holdings, **_waiting(store, impact), "row": got}
+            "outcomes": _with_parts(outcomes(store, pid, impact), impact, channels), "factors": factors, "names": names,
+            "levels": levels, "holdings": holdings, **_waiting(store, impact), "row": got}
+
+
+def _with_parts(found: list[dict] | None, impact: dict, channels: list[dict]) -> list[dict] | None:
+    """Each world of the outcome tree with its P&L against the baseline in three parts (impact.baseline_parts): through
+    the prices a statement sets there, the factors among them as the world's statements set them (`setting`); through
+    the factors moving with them, the largest named; and the rest. Each to the cent."""
+    parts = impact.get("parts")
+    if not found or not parts:
+        return found
+    setting = impact.get("setting") or {}
+    split = baseline_parts(parts, impact["baseline"], {w: {t for t in setting.get(w) or {} if not t.startswith("name:")}
+                                                       for w in parts})
+    titles = {c["id"]: c["stated"]["name"] for c in channels}
+    for o in found:
+        got = split.get(o["id"])
+        if got is not None and o.get("world"):
+            o["against_baseline_parts"] = _parts_shown(got, titles)
+    return found
+
+
+def _parts_shown(got: dict, titles: dict[str, str]) -> dict:
+    """A world's three parts against the baseline as a return shows them: each to the cent, the largest moving factor by
+    its id and its name."""
+    top = got.get("largest_moving")
+    return {"stated": _cents(got["stated"]), "moving": _cents(got["moving"]),
+            **({"largest_moving": {"factor": top["factor"], "name": titles.get(top["factor"], top["factor"]),
+                                   "dollars": _cents(top["dollars"])}} if top else {}),
+            "rest": _cents(got["rest"])}
 
 
 def _waiting(store: Store, impact: dict) -> dict:
@@ -560,6 +605,46 @@ def _cents(x: float | None) -> float | None:
 
 def _six(x: float | None) -> float | None:
     return None if x is None else round(x, 6) + 0.0
+
+
+# A stretched book's figures that are shares (its bid and ask, and how far it was stretched below its bid or above its
+# ask), read to six places, and its depth, dollars, to the cent, as a row's figures are (TOOLS.md 9). The derivation keeps
+# them exact, for the page.
+STRETCH_SHARES = ("bid", "ask", "below", "above")
+
+
+def stretched_read(book: dict) -> dict:
+    """A book a structure stretched, as the analyst reads it: each share to six places, its depth to the cent."""
+    return {k: _six(v) if k in STRETCH_SHARES and isinstance(v, (int, float)) else
+            _cents(v) if k == "depth" and isinstance(v, (int, float)) else v for k, v in book.items()}
+
+
+def cannot_hold_read(sets: list[dict]) -> list[dict]:
+    """What cannot hold together in a structure, as the analyst reads it in a statement's return and in check(): each
+    chance by what it is given (structure.cannot_hold_shown), its figure to six places."""
+    return [{**c, "statements": [{**x, "value": _six(x["value"])}
+                                 if isinstance(x, dict) and isinstance(x.get("value"), (int, float)) else x
+                                 for x in c["statements"]]}
+            for c in structure.cannot_hold_shown(sets)]
+
+
+def consequence_read(got: dict) -> dict:
+    """A consequence as the analyst reads it (TOOLS.md 5): its price's level in each world to the cent, as a price is
+    shown, and its whole move and its residual there to six places. The Computation keeps them exact."""
+    derived = got.get("derived")
+    if got.get("relation") != "consequence" or not isinstance(derived, dict):
+        return got
+    out = dict(derived)
+    levels = (derived.get("levels") or {}).get("value")
+    if isinstance(levels, dict):
+        out["levels"] = {**derived["levels"], "value": {w: _cents(x) if isinstance(x, (int, float)) else x
+                                                        for w, x in levels.items()}}
+    moves = (derived.get("moves") or {}).get("value")
+    if isinstance(moves, dict):
+        out["moves"] = {**derived["moves"], "value": {
+            w: {k: _six(x) if isinstance(x, (int, float)) else x for k, x in m.items()} if isinstance(m, dict) else m
+            for w, m in moves.items()}}
+    return {**got, "derived": out}
 
 
 READ_ROW = ("probability", "left_open", "range", "full_impact", "contributors", "yes", "no", "expected",
@@ -664,7 +749,8 @@ def _full_impact_parts(store: Store, pid: str, cid: str, impact: dict) -> dict:
 def _derivation(store: Store, pid: str, terms: list[dict]) -> list[dict]:
     """A probability its chances fix, as the sum of its parts (MATH.md 1.2): each case of what those chances are given, its
     probability or the range its statements leave it, the markets that probability rests on, and the share of it where
-    the event holds, with the chance that states that share, or `links` where they leave it 0 or 1."""
+    the event holds, `by` the chance given that case, which states that share, or by the `links` where they leave it 0
+    or 1."""
     asks = {link["id"]: link["to"] for p in _decomposition(store, pid) for link in store.links_of(p, "asks")}
     book = lambda tag: tag.rsplit(":", 1)[0]  # noqa: E731  a book's statement: its asks link's, or a market standing as itself
     out = []
@@ -675,7 +761,7 @@ def _derivation(store: Store, pid: str, terms: list[dict]) -> list[dict]:
                     **({"probability": _six(t["p"])} if t.get("p") is not None else
                        {"range": [_six(t["range"]["lo"]), _six(t["range"]["hi"])]}),
                     "markets": markets, **({"share": _six(t["share"])} if t.get("share") is not None else {}),
-                    **({"chance": t["chance"]} if t.get("chance") else {}), **({"by": t["by"]} if t.get("by") else {})})
+                    **({"by": "chance"} if t.get("chance") else {"by": t["by"]} if t.get("by") else {})})
     return out
 
 
@@ -709,16 +795,52 @@ def ledger_read(store: Store, together: list[str] | None = None, considering: di
     fix, its derivation; the ledger by holding beside the rows; the portfolio's value and its volatility to the end of
     the period the ledger looks over; with `together`, the events named read as one set of worlds, and with
     `considering`, a contract valued in them (1.9). Each row's whole account is in the Computations its basis names."""
+    if together is not None:  # the combination alone: the rows and the holdings under each event are ledger()'s
+        from harness.derive.together import read
+        return {"together": together_shown(read(store, together, considering))}
     out = _ledger(store, together, considering, row_read, _cents)
     held = _ledger_by_holding(store)
     return {**{k: v for k, v in out.items() if k != "rows"}, "rows": out["rows"], **({"by_holding": held} if held else {})}
 
 
+# A share of something, read to six places where events read together are shown: a probability, a weight today's
+# prices put on a world, the discount a contract's payout takes, a price on a venue's book; every other figure of the
+# view is dollars, to the cent, and each factor's move is in the terms its shocks are stated in, to six places.
+_SHARES = frozenset({"p", "q", "probability", "pays_probability", "discount", "price"})
+
+
+def together_shown(view: dict) -> dict:
+    """Events read together as the analyst reads them (MATH.md 1.9, TOOLS.md 5): each joint world under its id, which names each
+    event's outcome there, with its probability, the weight today's prices put on it, each factor's move, the
+    portfolio's P&L and what is stated there; each event's averages over the joint worlds beside its row's; and the
+    distribution on the latest of their dates, each joint world by its own mean, variance and quantiles, its
+    probability and its P&L at its centre being given above. Each dollar to the cent and each share and move to six
+    places, as a row's (TOOLS.md 9). Where they cannot be read together, why."""
+    out = dict(view)
+    if isinstance(out.get("worlds"), list):
+        out["worlds"] = [{k: v for k, v in w.items() if k not in ("outcomes", "side")} for w in out["worlds"]]
+    drawn = out.get("distribution")
+    if isinstance(drawn, dict) and isinstance(drawn.get("worlds"), dict):
+        out["distribution"] = {**drawn, "worlds": {w: {k: v for k, v in x.items() if k not in ("p", "side", "centre")}
+                                                    for w, x in drawn["worlds"].items()}}
+    return _to_its_places(out)
+
+
+def _to_its_places(x: Any, key: str | None = None, share: bool = False) -> Any:
+    if isinstance(x, float):
+        return round(x, 6 if share or key in _SHARES else 2) + 0.0
+    if isinstance(x, dict):
+        return {k: _to_its_places(v, k, share or k == "factors") for k, v in x.items()}
+    if isinstance(x, list):
+        return [_to_its_places(v, key, share) for v in x]
+    return x
+
+
 def event_read(store: Store, pid: str) -> dict:
     """A watched event as get reads it (TOOLS.md 5): the proposition whole, its stated fields, its links and searches, the
     range the markets imply and its probability or the range its statements leave, each with its
-    basis; the event as it now stands, as every statement on it returns it (event_now); and the distribution of the
-    portfolio's P&L at the horizon's end. The row the event gives beside its worlds carries its figures, its
+    basis; the event as it now stands in every world (event_now), whose row each statement on it returns; and the distribution of the
+    portfolio's P&L on the event's date (drawn_on). The row the event gives beside its worlds carries its figures, its
     probability and range being read above with their basis. The whole account is in the Computations named."""
     obj = store.get(pid, derived_fields=("range", "probability", "left_open", "distribution"))
     now = event_now(store, pid)
@@ -882,68 +1004,53 @@ def channel_reach(store: Store) -> dict:
     return {"value": value, "factors": out}
 
 
-# A company at least this share of the portfolio's value, held directly and through its funds together, comes with
-# its latest news: the line diversification rules draw for one issuer (MATH.md 3.1).
-NEWS_LINE = 0.05
-FUND_GIVEN = 10  # a fund's largest holdings, places, and kinds of asset that adding the portfolio returns
+# A company at least this share of the portfolio's value, held directly and through its funds together, comes with the
+# reports it made over the span the horizon looks ahead over: the line diversification rules draw for one issuer, above
+# which the portfolio rides on that company's own developments (MATH.md 3.1).
+REPORTS_LINE = 0.05
+WEIGHT_PLACES = 5  # a weight in the portfolio's first return, as a fraction: the floor's 0.0005 and below read whole
+
+
+def _weight(w: float | None) -> float | None:
+    return round(w, WEIGHT_PLACES) if w is not None else None
+
+
+def _what_it_is(store: Store, nid: str, fund: dict | None, classified: dict | None = None) -> dict:
+    """What a holding is, in one line: a company, by its name; or a fund, by its name, with whether the look-through
+    reads what it holds (or why not), as of when, and how many holdings. What a company does, and what a fund holds
+    by name, by listing and by kind, are its Name's, which `get` reads."""
+    company = store.engine.value("reference", nid).output or {}
+    found = company.get("company") or {}
+    if fund is None:
+        name = (classified or {}).get("company") or found.get("name")
+        return {"company": name} if name else {}
+    holds = fund.get("holds") or {}
+    return {"fund": _shown({"name": found.get("name"), "looked_through": fund.get("expanded"),
+                            "reason": fund.get("reason"), "holdings_asof": holds.get("holdings_asof"),
+                            "holdings": holds.get("count")})}
 
 
 def _shown(item: dict, *, keep_null: bool = False) -> dict:
-    """An entry as the return gives it: dollars to the cent, weights to six places, and, unless kept, only the fields
-    it has."""
+    """An entry as the return gives it: dollars to the cent, weights to WEIGHT_PLACES, and, unless kept, only the
+    fields it has."""
     out = {}
     for k, v in item.items():
         if v is None and not keep_null:
             continue
-        out[k] = round(v, 2) if k == "dollars" and v is not None else round(v, 6) if k == "weight" and v is not None \
-            else v
+        out[k] = round(v, 2) if k == "dollars" and v is not None else _weight(v) if k == "weight" else v
     return out
-
-
-def _largest(groups: list[dict]) -> list[dict]:
-    """The FUND_GIVEN largest groups, then the others summed, with how many."""
-    shown = [_shown(g, keep_null=True) for g in groups[:FUND_GIVEN]]
-    rest = groups[FUND_GIVEN:]
-    if rest:
-        shown.append(_shown({"others": len(rest), "weight": sum(g["weight"] for g in rest),
-                             "dollars": sum(g["dollars"] for g in rest)}))
-    return shown
-
-
-def _what_it_is(store: Store, nid: str, fund: dict | None, classified: dict | None = None,
-                companies: dict | None = None) -> dict:
-    """What a holding is: a fund, with what it holds, its largest holdings, how its dollars divide by where its
-    holdings are listed and by kind of asset, and whether the look-through prices them; or a company (MATH.md 3.1): its
-    name, its industry and its home as the one classification the portfolio's weight is read by gives them
-    (`classified`, the company's entry in the weights' by_company), and what it does, in its reference's words. A fund's
-    largest holdings each take their company's industry from that one classification too (`companies`)."""
-    company = store.engine.value("reference", nid).output or {}
-    found = company.get("company") or {}
-    if fund is None:
-        if not found and not classified:
-            return {}
-        c = classified or {}
-        return {"company": _shown({"name": c.get("company") or found.get("name"), "does": found.get("does"),
-                                   "industry": c.get("industry"), "country": c.get("country")})}
-    holds = fund.get("holds") or {}
-    out = {"name": found.get("name"), "looked_through": fund.get("expanded"), "reason": fund.get("reason"),
-           "holdings_asof": holds.get("holdings_asof"), "holdings": holds.get("count")}
-    if holds:
-        out.update(largest=[_shown({**h, "industry": ((companies or {}).get(h.get("priced_as")) or {}).get("industry")})
-                            for h in holds["named"][:FUND_GIVEN]], by_listing=_largest(holds["by_listing"]),
-                   by_kind=_largest(holds["by_kind"]))
-    return {"fund": _shown(out)}
 
 
 def holdings(store: Store) -> dict:
     """What the portfolio owns, as of its as-of, and the end of the period the ledger looks over, the as-of plus its
-    horizon's days, by which each event it watches is decided. The holdings as given, each with its value, weight, and
-    its price's session move, and what it is: a company, with what it does and its industry, or a fund, with its
-    largest holdings and how its dollars divide by where its holdings are listed and by kind of asset; the portfolio's
-    move, their sum; and the largest names after look-through, each with what is held directly and through which
-    funds; and the latest news on each company that is at least NEWS_LINE of the portfolio's value. Nothing about the
-    factors: exposure() gives the portfolio's exposure to each. It reads the portfolio's stated fields alone, never what is derived from every name's prices: add returns it
-    before the exposures are computed (harness.tools)."""
+    horizon's days, by which each event it watches is decided (MATH.md 3.1, TOOLS.md 5). The holdings as given, each with its
+    value, weight, and its price's session move, and what it is, a company or a fund, in one line; the portfolio's move,
+    their sum; every company the look-through names, each by its id, its name and its weight, the rest summed with how
+    many, and what is not a company by kind; the portfolio's weight by industry and by country, each group by its id,
+    which `get` reads with the companies in it; and the reports of each company that is at least REPORTS_LINE of the
+    portfolio's value over the span the horizon looks ahead over. Nothing about the factors: exposure() gives the
+    portfolio's exposure to each. It reads the portfolio's stated fields alone, never what is derived from every name's
+    prices: add returns it before the exposures are computed (harness.tools)."""
     stated = _stated(store)
     asof = stated["asof"]
     held = store.engine.value("holdings", "portfolio")
@@ -961,14 +1068,10 @@ def holdings(store: Store) -> dict:
         for nid, dollars in reached.items():
             if pseudo(nid.split(":", 1)[1]):
                 continue  # cash
-            found = names.setdefault(nid, {"name": nid.split(":", 1)[1], "exposure": 0.0, "direct": 0.0, "through": {}})
+            found = names.setdefault(nid, {"name": nid.split(":", 1)[1], "exposure": 0.0})
             found["exposure"] += dollars
-            if nid.split(":", 1)[1] == of_holding.get(hid):
-                found["direct"] += dollars
-            else:
-                found["through"][of_holding.get(hid)] = found["through"].get(of_holding.get(hid), 0.0) + dollars
     ranked = sorted(names.values(), key=lambda n: (-abs(n["exposure"]), n["name"]))  # by absolute net exposure
-    # what each name's reference says it is, which picks the companies whose news comes with it (_companies), read
+    # what each name's reference says it is, which picks the companies whose reports come with it (_companies), read
     # while the weights are worked out, which nothing of it needs
     store.prefetch("ticker_ref", [t for t in (reference_ticker(f"name:{n['name']}") for n in ranked) if t],
                    (asof, asof), wait=False)
@@ -983,16 +1086,16 @@ def holdings(store: Store) -> dict:
         if row.get("cash"):  # cash, an amount in its currency, at its rate in dollars where it is another's
             other = row["cash"] != "USD"
             rows.append({"cash": link["stated"]["cash"], "currency": row["cash"], "dollars": row["dollars"],
-                         "weight": row["weight"], **({"rate": row["price"], "rate_at": row.get("price_time") or
-                                                       row.get("session"), "session_move": row.get("session_move"),
-                                                       "session_move_dollars": row.get("session_move_dollars")}
-                                                      if other else {})})
+                         "weight": _weight(row["weight"]),
+                         **({"rate": row["price"], "rate_at": row.get("price_time") or row.get("session"),
+                             "session_move": row.get("session_move"),
+                             "session_move_dollars": row.get("session_move_dollars")} if other else {})})
             continue
         ticker = link["stated"].get("ticker") or link["to"].split(":", 1)[1]  # the security held
         item = {"ticker": ticker, **({"name": link["to"]} if link["to"] != f"name:{ticker}" else {}),
                 "given": {k: v for k, v in link["stated"].items() if k != "ticker"},
                 "dollars": row["dollars"], "quantity": row["quantity"],
-                "weight": row["weight"], "price": row["price"], "price_from": row.get("price_from"),
+                "weight": _weight(row["weight"]), "price": row["price"], "price_from": row.get("price_from"),
                 "price_at": row.get("price_time") or row.get("session"), "session": row.get("session"),
                 "previous_close": row.get("previous_close"), "session_move": row.get("session_move"),
                 "session_move_dollars": row.get("session_move_dollars")}
@@ -1001,17 +1104,17 @@ def holdings(store: Store) -> dict:
             item.update(contract=True, market=link["to"], side=link["stated"]["side"],
                         question=listing.get("question"))
         else:
-            item.update(_what_it_is(store, link["to"], funds.get(ticker), classified.get(link["to"]), classified))
+            item.update(_what_it_is(store, link["to"], funds.get(ticker), classified.get(link["to"])))
         rows.append(item)
-    # The news looks back from the as-of over the span the horizon looks ahead over.
+    # The reports look back from the as-of over the span the horizon looks ahead over.
     since = (date.fromisoformat(asof) - timedelta(days=stated["horizon_days"])).isoformat()
-    news = _news(store, _companies(store, ranked, held.output["V"], asof), since, asof)
     return {"asof": asof, "horizon_end": horizon, "value": held.output["V"],
             "session_move": held.output.get("session_move"),
             "session_move_dollars": held.output.get("session_move_dollars"), "holdings": rows,
-            "by_company": [_listed(c) for c in _by_company(lists["by_company"], names)],
-            "by_industry": [_listed(g) for g in lists["by_industry"]],
-            "by_country": [_listed(g) for g in lists["by_country"]], "news": news}
+            "by_company": _by_company(lists["by_company"]),
+            "by_industry": _groups(lists["by_industry"], "industry"),
+            "by_country": _groups(lists["by_country"], "country"),
+            "reports": _reports(store, _companies(store, ranked, held.output["V"], asof), since, asof)}
 
 
 def portfolio(store: Store) -> dict:
@@ -1030,97 +1133,180 @@ def portfolio_whole(store: Store) -> dict:
     return {**portfolio(store), "derived": got["derived"], "links": got["links"]}
 
 
-def _listed(entry: dict) -> dict:
-    """An entry of the portfolio's weight by company, industry or country as the analyst reads it: dollars to the cent and
-    weights to six places (_shown), each field kept where it has none, so a company no source classifies says so; and an
-    industry's or a country's companies once, under each company, not again as a list beside the group."""
-    out = _shown({k: v for k, v in entry.items() if k != "names"}, keep_null=True)
-    if isinstance(out.get("direct"), float):
-        out["direct"] = round(out["direct"], 2)
-    if isinstance(out.get("through"), dict):
-        out["through"] = {fund: round(x, 2) for fund, x in out["through"].items()}
-    return out
-
-
-def _by_company(listed: list[dict], names: dict[str, dict]) -> list[dict]:
-    """The portfolio's weight by company as add returns it: each company a name stands for, with how it is held,
-    directly and through which funds; the companies below every fund's floor that no name stands for, summed, with
-    how many they are (each is in the weights' by_company, which the page reads whole); and what is not a company, by
-    kind."""
-    out, rest = [], {"companies": 0, "dollars": 0.0, "weight": 0.0}
+def _by_company(listed: list[dict]) -> list[dict]:
+    """The portfolio's weight by company as the analyst reads it, largest first: each company the look-through names,
+    by its id, its name and its weight; the companies below the floor, which no name stands for, summed, with how many
+    (each is in the weights' by_company, which the page reads whole); and what is not a company, by kind."""
+    named, rest, kinds = [], {"companies": 0, "weight": 0.0}, []
     for c in listed:
         if "kind" in c:
-            out.append(c)
+            kinds.append({"kind": c["kind"], "weight": _weight(c["weight"])})
         elif c.get("name"):
-            held = names.get(c["name"]) or {}
-            out.append({**c, "direct": held.get("direct", 0.0), "through": held.get("through", {})})
+            named.append({"id": c["name"], "company": c["company"], "weight": _weight(c["weight"])})
         else:
             rest["companies"] += 1
-            rest["dollars"] += c["dollars"]
-            rest["weight"] = (rest["weight"] or 0.0) + (c["weight"] or 0.0)
-    kinds = [c for c in out if "kind" in c]
-    named = [c for c in out if "kind" not in c]
+            rest["weight"] += c["weight"] or 0.0
+    rest["weight"] = _weight(rest["weight"])
     return named + ([rest] if rest["companies"] else []) + kinds
 
 
+PLURAL = {"industry": "industries", "country": "countries"}
+
+
+def _listed(g: dict) -> bool:
+    """An industry or a country the portfolio's lists give by its id: one of at least the look-through's line, FLOOR,
+    of the portfolio, the line at which a company is named, so that one under it, whose every company is under it too,
+    stands with the others together, as those companies do."""
+    return bool(g.get("id")) and abs(g.get("weight") or 0.0) >= FLOOR
+
+
+def _groups(listed: list[dict], by: str) -> list[dict]:
+    """The portfolio's weight by industry or by country as its first return gives it, largest first: each at least
+    FLOOR of the portfolio by its id, which `get` reads with the companies in it, and its weight; those under it
+    together, with how many; one no source classifies, by its want of a name; and what is not a company, by its
+    kind."""
+    out, rest, kinds = [], {PLURAL[by]: 0, "weight": 0.0}, []
+    for g in listed:
+        if "kind" in g:
+            kinds.append({"kind": g["kind"], "weight": _weight(g["weight"])})
+        elif _listed(g):
+            out.append({"id": g["id"], "weight": _weight(g["weight"])})
+        elif g.get("id"):
+            rest[PLURAL[by]] += 1
+            rest["weight"] += g["weight"] or 0.0
+        else:
+            out.append({by: None, "weight": _weight(g["weight"])})
+    rest["weight"] = _weight(rest["weight"])
+    return out + ([rest] if rest[PLURAL[by]] else []) + kinds
+
+
+def group(store: Store, gid: str) -> dict:
+    """An industry or a country the portfolio holds companies in, by its id (TOOLS.md 5's `get`): its name, its weight of
+    the portfolio and its dollars, and the companies in it, each the look-through names by its id, its name and its
+    weight, the rest summed with how many. An id that names none of the groups the portfolio's lists give by id (_listed)
+    is refused, naming the list that gives them."""
+    by = gid.split(":", 1)[0]
+    weights = store.engine.value("weights", "portfolio")
+    if weights.output is None:
+        raise Unavailable(weights.cause or "where the portfolio's weight is, by industry and by country, is not read")
+    lists = weights.output
+    found = next((g for g in lists[f"by_{by}"] if g.get("id") == gid and _listed(g)), None)
+    if found is None:
+        raise StoreError(f"{gid} is not one of the {PLURAL[by]} the portfolio lists. Its by_{by} lists each that is at "
+                         f"least {FLOOR:.2%} of it, by its id.")
+    inside = [c for c in lists["by_company"] if c.get(f"{by}_id") == gid]
+    about = {"industry": found.get("industry"), "sector": found.get("sector")} if by == "industry" else \
+        {"country": found.get("country"), "name": found.get("country_name")}
+    return {"id": gid, **{k: v for k, v in about.items() if v is not None}, "dollars": round(found["dollars"], 2),
+            "weight": _weight(found["weight"]), "companies": found["companies"], "by_company": _by_company(inside)}
+
+
 def _companies(store: Store, ranked: list[dict], value: float | None, asof: str) -> list[str]:
-    """Each company that is at least NEWS_LINE of the portfolio's value, held directly and through its funds together,
-    largest first, by the ticker of its largest listing: a name is a company's where its ticker reference is a share
-    of one (a common stock, an ordinary share, a depositary receipt, a preferred), and a company's listings, its share
-    classes, count together by the CIK their references name. The line is on the absolute net exposure after
-    look-through, held directly and through funds, long and short netted, the same for every company. A fund's own news is about its flows and the market, so a fund gets none, whether it is booked
-    whole or looked through."""
+    """Each company that is at least REPORTS_LINE of the portfolio's value, held directly and through its funds
+    together, largest first, by the ticker of its largest listing: a name is a company's where its ticker reference is a
+    share of one (a common stock, an ordinary share, a depositary receipt, a preferred), and a company's listings, its
+    share classes, count together by the CIK their references name. The line is on the absolute net exposure after
+    look-through, held directly and through funds, long and short netted, the same for every company. A fund's reports
+    are about the fund, not what it holds, so a fund gets none, whether it is booked whole or looked through."""
     if not value:
         return []
     companies: dict[str, dict] = {}
     for n in ranked:
-        if (store.engine.value("reference", f"name:{n['name']}").output or {}).get("type") not in NAME_TYPES:
+        nid = f"name:{n['name']}"
+        if series.is_abroad(n["name"]):
+            if (store.engine.value("lookthrough", "portfolio").output["kinds"].get(nid) or {}).get("kind") != "name":
+                continue
+        elif (store.engine.value("reference", nid).output or {}).get("type") not in NAME_TYPES:
             continue
         found = companies.setdefault(_cik(store, n["name"], asof) or n["name"], {"exposure": 0.0, "ticker": n["name"]})
         found["exposure"] += n["exposure"]  # the largest listing comes first, as the names are ranked
     held = sorted(companies.values(), key=lambda c: -abs(c["exposure"]))
-    return [c["ticker"] for c in held if abs(c["exposure"]) >= NEWS_LINE * value]
+    return [c["ticker"] for c in held if abs(c["exposure"]) >= REPORTS_LINE * value]
 
 
 def _cik(store: Store, ticker: str, asof: str) -> str | None:
-    """The CIK a listing's ticker reference names, which its company's other share classes name too."""
+    """A US listing's company's CIK, which its other share classes name too: the one the SEC's list gives its ticker,
+    else the one its ticker reference names (identity.Lookup.company_cik: Massive's copy is out of date for a tracking
+    stock and a ticker that passed to another registrant)."""
+    if series.is_abroad(ticker):
+        return None
     row = store.data("ticker_ref", ticker, covering=(asof, asof), required=False)
     payload = store.data_payload(row["id"]) if row else None
-    found = (payload.get("results") or {}) if answered(payload) else {}
-    return str(found["cik"]).lstrip("0") or None if found.get("cik") else None
+    given = ((payload.get("results") or {}) if answered(payload) else {}).get("cik")
+    found = store_lookup(store, asof).company_cik(ticker, given)
+    return str(found) if found else None
 
 
-def _news(store: Store, tickers: list[str], since: str, asof: str) -> list[dict]:
-    """The latest news on the largest companies: each one's most recent articles published from `since` to the
-    as-of, read side by side and kept as data, each article once, newest first, with every one of these companies it
-    is about; its date, publisher, headline, summary, keywords, and link, as its source writes them. A company with no
-    article then has none. A sentiment label is a reading of what the news means, which is the analyst's, so it stays
-    out, as do images and logos. A news read that fails past its retries raises, so what the portfolio owns is not read
-    without it and the call that asked fails with nothing written (TOOLS.md 5); a read that finds no article is the
-    complete answer, none. News no client reads here (the Massive key not set, or its plan without news) is absent."""
-    store.prefetch("news", tickers, (since, asof), stage={"stage": "news"})
-    articles: dict[str, dict] = {}
-    absent: dict[str, str] = {}
+SEC_RECORD = "its current and periodic reports at the SEC"
+HOME_RECORD = "its results, from Yahoo Finance"
+
+
+def _reports(store: Store, tickers: list[str], since: str, asof: str) -> list[dict]:
+    """Each of these companies' reports over the span, from `since` to the as-of, largest company first, each entry
+    naming which part of its record they are. A company that files its reports at the SEC, as its record there holds them over the
+    year to the as-of (harness.venues.sec RECORD_REACH): its current reports (an 8-K, with the numbers of the items it
+    reports under, as the company states them; a foreign issuer's 6-K) and its periodic reports (10-Q, 10-K, 20-F,
+    40-F), with their amendments, newest first, each by its filing date, its form, its period where it states one, and
+    the address fetch_source reads it whole at (sec REPORTS). What is material is the company's to say under its
+    disclosure rules, so every report is given, with no reading of ours. A company that files none there, though it
+    may have a CIK (a receipt's registration alone): its results as its home market's record gives them, by the
+    listing it is priced through, each reported within the span. A read that fails past its retries raises, so what
+    the portfolio owns is not read without it and the call that asked fails with nothing written (TOOLS.md 5); a record no
+    client reads here is left out."""
+    ciks = {t: _cik(store, t, asof) for t in tickers}
+    store.prefetch("sec_filings", sorted({c.zfill(10) for c in ciks.values() if c}), (asof, asof),
+                   stage={"stage": "reports"})
+    filed: dict[str, list[dict]] = {}  # each company's reports at the SEC over the year, where it files any
+    for ticker, cik in ciks.items():
+        if not cik:
+            continue
+        row = store.data("sec_filings", cik.zfill(10), covering=(asof, asof), required=False)
+        payload = (store.data_payload(row["id"]) or {}) if row else None
+        if payload is None:
+            log.info("reports: %s: the SEC is not read here", ticker)
+            continue
+        found = [f for f in payload.get("filings") or [] if f["form"] in REPORTS and f["filed"] <= asof]
+        if found:
+            filed[ticker] = found
+    homes = {t: _home_symbol(store, t, asof) for t in tickers if t not in filed}
+    store.prefetch("company_record", sorted({s for s in homes.values() if s}), (asof, asof),
+                   stage={"stage": "reports"})
+    out = []
     for ticker in tickers:
-        row = store.data("news", ticker, covering=(since, asof), required=False)  # a failure raises
-        if row is None:
-            absent[ticker] = "the news is read with the Massive key, which is not set here"
+        if ticker in filed:
+            cik = int(ciks[ticker])
+            reports = [{"filed": f["filed"], "form": f["form"], **({"items": f["items"]} if f.get("items") else {}),
+                        **({"period": f["period"]} if f.get("period") else {}),
+                        "url": f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+                               f"{f['accession'].replace('-', '')}/{f['document']}"}
+                       for f in filed[ticker] if f["filed"] >= since]
+            out.append({"company": f"name:{ticker}", "record": SEC_RECORD,
+                        "reports": sorted(reports, key=lambda r: r["filed"], reverse=True)})
             continue
-        payload = store.data_payload(row["id"]) or {}
-        if not answered(payload):
-            absent[ticker] = f"Massive answered {payload.get('http_status') or payload.get('status')} for its news"
+        row = store.data("company_record", homes[ticker], covering=(asof, asof), required=False) \
+            if homes.get(ticker) else None
+        record = (store.data_payload(row["id"]) or {}) if row else None
+        if record is None:
+            log.info("reports: %s: its home market's record is not read here", ticker)
             continue
-        for r in payload.get("results") or []:
-            articles.setdefault(r.get("id") or r.get("article_url"), r)
-    order = {t: i for i, t in enumerate(tickers)}
-    out = [{"published": r.get("published_utc"), "publisher": (r.get("publisher") or {}).get("name"),
-            "title": r.get("title"), "summary": r.get("description"), "keywords": r.get("keywords") or [],
-            "url": r.get("article_url"),
-            "about": sorted((t for t in r.get("tickers") or [] if t in order), key=order.get)}
-           for r in articles.values()]
-    for ticker, why in absent.items():
-        log.info("news: %s: %s", ticker, why)
-    return sorted(out, key=lambda a: a["published"] or "", reverse=True)
+        results = [r for r in record.get("results") or [] if r.get("date") and since <= r["date"] <= asof]
+        out.append({"company": f"name:{ticker}", "record": HOME_RECORD,
+                    "results": sorted(results, key=lambda r: r["date"], reverse=True)})
+    return out
+
+
+def _home_symbol(store: Store, ticker: str, asof: str) -> str | None:
+    """The symbol a company's record on its own market is read under: the listing it is priced through, its own symbol
+    where that is a listing abroad, the one its ISIN's search finds where it is named `{ISIN}:{country}`, and a US
+    listing's ticker as Yahoo writes it."""
+    kinds = (store.engine.value("lookthrough", "portfolio").output or {}).get("kinds") or {}
+    security = (kinds.get(f"name:{ticker}") or {}).get("security") or ticker
+    if series.symbol_abroad(security):
+        return security
+    if series.is_abroad(security):
+        row = store.data("listing_symbol", f"{security}@{asof[:7]}", covering=(asof, asof), required=False)
+        return ((store.data_payload(row["id"]) or {}).get("symbol") or None) if row else None
+    return security.replace(".", "-")
 
 
 FACTOR_REACH = ("dollar_beta", "beta", "per_point", "largest_month_applied")
@@ -1181,15 +1367,19 @@ def _assumption(store: Store, owner: str, field: str, stated: dict) -> dict:
     return {"id": owner, "field": field, "value": value, "basis": basis}
 
 
-JUDGED = {"asks": ("forward", "converse"), "implies": ("check",)}  # the derived fields a reading of two texts gives
+JUDGED = {"asks": ("forward", "converse"), "implies": ("check",), "way": ("check",)}  # a reading of two texts
 
 
 def _sentence(relation: str, first: str, second: str, side: str, off: set[str]) -> str:
     """What differs between a claim and its two texts, in one sentence: a market that can resolve the other side
     where its proposition is true, or its own where it is false; a first proposition that can be true where the
-    second is false."""
+    second is false; a way that can be true where its parent is false, or, on an event's No side, where it is true."""
     if relation == "implies":
-        return f"{first} can be true where {second} is false."
+        holds = (lambda x: f"{x} can resolve Yes") if schema.MARKET_ID_RE.match(first) else (lambda x: f"{x} can be true")
+        fails = f"{second} resolves No" if schema.MARKET_ID_RE.match(second) else f"{second} is false"
+        return f"{holds(first)} where {fails}."
+    if relation == "way":
+        return f"{second} can be true where {first} is {'true' if side == 'no' else 'false'}."
     own, other = ("Yes", "No") if side == "yes" else ("No", "Yes")
     parts = ([f"{other} where {first} is true"] if "forward" in off else []) + \
         ([f"{own} where {first} is false"] if "converse" in off else [])
@@ -1198,8 +1388,9 @@ def _sentence(relation: str, first: str, second: str, side: str, off: set[str]) 
 
 def differs(link: dict) -> str | None:
     """Where a link's two texts describe different outcomes, what differs, in one sentence (ONTOLOGY.md 2.2; TOOLS.md 6): an
-    `asks` link whose market can resolve the other side where its proposition is true, or its own where the proposition is false; an
-    `implies` link whose first proposition can be true where its second is false. None where they support it, or are
+    `asks` link whose market can resolve the other side where its proposition is true, or its own where the proposition
+    is false; an `implies` link whose first proposition can be true where its second is false; a `way` that can be true
+    where its parent is false, or true where its event is, for a way of the No side. None where they support it, or are
     not yet read."""
     fields = JUDGED.get(link.get("relation"))
     if not fields:
@@ -1252,7 +1443,7 @@ def _differs(store: Store) -> list[dict]:
 # ---------------------------------------------------------------- what each link's check says
 
 
-CHECKED = ("asks", "implies", "and", "or", "then")  # the links whose claims a check reads
+CHECKED = ("asks", "implies", "and", "or", "then", "way")  # the links whose claims a check reads
 
 
 def judged_relation(relation: str, answers: dict[str, float | None]) -> str | None:
@@ -1260,11 +1451,14 @@ def judged_relation(relation: str, answers: dict[str, float | None]) -> str | No
     its Yes outcomes (No under the complement), the first, against the proposition's, the second; the forward question
     asks whether the second's lie within the first's, the converse whether the first's lie within the second's, and two
     answers of yes or no cannot tell some outcomes shared from none, so neither within the other is named as that. An
-    implication's: whether the first's lie within the second's, which its one question cannot tell from the same."""
+    implication's, and a way's against its parent, the way first: whether the first's lie within the second's, which
+    its one question cannot tell from the same; and for a way of an event's No side, whether they share none."""
     if any(v is None for v in answers.values()):
         return None
     yes = {f: not disputed(v) for f, v in answers.items()}
-    if relation == "implies":
+    if relation == "way_no":
+        return "none shared" if yes["check"] else "some shared"
+    if relation in ("implies", "way"):
         return "the first's within the second's, or the same outcomes" if yes["check"] else \
             "the first's not within the second's"
     if yes["forward"] and yes["converse"]:
@@ -1293,13 +1487,16 @@ def _checks(store: Store, derived: dict, fields: tuple[str, ...]) -> dict[str, d
 
 
 def _question(store: Store, link: dict) -> dict:
-    """What a link's check would ask now, as its check asks it (checks.market_question, implication_question): the
-    questions, and the evidence they are asked over, the situation as fact included; or why it cannot be put now."""
+    """What a link's check would ask now, as its check asks it (checks.market_question, implication_question,
+    way_question): the questions, and the evidence they are asked over, the situation as fact included; or why it
+    cannot be put now."""
     ctx = Inputs(store.engine)
     try:
         if link["relation"] == "asks":
             asked, found = market_question(ctx, link["from"], link["to"],
                                            link["stated"].get("side") or "yes")
+        elif link["relation"] == "way":
+            asked, found = way_question(ctx, link["from"], link["to"], link["stated"].get("side"))
         else:
             asked, found = implication_question(ctx, link["from"], link["to"])
     except (Unavailable, Waiting) as e:
@@ -1307,15 +1504,25 @@ def _question(store: Store, link: dict) -> dict:
     return {"questions": [list(q) for q in asked], "evidence": found, "version": 1}
 
 
+DISPUTED = ("fields contradict", "judge does not allow", "answered by a note")  # each state check() lists
+
+
+def stands_disputed(state: dict) -> bool:
+    """Whether a claim's check, as link_states gives it, is one check() lists (TOOLS.md 6): the fields contradict it, or
+    the judge's reading of its two texts is one the claim does not allow, a note about it written or not."""
+    return state.get("state") in DISPUTED
+
+
 def link_states(store: Store, *, questions: bool = False) -> dict[str, dict]:
     """What each link's check says of the claim it makes, for check() and for a reply's frozen copy:
-    every asks, implies, and, or, and then link, in the order made, as {relation, from, to, state, ...}.
+    every asks, implies, and, or, then and way link, in the order made, as {relation, from, to, state, ...}.
 
     - `fields hold` or `fields contradict`: two propositions on one metric and resolution source, whose fields decide
-      the claim (an implication, or the containment a composite claims), with the values compared;
-    - `judge allows`, `judge does not allow`, or `answered by a note`: the judge's reading of a market check or of an
-      implication the fields do not decide, in the words of the judge's five relations (`reading`), each check with
-      its answer and Judgment;
+      the claim (an implication, the containment a composite claims, or the place a way claims, `side` naming a way of
+      an event's No side), with the values compared;
+    - `judge allows`, `judge does not allow`, or `answered by a note`: the judge's reading of a market check, or of an
+      implication or a way the fields do not decide, in the words of the judge's five relations (`reading`), each check
+      with its answer and Judgment;
       not allowed and answered where a note about the Judgment says why the reading is wrong;
     - `not yet checked`: a check the judge has not answered, and where `questions`, the question it would ask now,
       the situation as of now included, for asking later exactly as it would have been asked;
@@ -1329,7 +1536,7 @@ def link_states(store: Store, *, questions: bool = False) -> dict[str, dict]:
         tested = _value(derived, "terms")
         if tested is not None:
             item.update(state="fields hold" if tested["holds"] else "fields contradict", within=tested["within"],
-                        of=tested["of"])
+                        of=tested["of"], **({"side": "no"} if tested.get("side") == "no" else {}))
         elif relation in ("and", "or", "then"):
             item["state"] = "a definition"
         else:
@@ -1344,7 +1551,8 @@ def link_states(store: Store, *, questions: bool = False) -> dict[str, dict]:
                 state = "not yet checked"
             else:
                 state = "judge allows"
-            item.update(state=state, reading=judged_relation(relation, {f: c["answer"] for f, c in checks.items()}),
+            read_as = "way_no" if relation == "way" and (got.get("stated") or {}).get("side") == "no" else relation
+            item.update(state=state, reading=judged_relation(read_as, {f: c["answer"] for f, c in checks.items()}),
                         checks=checks)
             if questions and state == "not yet checked":
                 item["question"] = _question(store, store.link_by_id(r["id"]))
@@ -1361,13 +1569,13 @@ def _wrong(store: Store) -> dict:
     for props in _components(store):
         found = store.engine.value("structure", props[0])
         out = found.output or {}
-        for c in out.get("cannot_hold") or []:
+        for c in cannot_hold_read(out.get("cannot_hold") or []):  # each chance by what it is given
             cannot.append({**c, "structure": props, "basis": found.basis})
         for lid, st in (out.get("stretched") or {}).items():
-            stretched.append({"link": lid, **st, "basis": found.basis})
+            stretched.append({"link": lid, **stretched_read(st), "basis": found.basis})
         for lid, st in (out.get("implied_stretched") or {}).items():
             if lid not in (out.get("stretched") or {}):
-                stretched.append({"link": lid, **st, "links_alone": True, "basis": found.basis})
+                stretched.append({"link": lid, **stretched_read(st), "links_alone": True, "basis": found.basis})
     return {"cannot_hold": cannot, "stretched": stretched, "weights_cannot_hold": _weights_wrong(store),
             "values_contradict_price": _values_wrong(store), **_worlds_wrong(store),
             "shocks_differ": _shocks_differ(store)}
@@ -1451,6 +1659,14 @@ def _values_wrong(store: Store) -> list[dict]:
     return out
 
 
+def _impact_output(store: Store, pid: str) -> dict:
+    """An event's impact as the store worked it out, or nothing where it cannot be worked out."""
+    try:
+        return store.engine.value("impact", pid).output or {}
+    except Unavailable:
+        return {}
+
+
 def _weights_wrong(store: Store) -> list[dict]:
     """Each watched event whose weights today's prices are stated to put on its outcomes cannot hold together (1.5)."""
     out = []
@@ -1460,7 +1676,8 @@ def _weights_wrong(store: Store) -> list[dict]:
         except Unavailable:
             continue
         if (impact.output or {}).get("weights_cannot_hold"):
-            out.append({"id": pid, **impact.output["weights_cannot_hold"], "basis": impact.basis})
+            out.append({"id": pid, "priced_in": impact.output.get("priced_in"), **impact.output["weights_cannot_hold"],
+                        "basis": impact.basis})
     return out
 
 
@@ -1481,12 +1698,88 @@ def _worlds_wrong(store: Store) -> dict:
 
 def _fields_contradict(store: Store) -> list[dict]:
     """Claims between two propositions on one metric and resolution source that their fields do not give, with the
-    values compared (link_states): an implication, and the containment a composite of and, or, or then claims. A
+    values compared (link_states): an implication, the containment a composite of and, or, or then claims, and the
+    place a way claims, within its parent or, on an event's No side (`side`), never true where the event is. A
     proposition's fields count its outcomes as stated, so a claim they do not give is one they contradict; it is
     answered by changing the claim or the propositions, since a note does not change arithmetic."""
     return [{"link": lid, "relation": item["relation"], "from": item["from"], "to": item["to"],
-             "within": item["within"], "of": item["of"]}
+             "within": item["within"], "of": item["of"], **({"side": "no"} if item.get("side") == "no" else {})}
             for lid, item in link_states(store).items() if item["state"] == "fields contradict"]
+
+
+def _joint_wrong(store: Store) -> dict:
+    """What a joint world's statements leave open (MATH.md 1.9, TOOLS.md 6): a joint world whose id no longer names one outcome of
+    each event it names, which a tree that changed since leaves it, with why; two joint worlds that each state a price
+    and share joint worlds without one lying within the other, so that neither is nearer where both hold, with the
+    joint world to state it on; one whose shocks move factors where the worlds it lies in name different episodes and
+    no joint world holding it names one, with each of them; and a shock or value stated on a composite of events'
+    worlds, with the joint world's id it is stated on (a joint world has that one name). Each is as the joint view of
+    the events the joint world names reads it (together)."""
+    import itertools as it
+    from harness.derive import episode as ep
+    from harness.derive.outcomes import holds, joint_id, joint_world, meet, named_by, within
+    ctx = Inputs(store.engine)
+    nothing, kept, trees = [], {}, {}
+    for jid in store.ids_of("JointWorld"):
+        try:
+            joint_world(ctx, jid)
+        except ValueError as e:
+            nothing.append({"id": jid, "why": str(e)})
+            continue
+        named = named_by(jid)
+        for event in named:
+            if event not in trees:
+                trees[event] = store.engine.value("outcomes", event).output
+        if any(trees[e] is None for e in named):
+            continue
+        kept[jid] = {"named": named, "episode": (store.stated_of(jid) or {}).get("episode"),
+                     "states": {x["to"] for x in store.links_of(jid, "consequence")}
+                     | {x["to"] for x in store.links_of(jid, "worth")}}
+    nodes_of = lambda e: trees[e]["nodes"]  # noqa: E731
+    overlap = []
+    for a, b in it.combinations(kept, 2):
+        shared = meet(nodes_of, kept[a]["named"], kept[b]["named"])
+        if shared is None or within(nodes_of, kept[a]["named"], kept[b]["named"]) or \
+                within(nodes_of, kept[b]["named"], kept[a]["named"]):
+            continue
+        inner = [k for k in kept.values() if within(nodes_of, k["named"], kept[a]["named"])
+                 and within(nodes_of, k["named"], kept[b]["named"])]  # nearer than both where they hold
+        cells = [dict(zip(shared, ws)) for ws in it.product(*([w for w in trees[e]["worlds"]
+                                                                if holds(nodes_of(e), o, w)] for e, o in shared.items()))]
+        open_ = sorted(t for t in kept[a]["states"] & kept[b]["states"]
+                       if any(not any(t in k["states"] and within(nodes_of, cell, k["named"]) for k in inner)
+                              for cell in cells))
+        if open_:
+            overlap.append({"joint_worlds": [a, b], "prices": open_, "state_on": joint_id(shared)})
+    differ = []
+    for jid, k in kept.items():
+        if not any(t.startswith("factor:") for t in k["states"]):
+            continue
+        inside = {o: m for o, m in kept.items() if set(m["named"]) <= set(k["named"])}  # in its events' view
+        under = []
+        for event, outcome in k["named"].items():
+            held = ep.for_worlds(ctx, event, trees[event])
+            under.append([(event, w, held.get(w)) for w in trees[event]["worlds"] if holds(nodes_of(event), outcome, w)])
+        for combo in it.product(*under):
+            cell = {event: w for event, w, _ in combo}
+            holding = [o for o, m in inside.items() if within(nodes_of, cell, m["named"])]
+            if any(inside[o]["episode"] for o in holding):  # a joint world holding it names the episode it fills with
+                continue
+            if any(o != jid and within(nodes_of, inside[o]["named"], k["named"]) and
+                   any(t.startswith("factor:") for t in inside[o]["states"]) for o in holding):
+                continue  # listed under the narrower joint world that moves its factors there
+            windows = {tuple(e["window"]) for _, _, e in combo if e}
+            if len(windows) > 1:
+                differ.append({"id": jid, "worlds": cell,
+                               "episodes": [{"event": event, "world": w, "window": e["window"], "on": e["on"]}
+                                            for event, w, e in combo if e]})
+    composite = []
+    for r in store._all("SELECT id, from_id FROM link WHERE relation IN ('consequence', 'worth') ORDER BY rowid"):
+        jid = store._stands_for_joint(r["from_id"])
+        if jid is not None:
+            composite.append({"link": r["id"], "on": r["from_id"], "joint": jid})
+    return {"joint_names_no_outcome": nothing, "joint_statements_overlap": overlap, "joint_episodes_differ": differ,
+            "stated_on_composite": composite}
 
 
 def check(store: Store) -> dict:
@@ -1495,7 +1788,8 @@ def check(store: Store) -> dict:
     compared; and each link whose two texts describe different outcomes, with what differs, until the claim changes.
     What an event lacks, a probability or a shock that sets something, is in its row and in the return of
     each statement about it. It gates nothing."""
-    return {"fields_contradict": _fields_contradict(store), "differs": _differs(store), **_wrong(store)}
+    return {"fields_contradict": _fields_contradict(store), "differs": _differs(store), **_wrong(store),
+            **_joint_wrong(store)}
 
 
 # ---------------------------------------------------------------- what a store records

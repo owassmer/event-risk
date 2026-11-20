@@ -46,6 +46,7 @@ EPISODE = "episode"  # a dated window supplying a world's factor co-movement
 ANALYST = "analyst"  # add() for objects, link() for links
 NOTE = "note"  # note() creates a Note; link(note, "about", x) adds a target
 VENUE = "venue"  # a market enters when a link or a note names it, and is kept while one does
+NAMED = "named"  # a joint world enters when a statement names it by its outcomes, and is kept while one does
 FETCH = "fetch"  # a page fetched with fetch_source, or a document search_company read, kept once cited or linked
 HOLDINGS = "holdings"  # a Name: held, looked through to, or named by a link
 STORE = "store"  # cites: written by add or edit with a source_id
@@ -206,7 +207,7 @@ OBJECTS: dict[str, ObjectType] = {
             ),
             ("question", "rules", "resolution_source", "close_time", "strike", "strike_date", "family", "fees",
              "book", "history", "bid", "ask", "price", "depth", "risk_neutral", "open", "last_trade", "quoted_at",
-             "price_date", "history_price", "settlement"),
+             "price_date", "settlement"),
             VENUE,
             "A venue's market, kept while a link, a note or a chance names it.",
         ),
@@ -247,6 +248,17 @@ OBJECTS: dict[str, ObjectType] = {
             "A citation: a page fetched with fetch_source, or a document of a company's record read with search_company, "
             "kept while it is cited or linked as evidence; when its last use goes, it is again a fetched page, citable "
             "under the same id.",
+        ),
+        ObjectType(
+            "JointWorld",
+            "joint",
+            (Field("episode", EPISODE,
+                   doc="the past window whose factor co-movement this joint world uses: start and end, with its basis"),),
+            (),
+            NAMED,
+            "One world of each of several events at once, named by them: joint:{event}={outcome}|..., each event by its "
+            "id and each outcome as its event's outcomes name it, yes, no or a way's id. It is kept while a statement "
+            "names it: a consequence or a value on it, or its episode.",
         ),
         ObjectType("Note", "note", (Field("text", TEXT, required=True),), (), NOTE, "The analyst's reason."),
         ObjectType(
@@ -316,7 +328,7 @@ RELATIONS: dict[str, Relation] = {
             "way", ("Proposition",), ("Proposition",),
             (Field("side", ENUM, choices=("yes", "no"),
                    doc="on a way of an event, the side it lies on, yes or no; a way's own ways lie on its side"),),
-            (), ANALYST,
+            ("terms", "check"), ANALYST,
             "the second is one way the first can turn out: the ways under one parent exclude one another and together "
             "make it up, and a way can have ways of its own; an event's worlds are its sides and ways left whole",
         ),
@@ -336,18 +348,20 @@ RELATIONS: dict[str, Relation] = {
                  (Field("passages", TEXTS, required=True,
                         doc="the words of the page that bear, each quoted word for word from its text"),),
                  (), ANALYST, "a page that bears, through the passages the link quotes from it"),
-        Relation("consequence", ("Proposition",), ("Factor", "Name"),
+        Relation("consequence", ("Proposition", "JointWorld"), ("Factor", "Name"),
                  (Field("shock", MOVE, required=True,
                         doc="one figure with its basis, and inside it `against`: `baseline` where none is named, "
                             "the price's whole move against the baseline; or `what_it_follows`, its residual, its "
                             "further move from the value it would otherwise have in that world. A fraction of the "
                             "price at that place, -1 at the lowest; on a factor quoted as a yield, percentage points "
-                            "of that yield"),),
+                            "of that yield. Its basis holds `windows` where the figure is sized from past windows: "
+                            "each {start, end}, ending on or before the as-of, over which the price is measured as "
+                            "window_returns measures it"),),
                  ("levels", "moves"), ANALYST,
                  "what a world does to a price: an event, or a way of it, to the factor or the name whose price it "
                  "moves, with the shock you state; the price's level in each world, placed against today's, and its "
                  "move there, a name's own part with it"),
-        Relation("worth", ("Proposition",), ("Name",),
+        Relation("worth", ("Proposition", "JointWorld"), ("Name",),
                  (Field("world", ENUM, choices=("yes", "no")),
                   Field("value", WORTH, required=True)),
                  ("levels", "implied"), ANALYST,
@@ -398,6 +412,7 @@ DERIVED_LINK_RE = re.compile(r"^(looks_through_to|beta_to):([^>]+)>([^>]+)$")
 PROXY_METRIC_RE = re.compile(rf"^metric:price:({TICKER})$")
 NAME_ID_RE = re.compile(rf"^name:({TICKER})$")
 MARKET_ID_RE = re.compile(r"^market:([a-z_]+):(\S+)$")
+JOINT_ID_RE = re.compile(r"^joint:([^|=\s]+=[^|=\s]+)(\|[^|=\s]+=[^|=\s]+)*$")  # joint:{event}={outcome}|...
 CASH_ID_RE = re.compile(r"^cash:([A-Z]{3})$")  # cash in a currency, by its ISO 4217 code
 FAMILY_ID_RE = re.compile(r"^family:([a-z_]+):(\S+)$")  # a venue's own grouping of markets, read whole by get
 METRIC_ID_RE = re.compile(rf"^metric:({METRIC_ID})$")
@@ -525,9 +540,12 @@ def based(name: str, raw, number, *, needed: bool = True) -> dict:
     if sid is not None or passages is not None:
         if not isinstance(sid, str) or not SOURCE_ID_RE.match(sid):
             raise Invalid(f"{name}'s page is its source_id, src:N, with the passages that bear")
-        if not isinstance(passages, (list, tuple)) or not passages or \
-                not all(isinstance(x, str) and x.strip() for x in passages):
-            raise Invalid(f"{name}'s basis is {sid} with the passages that bear: a list of the page's own words")
+        if passages is None or (isinstance(passages, (list, tuple)) and not passages):
+            raise Invalid(f"{name}.passages: {sid} is cited with no passage quoted. A basis that cites a page quotes "
+                          f'its passages word for word: {{"value": ..., "source_id": "{sid}", "passages": ["..."]}}')
+        if not isinstance(passages, (list, tuple)) or not all(isinstance(x, str) and x.strip() for x in passages):
+            raise Invalid(f'{name}.passages: the passages are a list, each quoted word for word from {sid}: '
+                          f'["...", "..."]')
         out.update(source_id=sid, passages=list(passages))
     if note is not None:
         if not isinstance(note, str) or not note.strip():
@@ -553,15 +571,39 @@ def against(stated: dict) -> str:
     return stated.get(AGAINST) or BASELINE
 
 
+WINDOWS = "windows"  # the past windows a shock is sized from, part of its basis: [{"start": ..., "end": ...}, ...]
+WINDOWS_SHAPE = 'a list of one or more past windows, each {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}'
+
+
+def windows(name: str, raw) -> list[dict]:
+    """The past windows a shock is sized from (MATH.md 1.3; ONTOLOGY.md 2): part of its basis, beside its note or its
+    page, each the window an episode names (`window`), each given once, in the order given."""
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise Invalid(f"{name} is {WINDOWS_SHAPE}")
+    out = [window(f"{name}[{i}]", w) for i, w in enumerate(raw)]
+    for i, w in enumerate(out):
+        if w in out[:i]:
+            raise Invalid(f"{name}[{out.index(w)}] and {name}[{i}] are one window, {w['start']} to {w['end']}: each "
+                          f"window is given once")
+    return out
+
+
 def move(name: str, raw) -> dict:
     """A shock, with its basis (MATH.md 1.3; ONTOLOGY.md 2.2): its value, and `against`, `baseline` for the whole move,
-    where it names none, or `what_it_follows` for the residual."""
+    where it names none, or `what_it_follows` for the residual; and, in its basis beside its note or its page, the past
+    windows it is sized from, where it names any."""
     if not isinstance(raw, dict):
         raw = {"value": raw}
+    extra = sorted(set(raw) - {"value", AGAINST, WINDOWS, *BASIS})
+    if extra:
+        raise Invalid(f"{name} is its value with its basis, {BASIS_SHAPE}, and with `{AGAINST}` and `{WINDOWS}` where "
+                      f"it states them; not {', '.join(extra)}")
     ref = raw.get(AGAINST)
     if ref is not None and ref not in REFERENCES:
         raise Invalid(f"{name}.{AGAINST} is `{BASELINE}`, the whole move, or `{FOLLOWS}`, the residual")
-    out = based(name, {k: v for k, v in raw.items() if k != AGAINST}, _number)
+    out = based(name, {k: v for k, v in raw.items() if k not in (AGAINST, WINDOWS)}, _number)
+    if raw.get(WINDOWS) is not None:
+        out[WINDOWS] = windows(f"{name}.{WINDOWS}", raw[WINDOWS])
     return {**out, AGAINST: ref} if ref is not None else out
 
 
@@ -667,6 +709,13 @@ def chance(name: str, raw) -> dict:
     both = sorted(set(given) & set(given_not))
     if both:
         raise Invalid(f"{name} is given {', '.join(both)} both true and false")
+    if taken_away(raw):  # the chance given these propositions, removed with its basis
+        beside = [k for k in raw if k not in ("given", "given_not", "value")]
+        if beside:
+            shape = json.dumps({"given": given, "given_not": given_not, "value": None})
+            raise Invalid(f"{name} has a null value, which removes the chance {said(given, given_not)}, with "
+                          f"{_and(beside)} beside it. A chance is removed by what it is given alone: {shape}")
+        return {"given": given, "given_not": given_not, "value": None}
     if "through" in raw and "reading" not in raw:
         raise Invalid(f"{name}.through gives the date a market's question counts through where it is a rung of "
                       f"a ladder, with a reading")
@@ -685,6 +734,9 @@ def chance(name: str, raw) -> dict:
         return {"given": given, "given_not": given_not, "reading": reading(f"{name}.reading", raw["reading"]),
                 **({"through": {m: _date(f"{name}.through.{m}", d) for m, d in through.items()}} if rungs else {}),
                 **{k: v for k, v in basis.items() if k != "value"}}
+    if "value" in raw and (isinstance(raw["value"], bool) or not isinstance(raw["value"], (int, float))):
+        raise Invalid(f"{name}.value: a chance's value is a number from 0 to 1, with its basis beside it: "
+                      f"{_restated(raw)}")
     basis = based(name, {k: raw[k] for k in ("value", *BASIS) if k in raw}, _chance)
     out = {"given": given, "given_not": given_not, **basis}
     if "follow" not in raw and "responsiveness" not in raw:
@@ -706,8 +758,42 @@ def chance(name: str, raw) -> dict:
     return {**out, "follow": raw["follow"], "responsiveness": r}
 
 
+def taken_away(c: dict) -> bool:
+    """A chance stated with its value null: the chance given the same propositions, removed (ONTOLOGY.md 2.1)."""
+    return isinstance(c, dict) and "value" in c and c["value"] is None and "reading" not in c
+
+
+def _and(words: list[str]) -> str:
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
+
+
+def said(given, given_not) -> str:
+    """What a chance is given, in words: given some propositions and not others, or stated on its own."""
+    return f"given {' and '.join([*given, *(f'not {x}' for x in given_not)])}" if given or given_not else \
+        "stated on its own"
+
+
+def _a_chance(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and 0.0 <= x <= 1.0
+
+
+def _restated(raw: dict) -> str:
+    """A chance in the shape the store takes, from one whose value is not a number: its own keys, the figure it gave
+    inside its value where it gave one there, and its basis beside the value."""
+    inner = raw["value"] if isinstance(raw["value"], dict) else {}
+    figure = inner.get("value")
+    parts = [f'"{k}": [...]' for k in ("given", "given_not") if k in raw]
+    parts.append(f'"value": {figure!r}' if _a_chance(figure) else '"value": ...')
+    for k in [k for k in BASIS if k in raw or k in inner] or ["note"]:
+        parts.append(f'"{k}": [...]' if k == "passages" else f'"{k}": "..."')
+    parts += [f'"{k}": ...' for k in ("follow", "responsiveness") if k in raw]
+    return "{" + ", ".join(parts) + "}"
+
+
 def chances(name: str, raw) -> list[dict]:
-    """A proposition's chances (ONTOLOGY.md 2.1): a list, one for each set of propositions a chance is given."""
+    """A proposition's chances (ONTOLOGY.md 2.1): a list, one for each set of propositions a chance is given, each one written
+    in place of the chance given the same propositions or beside the others, and one whose value is null taking that
+    chance away (Store._merged_chances)."""
     if not isinstance(raw, (list, tuple)):
         raise Invalid(f"{name} is a list of chances, each with its basis: {CHANCES_SHAPE}")
     out = [chance(f"{name}[{i}]", c) for i, c in enumerate(raw)]
@@ -715,20 +801,21 @@ def chances(name: str, raw) -> list[dict]:
     for i, c in enumerate(out):
         k = condition(c)
         if k in seen:
-            said = f"given {' and '.join([*k[0], *(f'not {x}' for x in k[1])])}" if k[0] or k[1] else \
-                "stated on their own"
-            raise Invalid(f"{name}[{seen[k]}] and {name}[{i}] are both {said}: one chance is stated for each set of "
+            both = said(*k) if k[0] or k[1] else "stated on their own"
+            raise Invalid(f"{name}[{seen[k]}] and {name}[{i}] are both {both}: one chance is stated for each set of "
                           f"propositions it is given, and one on its own")
         seen[k] = i
     return out
 
 
-def episode(name: str, raw) -> dict:
+def window(name: str, raw) -> dict:
+    """A past window (ONTOLOGY.md 2.1, MATH.md 3.2): two dates, its start before its end. An episode's value is one, and so is each
+    window a shock is sized from; that it ends on or before the as-of is the store's to say, which knows the as-of."""
     if not isinstance(raw, dict) or set(raw) != {"start", "end"}:
         raise Invalid(f"{name} gives start and end as dates")
     start, end = (_date(f"{name}.{k}", raw[k]) for k in ("start", "end"))
     if start >= end:
-        raise Invalid(f"{name}.start precedes its end")
+        raise Invalid(f"{name}: a window starts before its end, and this one starts {start} and ends {end}")
     return {"start": start, "end": end}
 
 
@@ -848,7 +935,7 @@ def check_value(f: Field, value):
     if k == WORTH:
         return based(f.name, value, worth)
     if k == EPISODE:
-        return based(f.name, value, episode)
+        return based(f.name, value, window)
     raise AssertionError(f"unknown field kind {k}")
 
 

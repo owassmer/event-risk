@@ -434,6 +434,64 @@ def test_a_side_the_bands_do_not_make_up_whole_is_left_whole(w):
         w.store.edit(r25, "baseline", b1)
 
 
+def three_rungs(tmp_path):
+    """Above 3 watched, at 0.45, between above 2.5 at 0.80 and above 3.5 at 0.12, with the bands (2.5, 3] and
+    (3, 3.5]: its Yes side can be made up of (3, 3.5] and above 3.5, and its No side of (2.5, 3] and 2.5 or below."""
+    from test_impact import channel, world
+    w = world(tmp_path, g={"SPY": 100_000.0}, coefficients={"SPY": {}}, levels={"SPY": 100.0})
+    r25, r3 = priced(w, rung(w, "above 2.5", ">", 2.5), 0.80), priced(w, rung(w, "above 3", ">", 3.0), 0.45)
+    r35 = priced(w, rung(w, "above 3.5", ">", 3.5), 0.12)
+    b1, b2 = band(w, "(2.5, 3]", (">", 2.5), ("<=", 3.0)), band(w, "(3, 3.5]", (">", 3.0), ("<=", 3.5))
+    low = rung(w, "2.5 or below", "<=", 2.5)
+    w.link("portfolio", "watches", r3)
+    return w, {"r25": r25, "r3": r3, "r35": r35, "b1": b1, "b2": b2, "low": low}, channel(w, "SPY")
+
+
+def test_a_band_linked_as_a_way_puts_its_sides_bands_in_use_and_a_sides_ways_are_one_set(tmp_path):
+    """A side's ways are one set (MATH.md 1.1, 1.2). One band linked as a way of above 3's Yes side makes that side its
+    bands, (3, 3.5] and above 3.5: their probabilities are 0.33 and 0.12, and nothing waits, where the band alone
+    would have been the whole side, above 3 and (3, 3.5] one outcome against above 3.5's market. A way that is no band
+    is then a second division of that side, and is refused; so is linking a band as a way on a side made of other
+    linked ways, and a shock on one of its bands."""
+    from harness.store import StoreError
+    w, x, mkt = three_rungs(tmp_path / "a")
+    w.link(x["r3"], "way", x["b2"], side="yes")
+    tree = w.store.engine.value("outcomes", x["r3"]).output
+    assert tree["nodes"]["yes"]["ways"] == [x["b2"], x["r35"]] and tree["nodes"]["no"]["ways"] == []
+    assert (tree["nodes"][x["b2"]]["p"], tree["nodes"][x["r35"]]["p"]) == pytest.approx((0.33, 0.12))
+    assert "why" not in tree and w.store.engine.value("structure", x["r25"]).output["cannot_hold"] == []
+    other = w.prop("A rise of another kind")
+    with pytest.raises(StoreError, match=rf"{other} is not one of the bands that make up {x['r3']}'s Yes side "
+                                         rf"\({x['b2']}, {x['r35']}\): a way of that side is one of its bands"):
+        w.link(x["r3"], "way", other, side="yes")
+    w, x, mkt = three_rungs(tmp_path / "b")
+    other = w.prop("A rise of another kind")
+    w.link(x["r3"], "way", other, side="yes")
+    with pytest.raises(StoreError, match=rf"{x['r3']}'s Yes side is made up of {other}, and {x['b2']} is one of "
+                                         rf"the bands its fields place on it"):
+        w.link(x["r3"], "way", x["b2"], side="yes")
+    w.store.edit(x["r3"], "baseline", "no")
+    with pytest.raises(StoreError, match=rf"{x['r35']} is no world of {x['r3']}: its Yes side is made up of {other}"):
+        w.link(x["r35"], "consequence", mkt, shock=-0.12)
+
+
+def test_the_first_statement_on_a_band_not_yet_in_use_finds_its_event(tmp_path):
+    """Nothing is yet stated of above 3's bands, so its sides are whole. The first statement on one finds above 3 all
+    the same (MATH.md 1.2): a shock is stated against above 3's baseline, so it waits for one to be named; a value on a
+    band takes the band as its world, as on a way, and names no side; and the band is then a world of above 3."""
+    from harness import schema
+    from harness.store import StoreError
+    from test_impact import carrier
+    w, x, mkt = three_rungs(tmp_path)
+    with pytest.raises(StoreError, match=rf"{x['r3']} states none\. State it with edit\({x['r3']}, baseline"):
+        w.link(x["b2"], "consequence", mkt, shock=-0.05)
+    held = schema.name_id(carrier("SPY"))
+    with pytest.raises(StoreError, match="worth on a way takes that way as its world"):
+        w.store.link(x["b2"], "worth", held, {"world": "yes", "value": {"value": {"amount": 90.0}, "note": "x"}})
+    w.store.link(x["b2"], "worth", held, {"value": {"value": {"amount": 90.0}, "note": "its value in the band"}})
+    assert w.store.engine.value("outcomes", x["r3"]).output["nodes"]["yes"]["ways"] == [x["b2"], x["r35"]]
+
+
 def test_a_band_between_rungs_names_its_chance_given_the_rungs_about_it(w):
     """MATH.md 1.2: a band whose ends fall between rungs is open between what the rungs about it allow, and what would
     settle it is its chance given the rung below it and not the one above (rungs above 2.5,

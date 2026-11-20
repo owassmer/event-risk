@@ -38,7 +38,7 @@ import httpx
 import truststore
 
 from harness.derive.engine import Unavailable
-from harness.venues.http import USER_AGENT, Cooldown, VenueError, now
+from harness.venues.http import USER_AGENT, VenueError, now
 
 ECB = "https://data-api.ecb.europa.eu/service/data/YC/B.U2.EUR.4F.G_N_A.SV_C_YM.{}"
 ECB_TENORS = {"SR_3M": 0.25, "SR_6M": 0.5, "SR_9M": 0.75, "SR_1Y": 1, "SR_2Y": 2, "SR_3Y": 3, "SR_5Y": 5, "SR_7Y": 7,
@@ -104,19 +104,15 @@ class Curves:
     def __init__(self, *, http: httpx.Client | None = None):
         self.http = http or httpx.Client(timeout=TIMEOUT, follow_redirects=True, headers={"User-Agent": USER_AGENT},
                                          verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
-        self.cooldown = Cooldown("the government yield curves")
 
     def _get(self, url: str, params: dict | None = None) -> httpx.Response:
-        self.cooldown.check()
         try:
             response = self.http.get(url, params=params)
         except httpx.HTTPError as e:
-            self.cooldown.failed()
             raise VenueError(f"{url}: {e}") from None
         if response.status_code == 404:
             return response
         if response.status_code != 200:
-            self.cooldown.failed()
             raise VenueError(f"{url} answered {response.status_code}")
         return response
 
