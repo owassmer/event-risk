@@ -1,0 +1,1 @@
+{"call": 96, "tool": "fetch_source", "input": {"url": "https://www.benzinga.com/news/26/11/62804611/apple-q4-2026-earnings-call-transcript", "text": "gross margin to be between"}, "result": null, "error": {"error": "the page could not be read: the site refused the request", "dependents": []}}

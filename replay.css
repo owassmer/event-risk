@@ -1,0 +1,91 @@
+/* The line above the page and the replay's bar at its foot (tools/site/replay.js): the page keeps its own geometry
+   between them. replay.js sets each one's height as it stands. */
+:root { --replay-h: 0px; --intro-h: 0px; }
+body.has-replay #app { height: calc(100dvh - var(--intro-h) - var(--replay-h)); }
+
+#intro {
+  display: flex; align-items: center; gap: 10px 24px; padding: 10px 16px;
+  background: var(--surface); border-bottom: 1px solid var(--line);
+  font: 13px/1.45 var(--sans); color: var(--gray);
+}
+#intro .in-text { flex: 1 1 auto; min-width: 0; margin: 0; max-width: 980px; }
+#intro .in-text strong { color: var(--ink); font-weight: 600; margin-right: 3px; }
+#intro .in-act { display: flex; align-items: center; gap: 14px; flex: 0 0 auto; white-space: nowrap; margin-left: auto; }
+#in-play {
+  display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 13px 0 10px;
+  border: 1px solid var(--ink); border-radius: 99px; background: var(--ink); color: var(--surface);
+  font: 600 13px/1 var(--sans); cursor: pointer;
+}
+#in-play svg { width: 15px; height: 15px; }
+#in-play small { font: 400 12px/1 var(--sans); opacity: 0.72; font-variant-numeric: tabular-nums; }
+#in-play small::before { content: "\00b7"; margin-right: 6px; }
+#in-by { color: var(--gray2); }
+#in-gh { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+#in-gh:hover { color: var(--accent); }
+body.replaying #stop { display: none; }
+body.replaying #composer { pointer-events: none; }  /* the composer shows what was sent; nothing is sent from it */
+
+#replay {
+  position: fixed; left: 0; right: 0; bottom: 0; height: var(--replay-h); z-index: 60;
+  display: flex; align-items: center; gap: 14px; padding: 0 16px;
+  background: var(--surface); border-top: 1px solid var(--line);
+  font: 13px/1 var(--sans); color: var(--gray);
+}
+#replay .rp-main {
+  display: inline-flex; align-items: center; gap: 8px; height: 28px; padding: 0 12px 0 9px;
+  border: 1px solid var(--line2); border-radius: 99px; background: var(--surface); color: var(--ink);
+  font: 600 13px/1 var(--sans); cursor: pointer; white-space: nowrap; flex: 0 0 auto;
+}
+#replay.idle .rp-main, #replay.done .rp-main { background: var(--ink); border-color: var(--ink); color: var(--surface); }
+#replay .rp-main:hover { border-color: var(--ink); }
+#replay .rp-main svg { width: 15px; height: 15px; }
+#replay .rp-main small { font: 400 12px/1 var(--sans); opacity: 0.72; }
+
+#rp-track {
+  position: relative; flex: 1 1 auto; min-width: 90px; height: 4px; border-radius: 99px; background: var(--hover);
+}
+#rp-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: 99px; background: var(--accent); }
+#rp-marks button {
+  position: absolute; top: 50%; width: 9px; height: 9px; margin: -4.5px 0 0 -4.5px; padding: 0;
+  border: 2px solid var(--surface); border-radius: 50%; background: var(--line2); cursor: pointer;
+}
+#rp-marks button.past { background: var(--accent); }
+#rp-marks button:hover { transform: scale(1.35); }
+#rp-now {
+  flex: 0 1 260px; min-width: 0; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#rp-clock { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+
+#rp-speed { display: inline-flex; flex: 0 0 auto; padding: 2px; border-radius: 99px; background: var(--subtle); }
+#rp-speed button {
+  border: 0; background: none; height: 22px; padding: 0 9px; border-radius: 99px;
+  font: 600 12px/1 var(--sans); color: var(--gray); cursor: pointer;
+}
+#rp-speed button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-sm); }
+
+#replay .rp-link {
+  flex: 0 0 auto; border: 0; background: none; padding: 0; color: var(--gray); font: inherit; cursor: pointer;
+  text-decoration: underline; text-underline-offset: 3px; white-space: nowrap;
+}
+#replay .rp-link:hover { color: var(--ink); }
+
+@media (max-width: 1080px) {
+  body.has-replay #app:not(.empty) #center { top: calc(var(--topbar-h) + var(--intro-h)); bottom: var(--replay-h); }
+  #rp-now { flex-basis: 150px; }
+}
+@media (max-width: 720px) {
+  #intro { flex-wrap: wrap; padding: 10px 12px; font-size: 12.5px; }
+  #intro .in-act { margin-left: 0; gap: 6px 12px; flex: 1 1 100%; min-width: 0; flex-wrap: wrap; white-space: normal; }
+  body.has-replay #tb-badge { display: none; }  /* the line above the page and the composer say it is an example */
+  #replay { gap: 10px; padding: 0 10px; }
+  #rp-now, #rp-end, #replay .rp-wide { display: none; }
+  #replay.playing .rp-main, #replay.paused .rp-main { padding: 0 8px; }
+  #replay.playing #rp-word, #replay.paused #rp-word {
+    position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%);
+  }
+  #rp-speed button { padding: 0 7px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #rp-marks button:hover { transform: none; }
+}

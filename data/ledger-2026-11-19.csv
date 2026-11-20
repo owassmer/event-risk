@@ -1,0 +1,14 @@
+﻿Event,Known by,Forecast (%),Lower bound (%),Upper bound (%),Market bid (¢),Market ask (¢),If Yes ($),If Yes (% of portfolio),If No ($),Full impact ($),Volatility ($),Worst outcome ($),Worst outcome,Worst outcome probability (%),Expected value ($),AAPL if Yes ($),MSFT if Yes ($),NVDA if Yes ($),TSM if Yes ($),XOM if Yes ($),JPM if Yes ($),NVO if Yes ($),TM if Yes ($),VTI if Yes ($),VXUS if Yes ($),BND if Yes ($),TLT if Yes ($),IBIT if Yes ($)
+"An AI industry downturn sets in by May 18, 2027",2027-05-18,16.9,7.8,20.0,,,-36704,-7.30,7456,-44160,16543,-36704,Yes,16.9,0,-1583,-2621,-5904,-3796,-460,-1574,-1174,-751,-14423,-4227,565,747,-1503
+"China blockades or attacks Taiwan by May 18, 2027",2027-05-18,3.6,,,,,-82094,-16.32,3055,-85149,15836,-82094,Yes,3.6,0,-9186,-4083,-9754,-10509,-23,-2474,-2073,-2879,-27775,-11151,116,345,-2648
+"The Fed's rate is 4.75% or higher after its April 28, 2027 meeting",2027-04-28,44.2,21.0,85.0,21,85,-6297,-1.25,4987,-11284,7341,-18226,"The Fed's rate is 5.00% or higher after April: a rise at every meeting, or a half-point step",11.5,0,-402,-331,-293,-361,175,-140,-319,-241,-1893,-1083,-816,-385,-208
+"The US launches another round of extensive strikes on Iran by May 18, 2027",2027-05-18,30.0,,,,,-8872,-1.76,3799,-12671,6247,-8872,Yes,30.0,0,-716,-631,-833,-1021,1612,-358,-532,-410,-3661,-1569,-330,-284,-139
+"The US-China trade truce lapses on January 10, 2027",2027-01-10,20.0,15.0,25.0,,,-11831,-2.35,2958,-14789,5916,-11831,Yes,20.0,0,-1269,-840,-1306,-1079,-167,-494,-377,-434,-4420,-1386,171,228,-458
+"Bitcoin falls below $50,000 by May 18, 2027",2027-05-18,51.5,26.0,,,,-3095,-0.62,3285,-6380,3188,-3095,Yes,51.5,0,226,-403,-69,-118,135,-11,-253,38,-159,-120,15,0,-2376
+Nvidia cuts its fiscal-2028 growth outlook on February 24,2027-02-24,20.0,,,,,-4910,-0.98,1227,-6137,2630,-4910,Yes,20.0,0,303,170,-2982,-1412,78,78,98,101,-1099,-230,13,0,-28
+The Fed raises rates at its December 9 meeting,2026-12-09,97.0,97.0,97.0,96,97,-134,-0.03,4323,-4457,1798,-6578,The Fed raises by a half point or more on December 9,6.0,0,-9,-10,-9,-10,2,-4,-8,-5,-41,-25,-8,-1,-6
+Microsoft's Azure growth falls below 48% in its January 27 report,2027-01-27,22.0,,,,,-2390,-0.48,674,-3064,1469,-2390,Yes,22.0,0,0,-1829,0,0,0,0,0,0,-561,0,0,0,0
+Apple guides its March-quarter gross margin below 45% on January 28,2027-01-28,33.0,,,,,-1677,-0.33,826,-2503,1270,-1677,Yes,33.0,0,-1254,0,0,0,0,0,0,0,-423,0,0,0,0
+"Jensen Huang returns to Nvidia in a formal role by May 18, 2027",2027-05-18,14.9,11.0,28.0,,,2282,0.45,-400,2682,956,-400,No,85.1,0,0,0,1398,273,0,0,0,0,582,29,0,0,0
+"The US government is shut down on December 12, 2026",2026-12-12,30.0,29.0,31.0,,,-1328,-0.26,569,-1897,869,-1328,Yes,30.0,0,-114,-117,-183,-146,-37,-66,-44,-25,-529,-142,63,75,-63
+"The FDA approves Novo Nordisk's CagriSema by March 31, 2027",2027-03-31,92.0,92.0,92.0,,,107,0.02,-1228,1335,362,-1228,No,8.0,0,0,0,0,0,0,0,106,0,0,1,0,0,0
