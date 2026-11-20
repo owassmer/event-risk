@@ -143,6 +143,16 @@ def test_a_company_named_by_its_home_listing_has_its_results_reported_by_the_as_
     assert ratings["rows"][0]["consensus_price_target"] == 3389.8
 
 
+def test_a_listings_record_is_bounded_by_the_analysts_own_dates_and_limit(abroad):
+    """TOOLS.md 5: a search's parameters bound what it returns, read from Massive or from a listing's own record: `limit`
+    keeps the newest, with `more` saying there were others, and `date.gte` leaves out what was reported before it and
+    each period's figures that carry no report date."""
+    got = abroad.search_company("TW0002330008:TW", "earnings", {"limit": 2})
+    assert [r["date"] for r in got["rows"]] == ["2026-04-16", "2026-01-15"] and got["more"] is True
+    since = abroad.search_company("TW0002330008:TW", "earnings", {"date.gte": "2025-06-01"})
+    assert [r["date"] for r in since["rows"]] == ["2026-04-16", "2026-01-15"] and since["more"] is False
+
+
 def test_a_past_as_of_reads_only_what_was_reported_by_then_and_no_ratings(abroad):
     with abroad.store.transaction():
         abroad.store._set_meta("asof", "2025-05-01")

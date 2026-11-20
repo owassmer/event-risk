@@ -288,14 +288,20 @@ class Lookup:
         if series.symbol_abroad(ticker) and reference.get("market") == "home":
             return abroad(ticker, reference, self)["isin"]
         if reference.get("type") in RECEIPTS:  # the ISIN a fund's row gives its ticker on a US exchange, where OpenFIGI's
-            # mapping of that ISIN names this listing's own FIGI: a ticker passes between securities, a FIGI does not
+            # mapping of that ISIN names this listing's own FIGI
             figi = reference.get("composite_figi")
-            found = self._read("ticker_isin", ticker)
-            isins = (found or {}).get("isins") or [] if isinstance(found, dict) else []
-            confirmed = [i for i in isins if figi and figi in set(self.composites_of_isin(i)) |
-                         {x.get("compositeFIGI") for x in self.us_listings({"isin": i})}]
+            confirmed = self.isins_of(ticker, {figi} if figi else set())
             return confirmed[0] if len(confirmed) == 1 else None
         return None
+
+    def isins_of(self, ticker: str, figis: set[str]) -> list[str]:
+        """The ISINs a fund's row gives a US ticker (`ticker_isin`) whose mapping at OpenFIGI names one of `figis`, the
+        FIGIs of the listings the ticker is known to name: a ticker passes between securities, and a file read on an
+        earlier day can give the ticker another security's ISIN, while a FIGI names one security for good."""
+        found = self._read("ticker_isin", ticker)
+        isins = (found or {}).get("isins") or [] if isinstance(found, dict) else []
+        return [i for i in isins if figis & (set(self.composites_of_isin(i)) |
+                                             {x.get("compositeFIGI") for x in self.us_listings({"isin": i})})]
 
     def priced(self, ticker: str) -> bool:
         """Whether Massive prices the listing: it has a close for it on or before the as-of, however old. Its dollars
@@ -441,19 +447,45 @@ def resolve(row: dict, look: Lookup) -> dict:
 
 def held_identifiers(ticker: str, reference: dict, look: Lookup) -> set[str]:
     """What names a company held directly through a US listing wherever its shares are listed: the listing's own
-    FIGIs; and every listing's composite FIGI of each share class of it and of each US ticker the SEC gives its
-    company, an ordinary's over the counter among them, so a fund's row of its ordinary shares abroad is known as it
+    FIGIs; every listing's composite FIGI of each share class of it and of each US ticker the SEC gives its company,
+    an ordinary's over the counter among them, so a fund's row of its ordinary shares abroad is known as it; and the
+    ISIN and CUSIP of each of those tickers that a fund's row gives it and OpenFIGI confirms (Lookup.isins_of), so a
+    report's row, which names a share by its ISIN or its CUSIP alone, is known as it by the security's own identifiers
     (MATH.md 3.1, the floor's exception)."""
-    out = {reference.get("composite_figi"), reference.get("share_class_figi")} - {None}
+    return _held_shares(ticker, reference, look)[0]
+
+
+def own_cusip_known(ticker: str, reference: dict, look: Lookup) -> bool:
+    """Whether a US listing held directly is known by its own CUSIP: a fund's row gives it an ISIN that OpenFIGI
+    confirms (held_identifiers). Where it is not, a fund's row of it named by its CUSIP alone is known as it only by
+    the listing that CUSIP is looked up to."""
+    return _held_shares(ticker, reference, look)[1]
+
+
+def _held_shares(ticker: str, reference: dict, look: Lookup) -> tuple[set[str], bool]:
+    figis = {reference.get("composite_figi"), reference.get("share_class_figi")} - {None}
     cik = look.company_cik(ticker, reference.get("cik"))
-    classes = set(look.share_classes(ticker)) | ({reference["share_class_figi"]} if reference.get("share_class_figi")
-                                                  else set())
-    for sibling in look.tickers_of(cik) if cik else []:
-        if sibling != ticker:
-            classes |= set(look.share_classes(sibling))
-    for share_class in sorted(classes):
-        out |= set(look.composites_of_class(share_class))
-    return out
+    tickers = [ticker] + [t for t in (look.tickers_of(cik) if cik else []) if t != ticker]
+    classes = {t: set(look.share_classes(t)) for t in tickers}
+    if reference.get("share_class_figi"):
+        classes[ticker].add(reference["share_class_figi"])
+    composites = {c: set(look.composites_of_class(c)) for c in sorted(set().union(*classes.values()))}
+    mine = figis | {x for c in classes[ticker] for x in composites[c]}  # the held listing's own share class
+    figis |= {x for found in composites.values() for x in found}
+    out = set(figis)
+    for t in tickers:
+        if t != ticker and not classes[t]:  # a ticker OpenFIGI names no share of: no fund holds it as one
+            continue
+        out |= {code for isin in look.isins_of(t, figis) for code in own_codes(isin)}
+    own = any(isin.startswith("US") for isin in look.isins_of(ticker, mine))
+    return out, own
+
+
+def own_codes(isin: str | None) -> set[str]:
+    """What names a security by its ISIN in a fund's rows: the ISIN, and for a US ISIN the CUSIP it carries."""
+    if not isin:
+        return set()
+    return {isin, isin[2:11]} if isin.startswith("US") and len(isin) == 12 else {isin}
 
 
 def abroad(symbol: str, reference: dict, look: Lookup) -> dict:

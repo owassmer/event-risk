@@ -194,10 +194,47 @@ class OpenFIGI:
         self._sleep = sleep
         self._last = 0.0
         self._slots = threading.Semaphore(PARALLEL if key else 1)  # requests at once: one without a key
+        self._waiting: list[dict] = []  # asks waiting for a slot, which the one that takes it sends with its own
+        self._queued = threading.Lock()
 
     def _post(self, jobs: list[dict]) -> list[dict]:
+        """The answers to these jobs, in order. Asks made at once share requests: whoever holds a slot sends its own
+        jobs with those of others still waiting for one, as many to a request as the key allows, so that without a key,
+        where OpenFIGI answers 25 requests a minute, a request carries ten jobs wherever ten are waiting."""
+        mine = {"jobs": jobs, "done": threading.Event(), "answers": None, "error": None}
+        with self._queued:
+            self._waiting.append(mine)
         with self._slots:
-            return self._answer(jobs)
+            with self._queued:
+                batch, size = [], 0
+                for ask in [mine] + [a for a in self._waiting if a is not mine]:
+                    if ask["done"].is_set() or ask not in self._waiting:
+                        continue
+                    if batch and size + len(ask["jobs"]) > self.jobs:
+                        continue
+                    batch.append(ask)
+                    size += len(ask["jobs"])
+                for ask in batch:
+                    self._waiting.remove(ask)
+            if batch:
+                try:
+                    answers = self._answer([j for ask in batch for j in ask["jobs"]])
+                    at = 0
+                    for ask in batch:
+                        ask["answers"] = answers[at:at + len(ask["jobs"])]
+                        at += len(ask["jobs"])
+                        ask["done"].set()
+                except BaseException as e:  # each ask fails, and is asked again where it is read again
+                    for ask in batch:
+                        if not ask["done"].is_set():
+                            ask["error"] = e if isinstance(e, Exception) else VenueError("OpenFIGI was not asked")
+                            ask["done"].set()
+                    if not isinstance(e, Exception):  # an interrupt goes on up; a failed request is raised by each
+                        raise  # ask it carried, below, and not by a carrier whose own ask was already answered
+        mine["done"].wait()
+        if mine["error"] is not None:
+            raise mine["error"]
+        return mine["answers"]
 
     def _answer(self, jobs: list[dict]) -> list[dict]:
         body = json.dumps(jobs).encode()

@@ -41,8 +41,8 @@ from harness.derive.rows import (OCC, close_moment, coins, companies_of, establi
                                  security_tickers, slope_reference, ticker_reference, with_exposure)
 from harness.derive.engine import Derivation, Inputs, Unavailable, Waiting, canonical
 from harness.derive.identity import (COMPANY_TYPES, FUND_TYPES, MAPPINGS, RECEIPTS, Lookup, abroad, class_id,
-                                     company_id, entities, held_identifiers, issuers, own_ticker, resolve, row_key,
-                                     unresolved, us_ticker)
+                                     company_id, entities, held_identifiers, issuers, own_codes, own_ticker, resolve,
+                                     own_cusip_known, row_key, unresolved, us_ticker)
 from harness.venues.gleif import valid_lei
 from harness.venues.yahoo import region_of
 from harness.observations import read_today
@@ -1515,11 +1515,14 @@ def _rows_reads(ctx: Inputs, subject: str, through: dict[str, float]) -> dict:
     for size, got in zip(sizes, found_rows):
         if size is not False and got.get("kind") == "fund" and got.get("ticker") and got["ticker"] not in constituents:
             reaches_funds[got["ticker"]] = max(reaches_funds.get(got["ticker"], 0.0), math.inf if size is None else size)
-    # Such a row can be a company the portfolio names only where one it names, held directly or named by a
-    # consequence, is a listing no row at the floor resolved to: only then are their listings read.
+    # Such a row can be a company the portfolio names only where one it names through a US listing, held directly or
+    # named by a consequence, is a listing no row at the floor resolved to and is known by no CUSIP of its own
+    # (identity.own_cusip_known): only then are their listings read. A listing abroad is known by its share class's
+    # ISIN, and a row with a US ISIN is never that class.
     at_floor = {x.get("ticker") for x in list(resolved.values()) + list(found_rows)}
     named = [t for t in held + shocked if _isin_form(t) or kind_of(reads.read("ticker_ref", t)) == "name"]
-    if not any(t not in at_floor for t in named):
+    if not reads.settle(lambda look: [t for t in named if t not in at_floor and not series.is_abroad(t)
+                                      and not own_cusip_known(t, look.reference(t), look)]):
         cusips = set()
     reads.fetch("cusip_listing", [f"{c}@{asof}" for c in sorted(cusips)])
     if constituents:  # the legal entity behind each security whose company neither its CIK nor its share class
@@ -1979,6 +1982,9 @@ def _look(m: dict, references: dict, constituents: dict, resolved: Callable[[dic
         reached[fund] += dollars
         if not rows:
             return whole(fund, f"no holdings are published for it on or before {m['asof']}")
+        unsized = _unsized_option(rows, m["asof"], payload)
+        if unsized:  # its rows no longer say what its contracts are, and its own betas carry what they do
+            return whole(fund, unsized)
         plan = []  # each listing the fund's rows reach, at its exposure per dollar of the fund, and the row's date
         unnamed = _reaching_none()  # per dollar of the fund, reaching no name
         stated = 0.0  # the fund's dollars its rows' values state
@@ -2128,6 +2134,53 @@ def _row_about(row: dict) -> dict:
     name = row.get("constituent_name") or row.get("title")
     return {**({"constituent_name": name} if name else {}), **about,
             **({"isin": isin_of(row)} if isin_of(row) else {})}
+
+
+def _unsized_option(rows: list[dict], asof: str, payload: Any = None) -> str | None:
+    """Why a fund's rows are no account of its options, where they are not: the contracts its rows hold that have
+    expired by the as-of, or whose exposure their terms and prices do not give, are material to what the fund is,
+    the shares they control together worth at least the look-through's floor per dollar of the fund (FLOOR,
+    _controlled). The reason names the largest. A row that names no contract, a warrant or a right a fund's holdings
+    give by its value alone, is counted as the row it is, at that value under its kind (_unnamed), and decides
+    nothing here. None where the contracts are sized and current, or too small to matter."""
+    found: list[tuple[float, str]] = []
+    for r in rows:
+        option = (r.get("payoff") or {}).get("option") if isinstance(r.get("payoff"), dict) else None
+        if not isinstance(option, dict) or not any(option.get(k) for k in ("expiry", "strike", "contracts")):
+            continue
+        named = option.get("symbol") or r.get("title") or r.get("constituent_ticker") or r.get("constituent_name")
+        if option.get("expiry") and str(option["expiry"])[:10] < asof:
+            reason = f"its holdings hold an option that expired on {str(option['expiry'])[:10]}, before {asof}: {named}"
+        elif r.get("exposure") is None:
+            reason = f"its holdings hold an option whose exposure its terms and prices do not give: {named}"
+        else:
+            continue
+        found.append((_controlled(r, option, payload), reason))
+    if found and sum(size for size, _ in found) >= FLOOR:
+        return max(found, key=lambda x: x[0])[1]
+    return None
+
+
+def _controlled(row: dict, option: dict, payload: Any) -> float:
+    """What a fund's contract is of the fund, per dollar of its net assets: the shares it controls, its contracts times
+    the shares each controls, at its underlying's price, or at its strike where no price is read; where its terms give
+    no number of contracts or of shares, its value as its fund states it, the only size its row gives; and where it
+    gives none of these, the whole fund, since nothing says it is small. A written call's value is a small part of
+    what it controls, so a contract is measured by its shares wherever they are stated."""
+    contracts, per = option.get("contracts"), option.get("underlying_per_contract")
+    price = (row.get("quote") or {}).get("underlying_price") or option.get("strike")
+    payload = payload if isinstance(payload, dict) else {}
+    first, second = ("derivatives_net_assets", "net_assets") if "asset_category" in row else ("net_assets",
+                                                                                             "derivatives_net_assets")
+    assets = payload.get(first) or payload.get(second)  # the net assets its own source states it against
+    if all(isinstance(v, (int, float)) and v for v in (contracts, per, price, assets)):
+        return abs(contracts * per * price) / abs(assets)
+    if isinstance(row.get("weight"), (int, float)):
+        return abs(row["weight"])
+    value = row.get("market_value")
+    if isinstance(value, (int, float)) and isinstance(assets, (int, float)) and assets:
+        return abs(value) / abs(assets)
+    return 1.0
 
 
 def _reaching_none() -> dict:
@@ -2367,7 +2420,7 @@ def booked(m: dict, references: dict, constituents: dict, resolved: Callable[[di
         # dollar of exposure to it (MATH.md 1.6, 3.1): known as one held directly is
         if _isin_form(ticker):
             isin = ticker.split(":")[0]
-            for x in (isin, *look.composites_of_isin(isin)):
+            for x in (*own_codes(isin), *look.composites_of_isin(isin)):
                 known.setdefault(x, ticker)
         elif kind_of(references.get(ticker)) in ("name", "fund"):
             for x in identifiers_of(ticker, references, look):
@@ -2630,7 +2683,7 @@ def identifiers_of(ticker: str, references: dict, look: Lookup) -> set[str]:
     reference = (references.get(ticker) or {}).get("results") or {}
     if series.symbol_abroad(ticker) and reference.get("market") == "home":
         found = abroad(ticker, reference, look)
-        return set(found["composites"]) | ({found["isin"]} if found["isin"] else set())
+        return set(found["composites"]) | own_codes(found["isin"])
     return held_identifiers(ticker, reference, look)
 
 
@@ -2695,7 +2748,7 @@ FUND_ROWS = Derivation(
 )
 
 LOOKTHROUGH = Derivation(
-    "lookthrough", 69, "Portfolio", _lookthrough_inputs, _lookthrough_compute,
+    "lookthrough", 72, "Portfolio", _lookthrough_inputs, _lookthrough_compute,
     subject_of=lambda store, entity: "portfolio", stage="funds",
     produces=("Name", "looks_through_to"),
     # Every Name has an e: what the look-through books to it, and 0 where it books nothing.

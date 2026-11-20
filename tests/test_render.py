@@ -267,7 +267,8 @@ def test_a_markets_chip_shows_its_price(tmp_path):
 
 def test_a_forecast_its_statements_leave_open_shows_the_conditional_probabilities_that_leave_it_open(tmp_path):
     """MATH.md 1.2: where the analyst's statements leave an event's forecast open, its probability tab still shows each
-    conditional probability it states, beside its whole condition, as stated: they are what the forecast rests on."""
+    conditional probability it states, as stated: a table of the condition's Yes and No against the event's, each row
+    adding to 100% as shown. They are what the forecast rests on."""
     import re
     from breakdown import World
     from harness.render import Reader, event_view
@@ -279,8 +280,59 @@ def test_a_forecast_its_statements_leave_open_shows_the_conditional_probabilitie
     with w.store.lock:
         opened = event_view(Reader(w.store), e)["html"]
     inputs = re.sub(r"<[^>]+>", "|", opened.split('data-k="inputs"', 1)[1])
-    assert inputs.count("Chances") == 1 and "Conditional probability" not in inputs and "Analyst input" not in inputs
-    assert "|30.0%|" in inputs and "|60.0%|" in inputs
+    cells = [x for x in inputs.split("|") if x.strip() and x != ">"]
+    assert cells[:12] == ["Condition", "A", "Forecast", "E", "Yes", "No", "If Yes", "30.0%", "70.0%", "If No", "60.0%",
+                          "40.0%"]
+    assert "Given" not in inputs and "Not" not in inputs and "Analyst input" not in inputs
+    w.store.close()
+
+
+def test_conditional_probabilities_read_as_a_table_of_each_conditions_outcome_against_the_events(tmp_path):
+    """MATH.md 1.2: an event's chances given other propositions show as a conditional probability table, one for each
+    set of conditions: each condition named once, at the head of its column, its closing date set apart; a row for each
+    case that can happen, "If Yes" or "If No" under the first condition and "And Yes" or "And No" under a further one;
+    and the event's Yes and No in that case, adding to 100.0% as shown, each tile shaded by its probability. A case a
+    link settles reads 100.0% or 0.0%; a chance the analyst states opens the forecast's calculation."""
+    import re
+    from breakdown import World
+    from harness.render import Reader, event_view
+    w = World(tmp_path / "scratch-table")
+    late = w.prop("It falls below 50 by June 30, 2027", end="2027-06-30")
+    soon = w.prop("It falls below 50 by December 31, 2026", end="2026-12-31")
+    e = w.prop("It falls below 50 by April 30, 2027", end="2027-04-30")
+    other = w.prop("A rival enters")
+    w.link(soon, "asks", w.market("s", "Below 50 by Dec 31?", 0.26, 0.28))
+    w.link(late, "asks", w.market("l", "Below 50 by Jun 30?", 0.58, 0.62))
+    w.link(soon, "implies", e)
+    w.link(e, "implies", late)
+    w.chances(e, {"given": [late], "given_not": [soon], "value": 0.4125})
+    w.link("portfolio", "watches", e)
+    f = w.prop("A rival answers")
+    w.chances(f, {"given": [other], "value": 0.9})  # nothing says it where the rival does not enter: one case alone
+    w.link("portfolio", "watches", f)
+    text = lambda html: [x for x in re.sub(r"<[^>]+>", "|", html).split("|") if x.strip()]  # noqa: E731
+
+    def tables(pid: str) -> list[tuple[str, str]]:
+        with w.store.lock:
+            opened = event_view(Reader(w.store), pid)["html"]
+        inputs = opened.split('data-k="inputs"', 1)[1].split('data-k="history"', 1)[0]
+        return re.findall(r'<table class="cp" data-conditions="(\d)">(.*?)</table>', inputs, re.S)
+
+    (n, table), = tables(e)
+    first = text(table)
+    # each condition once, its date set apart, then the event; a row for each case that can happen
+    assert n == "2" and first[:9] == [
+        "Condition", "It falls below 50 ", "by June 30, 2027", "Condition", "It falls below 50 ", "by December 31, 2026",
+        "Forecast", "It falls below 50 ", "by April 30, 2027"]
+    assert first[9:] == ["Yes", "No",
+                         "If Yes", "And Yes", "100.0%", "0.0%",  # by December 31 it has: a link settles it
+                         "If Yes", "And No", "41.3%", "58.7%",  # the analyst's chance, and its complement as shown
+                         "If No", "And No", "0.0%", "100.0%"]
+    assert '<span class="cp-date">by June 30, 2027</span>' in table
+    assert table.count(f'data-go="x:p:{e}"') == 1  # the chance the analyst states opens the forecast's calculation
+    assert 'style="--fill:0.294"' in table and 'style="--fill:0.008"' in table  # 100.0% and 0.0%
+    (n, table), = tables(f)
+    assert n == "1" and text(table)[-3:] == ["If Yes", "90.0%", "10.0%"]  # one case stated: that row, and no other
     w.store.close()
 
 
@@ -711,8 +763,9 @@ def test_an_event_reads_as_its_outcomes_in_the_ledger_the_tree_the_prices_and_ea
 
 def test_a_probability_its_chances_fix_opens_to_total_probability_over_what_they_are_given(tmp_path):
     """E given D at 0.8 and given not D at 0.1, with D's market at 0.30: the probability opens to a contribution
-    breakdown naming D and Not D directly in 1-decimal percentages (30.0% x 80.0% = 24.0% and 70.0% x 10.0% = +7.0%,
-    summing to 31.0%), with the rationale for each conditional share."""
+    breakdown with D named once, as the condition, and a row for each of its outcomes, If Yes and If No, in 1-decimal
+    percentages (30.0% x 80.0% = 24.0% and 70.0% x 10.0% = +7.0%, summing to 31.0%), with the rationale for each
+    conditional share under its row's name."""
     import re
     from breakdown import World
     from harness.render import view
@@ -725,7 +778,9 @@ def test_a_probability_its_chances_fix_opens_to_total_probability_over_what_they
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
     assert "Analyst input 30.0% 80.0% 24.0%" in text  # each case's probability, share and contribution, each labelled
     assert "70.0% 10.0% +7.0%" in text and "31.0%" in text and "×" not in text
-    assert "Not D" in text and text.count("Rationale ·") == 2 and "0000%" not in text
+    assert "Condition D Probability Chance Contribution If Yes Analyst input" in text and "Not D" not in text
+    assert "If No Analyst input 70.0% 10.0% +7.0%" in text
+    assert "Rationale · If Yes" in text and "Rationale · If No" in text and "0000%" not in text
     w.store.close()
 
 
@@ -745,8 +800,8 @@ def test_a_case_its_statements_leave_open_shows_its_range_and_its_symbol_in_the_
     assert text.count("Analyst input") == 2 and "0000%" not in text
     opened = event_view(Reader(w.store), e)["html"]
     inputs = re.sub(r"<[^>]+>", "|", opened.split('data-k="inputs"', 1)[1].split('data-k="none"', 1)[0])
-    assert inputs.count("Chances") == 1 and "Conditional probability" not in inputs and "Analyst input" not in inputs
-    assert inputs.count("|30.0%|") == 2 and "ours" not in inputs
+    assert "Conditional probability" not in inputs and "Analyst input" not in inputs and "ours" not in inputs
+    assert inputs.count("|30.0%|") == 2 and inputs.count("|70.0%|") == 2  # If Yes and If No, each with its complement
     w.store.close()
 
 
@@ -1054,8 +1109,8 @@ def test_a_shock_stated_as_a_factors_residual_opens_to_its_working(tmp_path):
 def test_a_market_standing_as_the_proposition_it_asks_reads_by_its_question_and_sits_in_the_drawing(tmp_path):
     """MATH.md 1.2: a market a chance is given, which no proposition asks, stands as the proposition its question
     defines. The page names it by its question wherever it names a proposition, in the event's drawing and in the
-    probability's working: in the drawing it is a lane like any proposition's, its book at its quotes, and each
-    conditional probability stands beside its whole condition, naming it by its question, once, its markdown
+    probability's working: in the drawing it is a lane like any proposition's, its book at its quotes, and the
+    conditional probabilities stand in a table under it as their condition, named by its question, once, its markdown
     emphasis rendered as its venue means it to read."""
     import re
 
@@ -1071,9 +1126,9 @@ def test_a_market_standing_as_the_proposition_it_asks_reads_by_its_question_and_
     drawing = opened.split('data-k="mv"', 1)[1].split('data-k="history"', 1)[0]
     shown = text(opened)
     assert m not in shown and "No market bears" not in shown and "Will it happen?" in text(drawing) and "**" not in shown
-    inputs = text(opened.split('data-k="inputs"', 1)[1])
-    assert "Will it happen?80.0%" in inputs
-    assert "NotWill it happen?5.0%" in inputs
+    inputs = text(opened.split('data-k="inputs"', 1)[1].split('data-k="history"', 1)[0])
+    assert inputs.count("Will it happen?") == 1 and "ConditionWill it happen?ForecastEYesNo" in inputs
+    assert "If Yes80.0%20.0%" in inputs and "If No5.0%95.0%" in inputs
     assert 'title="Yes bid 29¢ · Ask 31¢"' in drawing
     assert m not in text(view(w.store, f"x:p:{e}")["html"])
     w.store.close()
@@ -1446,7 +1501,7 @@ def test_a_page_opens_to_what_rests_on_it_and_its_text_marks_each_passage_where_
           for k, t, v, q in rests}
     assert set(by) == {"Shock", "Chance", "Evidence"}
     assert by["Shock"][1] == "whole move −10.00%" and by["Chance"][1] == "50.0%" and by["Evidence"][1] == ""
-    assert "given “E”" in by["Chance"][0] and by["Evidence"][0] == "A"
+    assert "If “E” is Yes" in by["Chance"][0] and by["Evidence"][0] == "A"
     hashed = {k: f"x:passage:{sid}:{hashlib.sha256(p.encode()).hexdigest()[:12]}" for k, p in cited.items()}
     # each passage in the page's words, opening the page's text there
     assert by["Shock"][2] == [(hashed["shock"], "X fell by a tenth in the last episode. The book")]

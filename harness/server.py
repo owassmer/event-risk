@@ -73,9 +73,10 @@ KEYS = {  # each key, and what the page cannot do without it: one plain line eac
     "ANTHROPIC_API_KEY": "No Claude key (ANTHROPIC_API_KEY in .env): the analyst can't reply.",
     "BASETEN_API_KEY": "No Baseten key (BASETEN_API_KEY in .env): new readings go unchecked; every number is still "
                        "worked out.",
-    "MASSIVE_API_KEY": "No Massive key (MASSIVE_API_KEY in .env): a new portfolio can't be priced, and the companies' "
-                       "news and records can't be read.",
 }
+# Set by a host that runs this page for visitors (harness.host), each on their own Anthropic key: the page then names
+# no key that is the host's to set, and a key Anthropic refuses is the visitor's to replace.
+HOSTED = "EVENT_RISK_HOSTED"
 LABELLED = ("from_id", "to_id", "id", "proposition_id", "source_id")  # the ids a call's input names
 WRITES = ("add", "link", "note", "edit", "remove", "search_markets", "search_web", "search_company")
 PREVIEW = 600  # a call's result as the work line first shows it; all of it opens on request
@@ -151,11 +152,14 @@ class Page:
     def missing_keys(self) -> list[str]:
         """A line for each missing key that stops something the person can do. Without Claude the conversation can
         only be read, so the Claude line is the only one; with it, the Baseten and Massive lines say what the
-        analyst's work goes without. A finished example reads no keys, and its one line says how to start one's own."""
+        analyst's work goes without. A finished example reads no keys, and its one line says how to start one's own.
+        A hosted page's visitor holds their own key and no other, so it names none of the host's."""
         if self.read_only:
             return [READ_ONLY]
         if claude.credential() is None:
             return [KEYS[claude.KEY]]
+        if os.environ.get(HOSTED):
+            return []
         return [line for key, line in KEYS.items() if key != claude.KEY and not os.environ.get(key)]
 
     def state(self) -> dict:
@@ -660,17 +664,30 @@ def _plain_error(err: Exception) -> str:
     """Why a reply stopped, in one line: the API's own message where it gave one."""
     import anthropic
 
+    if os.environ.get(HOSTED) and isinstance(err, anthropic.APIStatusError):  # said to a visitor, of their own key
+        message = _api_message(err)
+        if isinstance(err, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+            why = f" ({message.rstrip('.')})" if message else ""
+            return (f"Anthropic refused your key{why}, so the analyst can't reply. To go on, end the session and start "
+                    "again with another key.")
+        if message:
+            return f"The analyst couldn't reply on your key: {message}"
     if isinstance(err, anthropic.AuthenticationError):
         return f"The Claude key was refused. Check {claude.KEY} in .env."
     if isinstance(err, anthropic.APIConnectionError):
         return "The analyst couldn't be reached. Check the connection and send the message again."
     if isinstance(err, anthropic.APIStatusError):
-        body = err.body if isinstance(err.body, dict) else {}
-        message = (body.get("error") or {}).get("message") if isinstance(body.get("error"), dict) else None
+        message = _api_message(err)
         if isinstance(err, (anthropic.RateLimitError, anthropic.InternalServerError)) and not message:
             return "The analyst's model is busy. Send the message again in a moment."
         return f"The analyst couldn't reply on {claude.KEY}: {message or err.message}"
     return f"The reply stopped with an error: {str(err)[:300] or type(err).__name__}"
+
+
+def _api_message(err) -> str | None:
+    """The API's own message in an error's body, where it gave one."""
+    body = err.body if isinstance(err.body, dict) else {}
+    return (body.get("error") or {}).get("message") if isinstance(body.get("error"), dict) else None
 
 
 # The ways a reply ends without its whole answer, as the Messages API reports them in stop_reason
@@ -989,7 +1006,8 @@ def _serve(page: Page, prog: str, port: int, browser: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = _arguments("event-risk", "What could move a portfolio: the page.")
-    parser.add_argument("--store", help="open an existing store, stores/{name}")
+    parser.add_argument("--store", help="open an existing store, by its path or its name in the stores folder")
+    parser.add_argument("--stores", metavar="DIR", help="the folder conversations are kept in (default: stores/)")
     parser.add_argument("--readings-every", type=float, default=readings.INTERVAL, metavar="SECONDS",
                         help="how often, while the as-of is today, the latest marks and the kept markets' books are "
                              f"read again between calls (default {readings.INTERVAL:g})")
@@ -998,9 +1016,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--readings-every takes a number of seconds above 0")
     readings.INTERVAL = args.readings_every  # the page's minute reads it at each turn (Page._live_loop)
     load_env()
-    page = Page()
+    root = Path(args.stores) if args.stores else STORES
+    page = Page(root)
     if args.store:
-        page.open(Path(args.store) if Path(args.store).exists() else STORES / args.store)
+        page.open(Path(args.store) if Path(args.store).exists() else root / args.store)
     _serve(page, "event-risk", args.port, not args.no_browser)
     return 0
 

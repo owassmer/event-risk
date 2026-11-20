@@ -47,6 +47,10 @@ from harness.trace import now
 from harness.world import World
 
 MODEL = "claude-fable-5-2"
+# The model the analyst runs on, where the reader names another: Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5 each take
+# the same request, with a 1M-token window and 128K tokens of output, as Fable 5.2 does
+# (https://platform.claude.com/docs/en/models/overview). The effort is the same on every model.
+MODEL_ENV = "EVENT_RISK_MODEL"
 MAX_TOKENS = 128_000  # Fable 5.2's most output (https://platform.claude.com/docs/en/about-claude/models/overview)
 # Its context window is 1M tokens, the default for the model, with no beta header and at standard pricing
 # (https://platform.claude.com/docs/en/build-with-claude/context-windows): every tool result stays in it.
@@ -121,11 +125,13 @@ _clients_lock = threading.Lock()
 
 def clients() -> dict:
     """This process's data clients, one set for every store it opens, each reading through this machine's shared
-    observations (harness.observations), so what one store read about a closed range serves the next: Massive's where
-    MASSIVE_API_KEY is set, with which fund's holdings are an index's companies (harness.venues.trackers), read only
-    where a held fund's derivative is exposed to an index; Coinbase Exchange's, Yahoo Finance's, FinanceDatabase's, the
-    ECB's, OpenFIGI's, the SEC's, GLEIF's and TreasuryDirect's, which need no key, OpenFIGI's reading OPENFIGI_API_KEY
-    where it is set and the SEC's naming the reader by SEC_CONTACT where it is set. Returns `{"fetchers"}`."""
+    observations (harness.observations), so what one store read about a closed range serves the next. Every kind is
+    read with no key: Coinbase Exchange's, Yahoo Finance's, FinanceDatabase's, the ECB's, OpenFIGI's, the SEC's,
+    GLEIF's and TreasuryDirect's, and each kind Massive answers from those (harness.venues.keyless), OpenFIGI's reading
+    OPENFIGI_API_KEY where it is set and the SEC's naming the reader by SEC_CONTACT where it is set. Where
+    MASSIVE_API_KEY is set, Massive's take their kinds, with which fund's holdings are an index's companies
+    (harness.venues.trackers), read only where a held fund's derivative is exposed to an index. Returns
+    `{"fetchers"}`."""
     global _clients
     from harness.observations import shared
     from harness.venues.coinbase import Coinbase
@@ -133,6 +139,8 @@ def clients() -> dict:
     from harness.venues.equities import Equities
     from harness.venues.fixings import Fixings, with_fixings
     from harness.venues.gleif import GLEIF
+    from harness.venues.issuers import Issuers
+    from harness.venues.keyless import Keyless, keyless_trackers
     from harness.venues.massive import Massive
     from harness.venues.openfigi import OpenFIGI
     from harness.venues.sec import SEC
@@ -148,21 +156,28 @@ def clients() -> dict:
         observations = shared()
         equities = Equities()
         yahoo, sec, ecb = Yahoo(equities=equities), SEC(archive=observations), ECB()
+        openfigi = OpenFIGI(key=os.environ.get("OPENFIGI_API_KEY") or None)
         crypto, currency = Coinbase().fetchers(), yahoo.fetchers()
         # a currency's rates: Yahoo's hourly where they reach, and its daily fixings before them
         currency["hourly"] = with_fixings(currency["hourly"], Fixings(ecb))
-        base = {**currency, **crypto, **ecb.fetchers(), **equities.fetchers(),
-                **OpenFIGI(key=os.environ.get("OPENFIGI_API_KEY") or None).fetchers(),
+        base = {**currency, **crypto, **ecb.fetchers(), **equities.fetchers(), **openfigi.fetchers(),
                 **sec.fetchers(), **Treasury().fetchers(), **GLEIF().fetchers(),
                 **{kind: by_pair(crypto[kind], currency[kind]) for kind in ("hourly", "last_trade")}}
         # each currency's government yield curve: the Treasury's for the dollar, its own government's for another
         base["yield_curve"] = with_curves(base["yield_curve"], Curves())
+        # every kind Massive answers, read where no key is needed; Massive's own where its key is set
+        keyless = Keyless(yahoo, sec, openfigi, equities, Issuers(sec))
+        base.update(keyless.fetchers())
         key = os.environ.get("MASSIVE_API_KEY")
         if key:
-            massive = Massive(key)
-            base.update({**massive.fetchers(), **Trackers(massive, observations).fetchers()})
-            # a mutual fund's share class, which no listing's reference gives: its own reference, prices and dividends
-            base.update(MutualFunds(massive, sec, yahoo).fetchers(base))
+            prices: Any = Massive(key)
+            base.update({**prices.fetchers(), **Trackers(prices, observations).fetchers()})
+            base["figi"] = openfigi.fetchers()["figi"]  # an ISIN's listings at OpenFIGI, beside Massive's references
+        else:
+            prices = keyless
+            base.update(keyless_trackers(keyless, observations).fetchers())
+        # a mutual fund's share class, which no listing's reference gives: its own reference, prices and dividends
+        base.update(MutualFunds(prices, sec, yahoo).fetchers(base))
         _clients = {"fetchers": {kind: observations.shared(kind, f) for kind, f in base.items()}}
         return _clients
 
@@ -347,7 +362,7 @@ class Extra(NamedTuple):
 class Analyst:
     """One conversation with the analyst over one store."""
 
-    def __init__(self, world: World, *, client: Any = None, model: str = MODEL, effort: str = EFFORT,
+    def __init__(self, world: World, *, client: Any = None, model: str | None = None, effort: str = EFFORT,
                  knowledge: str | Path = KNOWLEDGE, max_tokens: int = MAX_TOKENS, thinking: dict | None = None,
                  on_event: Callable[[dict], None] | None = None, session: str | None = None,
                  credential: claude.Credential | None = None, mode: str | None = None, text: str | None = None,
@@ -366,7 +381,7 @@ class Analyst:
         # The key (harness.claude); a client given comes with the credential it carries, if any.
         self.credential = credential if client is not None or credential is not None else claude.credential()
         self.client = client if client is not None else claude.client(self.credential)
-        self.model = model
+        self.model = model or os.environ.get(MODEL_ENV, "").strip() or MODEL
         self.max_tokens = max_tokens
         self.thinking = thinking if thinking is not None else THINKING
         self.system, self.declared = self._declarations()
@@ -388,7 +403,7 @@ class Analyst:
         self.tools.session = self.session
         judge = self.store.engine.judge
         self.tools.trace.append({"type": "session", "session": self.session, "at": now(),
-                                 **({"mode": mode} if mode else {}), "model": model, "effort": effort,
+                                 **({"mode": mode} if mode else {}), "model": self.model, "effort": effort,
                                  "schema": SCHEMA_VERSION, "store": self.store.dir.name,
                                  "judge": getattr(judge, "model", None), "fetchers": sorted(self.store.fetchers),
                                  "system": digest([b["text"] for b in self.system])})

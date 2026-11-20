@@ -416,14 +416,24 @@ def test_a_file_the_analyst_cannot_read_is_refused_and_not_kept(tmp_path, name, 
     assert not (tmp_path / "files").exists() or not any((tmp_path / "files").iterdir())
 
 
-def test_every_request_runs_on_fable_5_2_at_xhigh_effort(world):
-    """Every analyst request selects Fable 5.2 and explicitly requests xhigh effort."""
+def test_every_request_runs_on_the_model_the_reader_names_fable_5_2_where_none_is_at_xhigh_effort(world, monkeypatch):
+    """Every analyst request selects the model EVENT_RISK_MODEL names, and Fable 5.2 where it names none; each
+    explicitly requests xhigh effort, whatever the model; and the conversation's trace names the model it ran on."""
+    from harness.analyst import MODEL_ENV
+    monkeypatch.delenv(MODEL_ENV, raising=False)
     analyst = world["start"](TURN_1)
     analyst.say(FIRST)
     script = world["script"]
     assert len(script.requests) == 6
     assert all(body["model"] == "claude-fable-5-2" for body in script.requests)
     assert all(body["output_config"] == {"effort": "xhigh"} for body in script.requests)
+    monkeypatch.setenv(MODEL_ENV, "claude-sonnet-5-5")
+    other = world["start"]([lambda s: [say("On Sonnet.")]])
+    other.say("Which model is this?")
+    assert [(b["model"], b["output_config"]) for b in world["script"].requests] == [
+        ("claude-sonnet-5-5", {"effort": "xhigh"})]
+    began = {e["session"]: e["model"] for e in other.tools.trace.entries() if e.get("type") == "session"}
+    assert began == {analyst.session: "claude-fable-5-2", other.session: "claude-sonnet-5-5"}
 
 
 # ---------------------------------------------------------------- a response that ends short of its answer
@@ -559,6 +569,38 @@ def test_on_the_key_a_request_carries_the_key_alone(monkeypatch):
     assert claude.credential() == key
     monkeypatch.delenv("ANTHROPIC_API_KEY")
     assert claude.credential() is None
+
+
+def test_a_hosted_page_speaks_to_its_visitor_of_their_own_key_and_names_none_of_the_hosts(monkeypatch):
+    """On a hosted page (server.HOSTED, which harness.host sets) the visitor holds their own Anthropic key and no other:
+    the line above the composer names no key of the host's, and a key Anthropic refuses is theirs to replace by
+    starting again. In a clone both read as they always have."""
+    import anthropic
+    import httpx2
+    from harness import server
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-test")
+    for k in ("BASETEN_API_KEY", "MASSIVE_API_KEY", server.HOSTED):
+        monkeypatch.delenv(k, raising=False)
+    page = server.Page.__new__(server.Page)  # its keys' lines alone, with none of its threads
+    page.read_only = False
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    said = lambda kind, status, message: kind("no", response=httpx2.Response(status, request=request),  # noqa: E731
+                                               body={"error": {"message": message}})
+    refused = said(anthropic.AuthenticationError, 401, "invalid x-api-key")
+    denied = said(anthropic.PermissionDeniedError, 403, "Your key does not have access to this model.")
+    limited = said(anthropic.RateLimitError, 429, "This request would exceed your limit.")
+    assert page.missing_keys() == [line for k, line in server.KEYS.items() if k != "ANTHROPIC_API_KEY"]
+    assert "in .env" in server._plain_error(refused)
+    monkeypatch.setenv(server.HOSTED, "1")
+    assert page.missing_keys() == []
+    lines = [server._plain_error(e) for e in (refused, denied, limited)]
+    assert lines == [
+        "Anthropic refused your key (invalid x-api-key), so the analyst can't reply. To go on, end the session and "
+        "start again with another key.",
+        "Anthropic refused your key (Your key does not have access to this model), so the analyst can't reply. To go "
+        "on, end the session and start again with another key.",
+        "The analyst couldn't reply on your key: This request would exceed your limit."]
+    assert not [line for line in lines if ".env" in line or "API_KEY" in line]
 
 
 def test_an_error_line_names_the_key_refused(monkeypatch):

@@ -19,6 +19,7 @@ dependencies = [
 [project.scripts]
 event-risk = "harness.server:main"
 example = "harness.server:example"
+event-risk-host = "harness.host:main"
 
 [dependency-groups]
 dev = [

@@ -7,6 +7,7 @@ import http.client
 import json
 import threading
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -195,15 +196,16 @@ def test_figures_the_store_could_not_keep_or_render_are_said_to_be_as_of_their_t
 
 def test_the_readings_interval_is_set_at_start_up_and_nothing_else_changes(monkeypatch):
     """event-risk --readings-every SECONDS: how often, while the as-of is today, the page reads its marks and books
-    again between calls; the default is readings.INTERVAL."""
+    again between calls; the default is readings.INTERVAL. --stores DIR: the folder its conversations are kept in."""
     from harness import readings, server
-    served = []
+    served, roots = [], []
     monkeypatch.setattr(readings, "INTERVAL", 60.0)
     monkeypatch.setattr(server, "load_env", lambda: None)
-    monkeypatch.setattr(server, "Page", lambda: "page")
+    monkeypatch.setattr(server, "Page", lambda root: roots.append(root) or "page")
     monkeypatch.setattr(server, "_serve", lambda page, prog, port, browser: served.append((page, port, browser)))
     assert server.main(["--no-browser"]) == 0 and readings.INTERVAL == 60.0
-    assert server.main(["--readings-every", "300", "--no-browser"]) == 0 and readings.INTERVAL == 300.0
+    assert server.main(["--readings-every", "300", "--no-browser", "--stores", "/elsewhere"]) == 0
+    assert readings.INTERVAL == 300.0 and roots == [server.STORES, Path("/elsewhere")]
     assert served == [("page", server.PORT, False)] * 2
     with pytest.raises(SystemExit):
         server.main(["--readings-every", "0"])

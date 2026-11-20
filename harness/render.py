@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from html import escape
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from harness import schema
 from harness.derive.engine import Unavailable, Waiting
@@ -1777,9 +1777,10 @@ def _stated_chance(store: Store, key: str) -> dict:
 
 def _said_chance(store: Store, of: str, given, given_not) -> str:
     """A chance in words, by the propositions' titles."""
-    cond = [*(quote(title_of(store, x)) for x in given), *(f"not {quote(title_of(store, x))}" for x in given_not)]
+    cond = [*(f"{quote(title_of(store, x))} is Yes" for x in given),
+            *(f"{quote(title_of(store, x))} is No" for x in given_not)]
     head = f"the chance of {quote(title_of(store, of))}"
-    return f"{head} given {' and '.join(cond)}" if cond else f"{head} stated on its own"
+    return f"{head} if {' and '.join(cond)}" if cond else f"{head} stated on its own"
 
 
 READING = ("probability", "left_open", "range")  # a proposition's reading in its structure (1.2)
@@ -1856,14 +1857,16 @@ def _jointly(reader: Reader, pid: str, out: dict) -> str:
             when = _rung_date(reader, ch, q) if ch.get("through") else None
             if when:
                 through[q] = when
-        rows.append(f'<tr><td><div class="fc-case">{_given_words(store, c)}</div>'
-                    + (f'<div class="fc-sub">{e(how)}</div>' if how else "") + '</td>'
-                    f'<td class="fc-val n">{num(chance(c.get("value")))}</td></tr>')
+        rows.append({"given": c.get("given") or [], "given_not": c.get("given_not") or [], "share": c.get("value"),
+                     "chance": c["key"], "how": how})
         basis = _stated_basis(reader, ch, pid)
         if basis:
             bases.append(basis)
-    table = (f'<table class="fc-table"><thead><tr><th>Condition</th><th class="r">Chance</th></tr></thead>'
-             f'<tbody>{"".join(rows)}</tbody></table>')
+    alone = "".join(f'<tr><td><div class="fc-case">Analyst estimate</div></td>'
+                    f'<td class="fc-val n">{num(chance(t["share"]))}</td></tr>'
+                    for t in rows if not t["given"] and not t["given_not"])
+    table = (_conditional_tables(reader, title_of(store, pid), rows, sub=lambda t: t.get("how") or "")
+             + (f'<table class="fc-table"><tbody>{alone}</tbody></table>' if alone else ""))
     rng = out.get("range") or {}
     markets = list(dict.fromkeys(m for x in (*(rng.get("lo_rests") or []), *(rng.get("hi_rests") or []),
                                              *(out.get("rests") or []))
@@ -1989,29 +1992,12 @@ def _derivation(reader: Reader, pid: str, point: dict, p: float) -> str:
         basis_sec = f'<h3 class="sub">Rationale</h3>{basis}' if basis else ""
         return table + rungs_sec + basis_sec
 
-    # 2. General conditional breakdown (e.g., total probability over one or more conditions)
+    # 2. The forecast as total probability over the cases of what its chances are given: a column for each condition,
+    # a row for each case that gives the forecast something, by whether each condition holds
     active = [t for t in terms if t.get("chance") or (t.get("share") or 0.0) > 1e-9]
     if not active:
         active = terms
-
-    # Remove redundant implied conditions in labels: if x in given always appears with y in given across terms, x alone names it
-    given_sets = [set(t.get("given") or []) for t in terms]
-
-    def _clean_cond(t: dict) -> tuple[str, str]:
-        g_raw = list(t.get("given") or [])
-        gn_raw = list(t.get("given_not") or [])
-        g_keep = [x for x in g_raw if not any(y != x and all((x not in s) or (y in s) for s in given_sets) for y in g_raw)]
-        gn_keep = [y for y in gn_raw if not any(x != y and all((x not in s) or (y in s) for s in given_sets) for x in gn_raw)]
-        parts, plain_parts = [], []
-        for x in (g_keep or g_raw):
-            nm = _prop_name(reader, x)
-            parts.append(go(x, e(nm), "go name"))
-            plain_parts.append(nm)
-        for x in (gn_keep or gn_raw):
-            nm = _prop_name(reader, x)
-            parts.append(f'Not {go(x, e(nm), "go name")}')
-            plain_parts.append(f"not {nm}")
-        return (" · ".join(parts) or "Base case"), (", ".join(plain_parts) or "base case")
+    over = list(dict.fromkeys(q for t in terms for q in (*(t.get("given") or []), *(t.get("given_not") or []))))
 
     all_joint = all(isinstance(t.get("joint"), (int, float)) for t in active)
     pts = apportion([1000 * t["joint"] for t in active], round(1000 * p)) if all_joint and active else [None] * len(active)
@@ -2019,7 +2005,6 @@ def _derivation(reader: Reader, pid: str, point: dict, p: float) -> str:
     trows = []
     bases = []
     for idx, (t, pt) in enumerate(zip(active, pts)):
-        cond_html, cond_plain = _clean_cond(t)
         p_case = (chance(t["p"]) if isinstance(t.get("p"), (int, float)) else
                   f'{chance(t["range"]["lo"])}–{chance(t["range"]["hi"])}' if t.get("range") else "—")
         sh = chance(t["share"]) if isinstance(t.get("share"), (int, float)) else "—"
@@ -2027,19 +2012,20 @@ def _derivation(reader: Reader, pid: str, point: dict, p: float) -> str:
         j_raw = t.get("joint")
         contrib = ((f"+{_tenth(pt)}" if idx > 0 and pt > 0 else _tenth(pt)) if pt is not None else
                    f'{chance(j_raw["lo"])}–{chance(j_raw["hi"])}' if isinstance(j_raw, dict) and "lo" in j_raw else "—")
-        trows.append(f'<tr><td><div class="fc-case">{cond_html}</div>'
-                     + (f'<div class="fc-sub">{e(how)}</div>' if how else "") + '</td>'
+        trows.append(f'<tr>{_case_heads(over, t, how)}'
                      f'<td class="fc-math n">{e(p_case)}</td><td class="fc-math n">{e(sh)}</td>'
                      f'<td class="fc-val n">{num(contrib)}</td></tr>')
         if t.get("chance"):
             b_html = _stated_basis(reader, _stated_chance(store, t["chance"]), pid)
             if b_html:
-                hdr = f"Rationale · {sh} given {e(cond_plain)}" if len(active) > 1 else "Rationale"
+                hdr = f"Rationale · {_case_label(over, t)}" if len(active) > 1 else "Rationale"
                 bases.append(f'<h3 class="sub">{hdr}</h3>{b_html}')
 
-    trows.append(f'<tr class="tot"><td>Forecast</td><td></td><td></td><td class="fc-val n">{num(chance(p))}</td></tr>')
-    table = (f'<table class="fc-table"><thead><tr><th>Condition</th><th class="r">Probability</th>'
-             f'<th class="r">Chance</th><th class="r">Contribution</th></tr></thead><tbody>{"".join(trows)}</tbody></table>')
+    trows.append(f'<tr class="tot"><th scope="row" colspan="{max(len(over), 1)}">Forecast</th><td></td><td></td>'
+                 f'<td class="fc-val n">{num(chance(p))}</td></tr>')
+    table = (f'<table class="fc-table fc-cases"><thead><tr>{_condition_heads(reader, over)}'
+             f'<th class="r">Probability</th><th class="r">Chance</th><th class="r">Contribution</th></tr></thead>'
+             f'<tbody>{"".join(trows)}</tbody></table>')
     return table + "".join(bases)
 
 
@@ -2225,12 +2211,85 @@ def _pt_label(v: float, dom: tuple[float, float], text: str, cls: str = "") -> s
     return f'<span class="pt-v{side}{" " + cls if cls else ""}" style="left:{_pt_x(v, dom)}">{text}</span>'
 
 
-def _given_words(store: Store, t: dict) -> str:
-    """A case the analyst's chance is given, each proposition in its own title on its own line: those that hold, after
-    "Given", and those that do not, after "Not"."""
-    lines = [f'<span class="pt-k">Given</span>{go(x, e(title_of(store, x)), "go name")}' for x in t.get("given") or []]
-    lines += [f'<span class="pt-k">Not</span>{go(x, e(title_of(store, x)), "go name")}' for x in t.get("given_not") or []]
-    return "".join(f'<span class="pt-c">{x}</span>' for x in lines)
+_DATED = re.compile(r"\s+((?:by|on|before|after|through|until)\s+(?:January|February|March|April|May|June|July|August|"
+                    r"September|October|November|December)\s+\d{1,2}(?:,\s+\d{4})?)(\??)$")
+
+
+def _dated(title: str) -> str:
+    """A title as HTML with its closing date set apart, where it ends in one ("… by June 30, 2027"): the date is what
+    tells two propositions on one question apart."""
+    m = _DATED.search(title or "")
+    if not m:
+        return e(title)
+    return f'{e(title[:m.start()])} <span class="cp-date">{e(m.group(1) + m.group(2))}</span>'
+
+
+def _case_groups(terms: list[dict]) -> list[tuple[list[str], list[dict]]]:
+    """Cases by the propositions they are cases of: each group's conditions in the order its first case gives them, and
+    its cases with each condition's Yes before its No."""
+    groups: dict[frozenset, tuple[list[str], list[dict]]] = {}
+    for t in terms:
+        over = [*(t.get("given") or []), *(t.get("given_not") or [])]
+        if over:
+            groups.setdefault(frozenset(over), (over, []))[1].append(t)
+    return [(over, sorted(cases, key=lambda t: tuple(q not in (t.get("given") or []) for q in over)))
+            for over, cases in groups.values()]
+
+
+def _case_label(over: list[str], t: dict) -> str:
+    """A case in words, by whether each of its conditions holds: "If Yes", "If No", "If Yes and No"."""
+    given = set(t.get("given") or [])
+    return "If " + " and ".join("Yes" if q in given else "No" for q in over)
+
+
+def _case_heads(over: list[str], t: dict, sub: str = "") -> str:
+    """A case's row heads, one under each condition: "If Yes" or "If No", and "And Yes" or "And No" after the first;
+    `sub`, a line about the case, under the first."""
+    given = set(t.get("given") or [])
+    cells = [f'{"If" if i == 0 else "And"} {"Yes" if q in given else "No"}' for i, q in enumerate(over)]
+    if sub:
+        cells[0] += f'<span class="cp-sub">{e(sub)}</span>'
+    return "".join(f'<th scope="row">{c}</th>' for c in cells)
+
+
+def _condition_heads(reader: Reader, over: list[str], rows: int = 1) -> str:
+    """The head of each condition's column: the proposition, under its role, opening it."""
+    span = f' rowspan="{rows}"' if rows > 1 else ""
+    return "".join(f'<th scope="col"{span} class="cp-cond"><span class="cp-role">Condition</span>'
+                   f'{go(q, _dated(_prop_name(reader, q)), "go name")}</th>' for q in over)
+
+
+def _yes_no(share: Any) -> tuple[str, str]:
+    """A chance and its complement, as percents that add to 100.0% as shown; a dash each where the chance is open."""
+    if not isinstance(share, (int, float)):
+        return "\u2013", "\u2013"
+    tenths = int(Decimal(repr(share * 100)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP) * 10)
+    return f"{tenths / 10:.1f}%", f"{(1000 - tenths) / 10:.1f}%"
+
+
+def _conditional_tables(reader: Reader, title: str, terms: list[dict], *, opens: str | None = None,
+                        sub: Callable[[dict], str] | None = None) -> str:
+    """The event's chance in each case of the propositions its chances are given, as a conditional probability table
+    (MATH.md 1.2), one for each set of conditions: a column for each condition, a row for each case, saying of each
+    condition whether it holds, and the event's Yes and No in that case, which add to 100% as shown, each tile shaded
+    by its probability. A chance the analyst states opens `opens`, the forecast's calculation, where its basis is."""
+    tables = []
+    for over, cases in _case_groups(terms):
+        body = []
+        for t in cases:
+            share = t.get("share")
+            known = isinstance(share, (int, float))
+            yes, no = _yes_no(share)
+            fill = (lambda x: f' style="--fill:{0.008 + 0.286 * min(max(x, 0.0), 1.0):.3f}"') if known else (lambda x: "")
+            said = gonum(opens, yes) if opens and known and t.get("chance") else num(yes)
+            body.append(f'<tr>{_case_heads(over, t, sub(t) if sub else "")}'
+                        f'<td class="cp-tile"{fill(share if known else 0.0)}>{said}</td>'
+                        f'<td class="cp-tile"{fill(1.0 - share if known else 0.0)}>{num(no)}</td></tr>')
+        tables.append(f'<table class="cp" data-conditions="{len(over)}"><thead><tr>{_condition_heads(reader, over, 2)}'
+                      f'<th scope="colgroup" colspan="2" class="cp-fore"><span class="cp-role">Forecast</span>'
+                      f'{_dated(title)}</th></tr><tr class="cp-out"><th scope="col">Yes</th><th scope="col">No</th></tr>'
+                      f'</thead><tbody>{"".join(body)}</tbody></table>')
+    return f'<div class="cpt">{"".join(tables)}</div>' if tables else ""
 
 
 def _rested_on(reader: Reader, rng: dict) -> list[str]:
@@ -2334,15 +2393,12 @@ def _probability_drawing(reader: Reader, r: dict) -> str:
     drawing = (f'<div class="pt" data-k="mv"><div class="pt-row pt-head"><div class="pt-lab"></div>'
                f'<div class="pt-plot">{axis}</div></div><div class="pt-body"><div class="pt-grid">{lines}</div>'
                f'{"".join(rows)}</div></div>')
-    # each conditional probability the analyst states, beside its whole condition
-    inputs = []
-    for t in terms:
-        if not t.get("chance"):
-            continue
-        inputs.append(f'<div class="pt-in"><div class="pt-lab"><span class="pt-name pt-cs">{_given_words(store, t)}</span>'
-                      f'</div><span class="pt-fig">{gonum("x:p:" + pid, chance(t.get("share")))}</span></div>')
-    return drawing + (f'<div class="pt-inputs" data-k="inputs"><h3 class="sub">Chances</h3>{"".join(inputs)}</div>'
-                      if inputs else "")
+    # the event's chance in each case of what the analyst's chances are given: every case that can happen, where the
+    # forecast is worked out from them, and otherwise each chance as stated
+    worked = me.get("terms") or []
+    tables = _conditional_tables(reader, r["title"], worked if any(t.get("chance") for t in worked) else terms,
+                                 opens="x:p:" + pid)
+    return drawing + (f'<div class="pt-inputs" data-k="inputs">{tables}</div>' if tables else "")
 
 
 def _market_section(reader: Reader, r: dict) -> str:
@@ -4478,10 +4534,10 @@ def _statement(reader: Reader, owner: str, kind: str, field_: str, v: dict, link
     store = reader.store
     x = v.get("value") if isinstance(v, dict) else v
     if kind == "Proposition" and field_.startswith("chances"):
-        cond = [*(quote(title_of(store, g)) for g in v.get("given") or []),
-                *(f"not {quote(title_of(store, g))}" for g in v.get("given_not") or [])]
+        cond = [*(f"{quote(title_of(store, g))} is Yes" for g in v.get("given") or []),
+                *(f"{quote(title_of(store, g))} is No" for g in v.get("given_not") or [])]
         figure = chance(x) if isinstance(x, (int, float)) else ""
-        return {"kind": "Chance", "what": title_of(store, owner), "sub": f"given {' and '.join(cond)}" if cond else "",
+        return {"kind": "Chance", "what": title_of(store, owner), "sub": f"If {' and '.join(cond)}" if cond else "",
                 "figure": figure, "opens": f"x:p:{owner}"}
     if kind == "Proposition" and field_ == "priced_in":
         figure = chance(x) if isinstance(x, (int, float)) else ""
