@@ -500,6 +500,13 @@ class Moves:
                 accrued = 0.0 if accrual is None else (accrual(day) - accrual(previous)) / closes[previous]
                 self.clean[day] = daily[day] - accrued
 
+    def between(self, start: str, end: str) -> tuple[str, str] | None:
+        """The two closes a window from `start` to `end` runs between (MATH.md 3.2): the last on or before each date, so a
+        date with no session reads the close before it. None where the series has no close on or before `start`, or
+        none after that one through `end`."""
+        i, j = bisect_right(self.days, start) - 1, bisect_right(self.days, end) - 1
+        return (self.days[i], self.days[j]) if 0 <= i < j else None
+
     def __call__(self, start: str, end: str) -> float | None:
         before, after = self.closes.get(start), self.closes.get(end)
         if before is None or after is None or before == 0:

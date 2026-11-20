@@ -28,9 +28,9 @@ limit 413. So identifiers are mapped as many to a request as the key allows, and
 one request at a time, 250 ISINs in the first moments and 250 a minute after; with one, PARALLEL at once, the chunks
 of one mapping and the mappings of several kinds side by side, since one request takes some 0.3 to 0.9 seconds, so
 that one at a time used a fraction of the key's window. A chunk OpenFIGI does not answer leaves only its own
-identifiers to be read again. The key is optional: where OPENFIGI_API_KEY is not set,
-the client reads as it does without one (harness.analyst.clients). Where OpenFIGI does not answer, it is not asked again
-for a minute (harness.venues.http.Cooldown), and the rows it would confirm wait (harness.derive.identity).
+identifiers to be read again. The key is optional: where OPENFIGI_API_KEY is not set, the client reads as it does
+without one (harness.analyst.clients). Where OpenFIGI does not answer past its retries, the rows it would confirm wait
+(harness.derive.identity).
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
-from harness.venues.http import TRANSIENT, Cooldown, VenueError, VenueRefused, now, pooled
+from harness.venues.http import TRANSIENT, VenueError, VenueRefused, now, pooled
 
 URL = "https://api.openfigi.com/v3/mapping"
 JOBS = 10  # the most a request takes without a key
@@ -194,16 +194,10 @@ class OpenFIGI:
         self._sleep = sleep
         self._last = 0.0
         self._slots = threading.Semaphore(PARALLEL if key else 1)  # requests at once: one without a key
-        self.cooldown = Cooldown("OpenFIGI")
 
     def _post(self, jobs: list[dict]) -> list[dict]:
-        self.cooldown.check()
-        try:
-            with self._slots:
-                return self._answer(jobs)
-        except VenueError:
-            self.cooldown.failed()
-            raise
+        with self._slots:
+            return self._answer(jobs)
 
     def _answer(self, jobs: list[dict]) -> list[dict]:
         body = json.dumps(jobs).encode()

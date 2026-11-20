@@ -6,23 +6,33 @@ The look-through accounts for every dollar of the portfolio by what it is (`owne
 company a name stands for, each share no name stands for (a fund's row below the floor), and each kind of asset that is
 not a company, a derivative's own value beyond what it carries in companies among them. These lists read that account.
 
-**A company's industry** is its place in Yahoo's one classification for every market, its sector and its industry
-(harness.venues.yahoo): its listing's, as Yahoo's screener gives it for the listing's symbol, the listing found by its
-own ticker where it trades (`symbols_for`), else by searching its ISIN; and where the screener gives it none, its
-profile's. **Its country**
-is its home: the country it is registered in, its ISIN's, where it also trades there, its listing in that country; and
-otherwise the one its own record gives, its profile's country. A depositary receipt's ISIN is the receipt's own, issued
-where the receipt trades, and says nothing of where its company is registered, so a company met by its receipt (the
-look-through marks the row) has the home its own record gives. A row whose own ticker matches no listing where it
-trades (an exchange's code after it, a when-issued line, a ticker since changed, a fund naming the wrong country) is
-found by searching its ISIN, or the one its US CUSIP makes, wherever it trades. A company whose classification no source states stands
-under no industry, and one whose home no source states under no country, each with its name, so the lists still sum.
+**A company's industry** is its place in FinanceDatabase's one classification for every market, its sector and its
+industry (harness.venues.equities), from the file's row of the company. The row is first that of one of the company's
+own securities, those its identifiers confirmed it by (harness.derive.identity), by its symbol; then one of the rows of
+its ISIN, or of the one its US CUSIP makes, the listing on the market its fund names or on its ISIN's own first (pick);
+then the row of a listing its own ticker builds where it trades and on the exchanges of its ISIN's country
+(`symbols_for`), since a symbol built from a ticker and a country is a guess at a listing and can name another company:
+AngloGold Ashanti's row, its JSE ticker ANG under a US exchange and a British ISIN, builds London's ANG, Angling
+Direct's. A listing the file holds as delisted names no company by its symbol, since its symbol can since have passed
+to another; an ISIN's delisted rows are still its company's. **Its country** is its home: the country it is
+registered in, its ISIN's, where it also trades there, by a listing of it there or the exchange its fund names there;
+and otherwise the one its own record gives, the file's country, or, for a company the file holds by none of these,
+the country of its profile at Yahoo Finance, the first that answers of the listing a search by its ISIN finds, of each
+its own ticker builds, and of each US line OpenFIGI maps its ISIN to. A depositary receipt's ISIN is the receipt's
+own, issued where the receipt trades, and says nothing of where its company is registered, so a company met by its
+receipt (the look-through marks the row) has the home its own record gives. A company whose classification the file
+does not state stands under no industry, and one whose home no source states under no country, each with its name, so
+the lists still sum.
 **What is not a company** stands under its kind of asset, in each list: cash, debt, a derivative, a commodity, a
 currency, or other.
+
+**Each industry and each country has an id,** `industry:{key}` (industry_id) and `country:{code}` (country_id), on its
+group and on each company in it: the one name the analyst's `get`, a chip in its words, and the page's views open it by.
 """
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from typing import Any, Callable, Iterable
 
@@ -32,10 +42,12 @@ from harness.derive import series
 from harness.derive.assets import isin_of
 from harness.derive.engine import Derivation, Inputs
 from harness.derive.portfolio import asof_of
-from harness.venues.yahoo import region_of, symbols_for
+from harness.venues.yahoo import pick, region_of, symbols_for
 
-# Yahoo's names of countries that ISO 3166 names otherwise (read on profiles of funds drawn by rule).
-ALIAS = {"Turkey": "TR", "Macau": "MO", "Curacao": "CW", "Ivory Coast": "CI", "Russia": "RU", "Korea": "KR"}
+# Names of countries that ISO 3166 names otherwise: Yahoo's (read on profiles of funds drawn by rule) and FinanceDatabase's
+# (every name its file gives).
+ALIAS = {"Turkey": "TR", "Macau": "MO", "Curacao": "CW", "Ivory Coast": "CI", "Russia": "RU", "Korea": "KR",
+         "Falkland Islands": "FK", "Macedonia": "MK", "Sint Maarten": "SX"}
 
 
 def country_code(name: str | None) -> str | None:
@@ -50,6 +62,18 @@ def country_code(name: str | None) -> str | None:
         return None
 
 
+def industry_id(industry: str | None) -> str | None:
+    """An industry's id, `industry:{key}`: its name lowercased, each run of other characters one hyphen (`Semiconductors
+    & Chip Equipment` is `industry:semiconductors-chip-equipment`). An id the analyst writes in a sentence, and the
+    page opens."""
+    return f"industry:{re.sub(r'[^a-z0-9]+', '-', industry.lower()).strip('-')}" if industry else None
+
+
+def country_id(code: str | None) -> str | None:
+    """A country's id, `country:{ISO 3166 alpha-2}`."""
+    return f"country:{code}" if code else None
+
+
 def country_name(code: str | None) -> str | None:
     """A country's common name from its ISO 3166 code."""
     found = pycountry.countries.get(alpha_2=code) if code else None
@@ -62,23 +86,29 @@ def companies(owned: dict[str, dict], kinds: dict[str, dict]) -> dict[str, dict]
             if key.startswith("row:") or (key.startswith("name:") and (kinds.get(key) or {}).get("kind") == "name")}
 
 
-def candidates(key: str, entry: dict, securities: dict[str, dict]) -> list[str]:
-    """The symbols a company's listing can have: from the row it was met on, its own ticker where it trades; and for a
-    company held directly, its US listing."""
-    row = entry.get("row") or {}
-    ticker, country = traded(row)
-    out = symbols_for(ticker, country, row.get("isin")) if row else []
+def own_symbols(key: str, securities: dict[str, dict]) -> list[str]:
+    """The symbols of a company's own securities, each a listing its identifiers confirmed it by: a listing abroad by
+    its own symbol, a US listing by its ticker as Yahoo writes it."""
+    out: list[str] = []
     for sec in securities.get(key) or {}:
-        if series.symbol_abroad(sec):  # a listing abroad by its own symbol, which the screener holds it under
+        if series.symbol_abroad(sec):
             out.append(sec)
         elif ":" not in sec:
-            out += symbols_for(sec, "US")
+            out += symbols_for(sec, "US")[:1]
     return list(dict.fromkeys(out))
+
+
+def built_symbols(entry: dict) -> list[str]:
+    """The symbols the row a company was met on builds from its own ticker where it trades, and on its ISIN's country's
+    exchanges (symbols_for)."""
+    row = entry.get("row") or {}
+    ticker, country = traded(row)
+    return list(dict.fromkeys(symbols_for(ticker, country, row.get("isin")))) if row else []
 
 
 def symbols_of(rows: Iterable[dict]) -> list[str]:
     """The symbols a fund's rows' companies are first looked for under: those each row's own ticker builds where it
-    trades (candidates)."""
+    trades (built_symbols)."""
     return sorted({s for r in rows for s in symbols_for(*traded(r), r.get("isin"))} - {None, ""})
 
 
@@ -100,84 +130,83 @@ def _identified(entry: dict) -> str | None:
     return f"{isin}:{country}" if isin and country else None
 
 
-def classify(entries: dict[str, dict], securities: dict, listing: Callable[[str], dict | None],
+def _held(rows: list[dict], country: str | None, isin: str) -> dict | None:
+    """The row of an ISIN's that stands for its company: a listing on the market its fund names, else on its ISIN's
+    own, the primary market first (pick), else its first listed row, else its first."""
+    listed = [r for r in rows if not r["delisted"]]
+    quotes = [{"symbol": r["symbol"], "exchange": r["exchange"], "quoteType": "EQUITY"} for r in listed]
+    chosen = (pick(quotes, country) if country else None) or pick(quotes, isin[:2])
+    return next((r for r in listed if r["symbol"] == chosen), None) or (listed or rows or [None])[0]
+
+
+def classify(entries: dict[str, dict], securities: dict, equity: Callable[[str], list[dict] | None],
              found: Callable[[str], str | None], profile: Callable[[str], dict | None],
              figi: Callable[[str], list[str] | None]) -> dict[str, dict]:
-    """Each company's listing, industry and home, by what its sources state, each read through the callables (a
-    listing's sector and industry by its symbol, empty where the screener holds none with a sector; a listing's symbol
-    by its ISIN; a symbol's profile; the US listings OpenFIGI maps an ISIN to), which give None for what is not read
-    yet. A company's listing is the one its own ticker names that the screener holds, else the one its identifiers
-    find; where the screener holds neither, the first of these whose profile answers: the one its ISIN's
-    search found, each its own ticker builds where it trades, and each US line its ISIN maps to. Returns, for each
-    company, `{symbol, how, sector, industry, home, name, wants}`: `wants`, what must be read before it is
-    classified, the reads `inputs` makes."""
+    """Each company's row in FinanceDatabase's file, industry and home, each read through the callables (the file's
+    rows of `symbol:{SYMBOL}` or `isin:{ISIN}`; a listing's symbol by its ISIN; a symbol's profile; the US listings
+    OpenFIGI maps an ISIN to), which give None for what is not read yet. Returns, for each company, `{symbol, how,
+    sector, industry, home, name, wants}`: `wants`, what must be read before it is classified, the reads `inputs`
+    makes."""
     out: dict[str, dict] = {}
     for key, entry in entries.items():
         wants: list[tuple[str, str]] = []
         row = entry.get("row") or {}
-        symbols = candidates(key, entry, securities)
-        listed = None
-        for s in symbols:
-            record = listing(s)
-            if record is None:
-                wants.append(("listing", s))
-            elif record:
-                listed = (s, record)
-                break
-        symbol, how = (listed[0], "listing") if listed else (None, None)
         isin = isin_of(row) or ""
-        p = None
-        if listed is None and not wants:  # its own ticker matches no listing where it trades: its identifiers
+        named_there = str(traded(row)[1] or "").upper()
+        own, built = own_symbols(key, securities), built_symbols(entry)
+        asked = [f"symbol:{s}" for s in own] + ([f"isin:{isin}"] if isin else []) + [f"symbol:{s}" for s in built]
+        read = {a: equity(a) for a in asked}
+        wants += [("equity", a) for a, rows in read.items() if rows is None]
+        record, places = None, set()
+        if not wants:
+            listed = lambda a: next((r for r in read[a] if not r["delisted"]), None)  # noqa: E731
+            if isin:
+                places = {region_of(r["symbol"]).upper() for r in read[f"isin:{isin}"] if not r["delisted"]}
+            record = next((listed(f"symbol:{s}") for s in own if listed(f"symbol:{s}")), None) or \
+                (_held(read[f"isin:{isin}"], named_there, isin) if isin and read[f"isin:{isin}"] else None) or \
+                next((listed(f"symbol:{s}") for s in built if listed(f"symbol:{s}")), None)
+        symbol = record["symbol"] if record else None
+        trades = {region_of(symbol).upper()} if symbol else set()
+        # its ISIN's country where it trades there, by a listing of it there or the exchange its fund names, which a
+        # depositary receipt's ISIN, issued where the receipt trades, does not say: a receipt's company has its home
+        # from its own record
+        home = isin[:2] if isin and isin[:2] in (trades | places | {named_there}) and not row.get("receipt") else None
+        named = country_code(record.get("country")) if record else None
+        p: dict = {}
+        if not wants and record is None and home is None:  # the file holds it by none of them: its profile's country
             identified = _identified(entry)
             searched = found(identified) if identified else ""
+            lines = figi(isin) if isin else []
             if searched is None:
                 wants.append(("symbol", identified))
-            elif searched and listing(searched) is None:
-                wants.append(("listing", searched))
-            elif searched and listing(searched):
-                listed, symbol, how = (searched, listing(searched)), searched, "search"
-            else:  # the screener holds it under none of them: the first listing of it whose profile answers
-                lines = figi(isin) if isin else []
-                if lines is None:
-                    wants.append(("figi", isin))
-                tries = list(dict.fromkeys(([searched] if searched else []) + symbols + (lines or [])))
-                for t in tries:
-                    found_ = profile(t)
-                    if found_ is None:
+            if lines is None:
+                wants.append(("figi", isin))
+            if not wants:
+                for t in dict.fromkeys(([searched] if searched else []) + own + built + (lines or [])):
+                    got = profile(t)
+                    if got is None:
                         wants.append(("profile", t))
                         break
-                    if found_.get("industry") or found_.get("country"):
-                        symbol, p = t, found_
+                    if got.get("country"):
+                        symbol, p = t, got
                         break
-        record = listed[1] if listed else {}
-        trades = region_of(symbol).upper() if listed else \
-            str(traded(row)[1] or "").upper() or (region_of(symbol).upper() if symbol else "")
-        # its ISIN's country where it trades there, which a depositary receipt's ISIN, issued where the receipt trades,
-        # does not say: a receipt's company has its home from its own record
-        home = isin[:2] if isin and isin[:2] == trades and not row.get("receipt") else None
-        if p is None and symbol and listed and (home is None or not record.get("industry")):
-            p = profile(symbol)
-            if p is None:
-                wants.append(("profile", symbol))
-        p = p or {}
-        sector, industry = (record.get("sector"), record.get("industry")) if record.get("industry") else \
-            (p.get("sector"), p.get("industry"))
-        out[key] = {"symbol": symbol, "how": how if record.get("industry") else ("profile" if industry else None),
-                    "sector": sector, "industry": industry, "home": home or country_code(p.get("country")),
-                    "home_named": p.get("country") if not home else None,
-                    "name": record.get("name") or p.get("name") or row.get("constituent_name"),
+        out[key] = {"symbol": symbol, "how": "file" if record else ("profile" if p else None),
+                    "sector": record.get("sector") if record else None,
+                    "industry": record.get("industry") if record else None,
+                    "home": home or named or country_code(p.get("country")),
+                    "home_named": (record or p).get("country") if not home else None,
+                    "name": (record or p).get("name") or row.get("constituent_name"),
                     "wants": wants}
     return out
 
 
-def _readers(asof: str, listings: dict, symbols: dict, profiles: dict, figis: dict,
+def _readers(asof: str, equities: dict, symbols: dict, profiles: dict, figis: dict,
              load) -> tuple[Callable, Callable, Callable, Callable]:
-    def listing(symbol: str) -> dict | None:
-        ref = listings.get(symbol)
+    def equity(subject: str) -> list[dict] | None:
+        ref = equities.get(subject)
         if ref is None:
             return None
-        payload = (load(ref) if ref.get("data") else None) or {}
-        return payload if payload.get("status") == "OK" and payload.get("sector") else {}
+        return ((load(ref) if ref.get("data") else None) or {}).get("rows") or []
 
     def found(listing: str) -> str | None:
         ref = symbols.get(listing)
@@ -200,28 +229,29 @@ def _readers(asof: str, listings: dict, symbols: dict, profiles: dict, figis: di
         payload = (load(ref) if ref.get("data") else None) or {}
         return [str(x["ticker"]).replace("/", "-").replace(".", "-") for x in payload.get("listings") or []
                 if isinstance(x, dict) and x.get("ticker") and x.get("exchCode") in (None, "US")]
-    return listing, found, profile, figi
+    return equity, found, profile, figi
 
 
 def _inputs(ctx: Inputs, subject: str) -> dict:
-    """The look-through's account, and every read that classifies its companies: each listing's sector by the symbols
-    their rows trade under, each listing abroad's symbol the screener does not hold, and each profile a company's
-    industry or home needs; read stage by stage, each stage's reads side by side."""
+    """The look-through's account, and every read that classifies its companies: the file's rows of each company's
+    symbols and ISIN, and, for a company the file holds by none of them and whose home they leave open, its listing's
+    symbol by its ISIN, OpenFIGI's mapping of its ISIN and the profiles its home needs; read round by round, each
+    round's reads side by side."""
     asof = asof_of(ctx)
     month = asof[:7]
     looked = ctx.value("lookthrough", "portfolio")["output"]
     entries = companies(looked.get("owned") or {}, looked["kinds"])
-    listings: dict[str, dict] = {}
+    equities: dict[str, dict] = {}
     symbols: dict[str, dict] = {}
     profiles: dict[str, dict] = {}
     figis: dict[str, dict] = {}
-    # each read's kind, where it goes, and its subject: a month's, or for OpenFIGI's mapping the identity reads, its own
-    kinds = {"listing": ("listing_sector", listings, f"@{month}"), "symbol": ("listing_symbol", symbols, f"@{month}"),
+    # each read's kind, where it goes, and its subject: a month's, or for the file and OpenFIGI's mapping, its own
+    kinds = {"equity": ("equity", equities, ""), "symbol": ("listing_symbol", symbols, f"@{month}"),
              "profile": ("profile", profiles, f"@{month}"), "figi": ("figi", figis, "")}
-    for _ in range(8):  # the listings, the searches, then the profiles and mappings each needs, a round at a time
-        listing, found, profile, figi = _readers(asof, listings, symbols, profiles, figis, ctx.payload)
+    for _ in range(8):  # the file's rows, then the searches, mappings and profiles each needs, a round at a time
+        equity, found, profile, figi = _readers(asof, equities, symbols, profiles, figis, ctx.payload)
         wanted: dict[str, set[str]] = defaultdict(set)
-        for got in classify(entries, looked.get("securities") or {}, listing, found, profile, figi).values():
+        for got in classify(entries, looked.get("securities") or {}, equity, found, profile, figi).values():
             for kind, what in got["wants"]:
                 wanted[kind].add(what)
         if not wanted:
@@ -237,7 +267,7 @@ def _inputs(ctx: Inputs, subject: str) -> dict:
             into.update({s: refs[f"{s}{at}"] for s in named})
     return {"asof": asof, "lookthrough": ctx.value("lookthrough", "portfolio", ref=True),
             "holdings": ctx.value("holdings", "portfolio", ref=True),
-            "listings": listings, "symbols": symbols, "profiles": profiles, "figis": figis}
+            "equities": equities, "symbols": symbols, "profiles": profiles, "figis": figis}
 
 
 def _kinds_of(owned: dict[str, dict], funds: dict) -> dict[str, float]:
@@ -266,15 +296,16 @@ def _compute(m: dict, load) -> dict:
     value = (load(m["holdings"]) or {}).get("V") or 0.0
     owned = looked.get("owned") or {}
     entries = companies(owned, looked["kinds"])
-    listing, found, profile, figi = _readers(m["asof"], m["listings"], m["symbols"], m["profiles"], m.get("figis") or {},
-                                            load)
-    got = classify(entries, looked.get("securities") or {}, listing, found, profile, figi)
+    equity, found, profile, figi = _readers(m["asof"], m.get("equities") or {}, m["symbols"], m["profiles"],
+                                            m.get("figis") or {}, load)
+    got = classify(entries, looked.get("securities") or {}, equity, found, profile, figi)
     weight = (lambda d: d / value) if value else (lambda d: None)
     others = {k: d for k, d in _kinds_of(owned, looked.get("funds") or {}).items() if abs(d) > 0.005}
     kinds = [{"kind": k, "dollars": d, "weight": weight(d)} for k, d in sorted(others.items(), key=lambda kd: -abs(kd[1]))]
     by_company = sorted(({"name": key if key.startswith("name:") else None, "company": got[key]["name"],
                           "dollars": entry["dollars"], "weight": weight(entry["dollars"]),
-                          "industry": got[key]["industry"], "country": got[key]["home"]}
+                          "industry": got[key]["industry"], "industry_id": industry_id(got[key]["industry"]),
+                          "country": got[key]["home"], "country_id": country_id(got[key]["home"])}
                          for key, entry in entries.items()), key=lambda c: -abs(c["dollars"]))
 
     def grouped(field: Callable[[dict], Any], about: Callable[[Any], dict]) -> list[dict]:
@@ -290,8 +321,10 @@ def _compute(m: dict, load) -> dict:
 
     sectors = {(got[k]["sector"], got[k]["industry"]) for k in got}
     sector_of = {i: s for s, i in sectors}
-    by_industry = grouped(lambda c: c["industry"], lambda i: {"industry": i, "sector": sector_of.get(i)})
-    by_country = grouped(lambda c: c["country"], lambda code: {"country": code, "country_name": country_name(code)})
+    by_industry = grouped(lambda c: c["industry"],
+                          lambda i: {"id": industry_id(i), "industry": i, "sector": sector_of.get(i)})
+    by_country = grouped(lambda c: c["country"],
+                         lambda code: {"id": country_id(code), "country": code, "country_name": country_name(code)})
     unclassified = {"industry": sum(1 for c in by_company if not c["industry"]),
                     "country": sum(1 for c in by_company if not c["country"])}
     return {"by_company": by_company + kinds, "by_industry": by_industry + kinds, "by_country": by_country + kinds,
@@ -306,7 +339,7 @@ def _counted(values) -> dict:
     return out
 
 
-WEIGHTS = Derivation("weights", 6, "Portfolio", _inputs, _compute,
+WEIGHTS = Derivation("weights", 9, "Portfolio", _inputs, _compute,
                      fields=("by_company", "by_industry", "by_country"),
                      subject_of=lambda store, entity: "portfolio", stage="industries")
 

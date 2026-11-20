@@ -222,7 +222,7 @@ def test_a_shock_needs_its_events_baseline(tmp_path):
     x = channel(w, "USO")
     e = w.prop("E", chance={"value": 0.25})
     w.link("portfolio", "watches", e)
-    with pytest.raises(StoreError, match="names none"):
+    with pytest.raises(StoreError, match="states none"):
         w.link(e, "consequence", x, shock=0.2)
     w.store.edit(e, "baseline", "no")
     lid = w.link(e, "consequence", x, shock=0.2)
@@ -511,7 +511,7 @@ def test_a_consequence_stating_a_shock_against_what_a_factor_follows_is_read_by_
     event's own view and the download."""
     from harness import record
     from harness.ledger import ledger_read, row
-    from harness.render import Reader, event_view, ledger_markdown, ledger_panel
+    from harness.render import Reader, event_view, ledger_csv, ledger_panel
     w = world(tmp_path, g={"SPY": 10_000.0, "UUP": 5_000.0}, coefficients={"UUP": {"SPY": 1.4}})
     semis, spy = channel(w, "UUP"), channel(w, "SPY")
     e = event(w, title="An event with a residual")
@@ -529,7 +529,7 @@ def test_a_consequence_stating_a_shock_against_what_a_factor_follows_is_read_by_
     assert {c["link"]: c["shock"] for c in kept["consequences"]}[own] == {"value": -0.1, "against": schema.FOLLOWS,
                                                                          "note": got[own]["shock"]["note"]}
     assert "An event with a residual" in ledger_panel(Reader(w.store))
-    assert "An event with a residual" in ledger_markdown(w.store)
+    assert "An event with a residual" in ledger_csv(w.store)
     assert "An event with a residual" in event_view(Reader(w.store), e)["html"]
 
 
@@ -896,8 +896,8 @@ def test_a_derived_probabilitys_cases_each_read_where_the_statements_settle_them
     [row] = ledger_read(w.store)["rows"]
     assert row["probability"] == pytest.approx(0.3) and row["rule"] == "derived"
     assert row["derivation"] == [
-        {"given": [a], "given_not": [], "range": [0.0, 1.0], "markets": [], "share": 0.3, "chance": f"{e}.chances[0]"},
-        {"given": [], "given_not": [a], "range": [0.0, 1.0], "markets": [], "share": 0.3, "chance": f"{e}.chances[1]"}]
+        {"given": [a], "given_not": [], "range": [0.0, 1.0], "markets": [], "share": 0.3, "by": "chance"},
+        {"given": [], "given_not": [a], "range": [0.0, 1.0], "markets": [], "share": 0.3, "by": "chance"}]
 
 
 def test_a_stated_weight_places_the_worlds_and_the_row_carries_an_expected_value(tmp_path):
@@ -966,13 +966,13 @@ SECTION_10 = {"QQQ": (40_000.0, {"SPY": 1.15, "SOXX": 0.25}), "NVDA": (15_000.0,
               "TLT": (10_000.0, {"SPY": -0.20}), "IBIT": (5_000.0, {"SPY": 0.90, "SOXX": 0.30}), "CASH": (10_000.0, {})}
 
 
-def test_the_worked_row_built_through_the_tools(tmp_path):
-    """The worked row, every statement a tool call, on a store that starts as a new one does, with the market alone:
-    its portfolio added, with QQQ holding NVIDIA at $3,200 (its other companies left out); each holding's betas fixed
-    at the worked row's table and semiconductors built from the S&P 500 with a coefficient of 1.4. T, L, R, A30 and
-    A20 with three markets; the chance of T given R, 0.62; T's baseline its No side; the semiconductors factor added
-    after the market; shocks of -0.033 and -0.063. Every figure the worked row gives comes out at the rounding it
-    shows, each computed by hand from what the row states."""
+def section_10(tmp_path, readings: dict | None = None) -> SimpleNamespace:
+    """The worked row's store, through the tools, on a store that starts as a new one does, with the market alone: its
+    portfolio added, with QQQ holding NVIDIA at $3,200 (its other companies left out), each holding's betas fixed at
+    the worked row's table and semiconductors built from the S&P 500 with a coefficient of 1.4, and the metric its
+    propositions are decided on; the judge reads T as within R, and each other claim by `readings` where it names it.
+    Its tools, `call` (a tool call that must succeed), `market` (a market the venue lists, with its book) and `prop` (a
+    proposition's definition, as the worked row's propositions are written)."""
     from breakdown import RETRIEVED, Venues, key
     from harness.judge import FixtureJudge
     from harness.store import Store
@@ -980,7 +980,8 @@ def test_the_worked_row_built_through_the_tools(tmp_path):
     from harness.web import Web
     from harness.world import World as Harness
     from pathlib import Path
-    judge = FixtureJudge({("implication", "T", "R"): 0.97}, default=lambda kind, statement, evidence: 0.95, key=key)
+    judge = FixtureJudge({("implication", "T", "R"): 0.97, **(readings or {})},
+                         default=lambda kind, statement, evidence: 0.95, key=key)
     venues, books = Venues(), {}
     store = Store.create(tmp_path / "scratch-section-10", registry=fixture_registry(), judge=judge, venues=venues,
                          fetchers={"book": lambda s, c: {"payload": books[s], "request": {"endpoint": "/books"},
@@ -1021,7 +1022,7 @@ def test_the_worked_row_built_through_the_tools(tmp_path):
             fields.update(metric="metric:us_effective_tariff_rate_pct", value=value)
         if kind == "hitting":
             fields["window_start"] = "2026-11-04"
-        return call("add", type="Proposition", fields=fields)["id"]
+        return fields
 
     owned = call("add", type="Portfolio", fields={"asof": "2026-11-04", "holdings": [
         {"cash": d} if t == "CASH" else {"ticker": t, "dollars": d} for t, (d, _) in SECTION_10.items()]})
@@ -1031,6 +1032,20 @@ def test_the_worked_row_built_through_the_tools(tmp_path):
     call("add", type="Metric", fields={"id": "us_effective_tariff_rate_pct", "name": "the US effective tariff rate",
                                        "kind": "level", "unit": "pct", "resolution_source": "Yale Budget Lab",
                                        "level": {"value": 22, "source_id": yale}})
+    return SimpleNamespace(store=store, tools=tools, call=call, market=market, prop=prop)
+
+
+def test_the_worked_row_built_through_the_tools(tmp_path):
+    """The worked row, every statement a tool call (section_10): T, L, R, A30 and A20 with three markets; the chance of
+    T given R, 0.62; T's baseline its No side; the semiconductors factor added after the market; shocks of -0.033 and
+    -0.063. Every figure the worked row gives comes out at the rounding it shows, each computed by hand from what the
+    row states."""
+    w = section_10(tmp_path)
+    store, call, market = w.store, w.call, w.market
+
+    def prop(*args):
+        return call("add", type="Proposition", fields=w.prop(*args))["id"]
+
     t, l, r = prop("T", ">=", 25), prop("L", ">=", 25, "level_at_date"), prop("R")
     a30, a20 = prop("A30", ">", 30, "level_at_date"), prop("A20", ">", 20, "level_at_date")
     m1 = market("1", "Will the US raise tariffs by March 31?", 0.28, 0.33, size=14_000 / 0.33)  # $14,000 at its ask
@@ -1074,7 +1089,7 @@ def test_the_worked_row_built_through_the_tools(tmp_path):
     # its derivation: R at its market's price, 0.62 of it by the chance, and none of not R, which T implies
     assert row["derivation"] == [
         {"given": [r], "given_not": [], "probability": 0.305, "markets": [m1], "share": 0.62,
-         "chance": f"{t}.chances[0]"},
+         "by": "chance"},
         {"given": [], "given_not": [r], "probability": 0.695, "markets": [m1], "share": 0.0, "by": "links"}]
     assert sum(c["probability"] * c["share"] for c in row["derivation"]) == pytest.approx(row["probability"])
     # what it does: each price placed at p, and the placed moves between the two sides
@@ -1148,9 +1163,9 @@ def holding_world(tmp_path, channels=("USO",)):
 
 
 def test_a_company_held_only_below_the_floor_has_its_own_part_on_those_dollars_while_a_consequence_names_it(tmp_path):
-    """MATH.md 1.6, 3.1: every dollar of exposure to a company moves by its one price. XYZ is 0.1% of FUND, below the
-    look-through's floor, and held nowhere else; a consequence on it, made through the store's link, books its $4 inside
-    FUND to it, and its own part reaches those dollars, through FUND's holding; with the consequence removed, nothing
+    """MATH.md 1.6, 3.1: every dollar of exposure to a company moves by its one price. XYZ is 0.05% of FUND, 0.04% of the
+    portfolio, below the look-through's floor, and held nowhere else; a consequence on it, made through the store's
+    link, books its $2 inside FUND to it, and its own part reaches those dollars, through FUND's holding; with the consequence removed, nothing
     of XYZ is left in the event or the look-through."""
     rng = np.random.default_rng(5)
     w = world(tmp_path, registry=default_registry())
@@ -1158,18 +1173,18 @@ def test_a_company_held_only_below_the_floor_has_its_own_part_on_those_dollars_w
         put_reference(w.store, ticker, "CS")
         put_bars(w.store, ticker, closes_from(random_returns(rng, 0.02)))
     put_reference(w.store, "FUND", "ETF")
-    put_constituents(w.store, "FUND", [("NVDA", 0.6, "Equity"), ("XOM", 0.35, "Equity"), ("XYZ", 0.001, "Equity")])
+    put_constituents(w.store, "FUND", [("NVDA", 0.6, "Equity"), ("XOM", 0.35, "Equity"), ("XYZ", 0.0005, "Equity")])
     put_bars(w.store, "FUND", closes_from(random_returns(rng, 0.015)))
     w.store.link("portfolio", "holds", "name:FUND", {"dollars": 4000.0})
     e = event(w, p=0.3)
     assert "name:XYZ" not in w.store.engine.value("lookthrough", "portfolio").output["e"]
     shock = w.link(e, "consequence", "name:XYZ", shock=-0.5)
     out = output(w, e)
-    assert out["reach"]["name:XYZ"] == pytest.approx(4.0)  # 0.001 of FUND's $4,000
+    assert out["reach"]["name:XYZ"] == pytest.approx(2.0)  # 0.0005 of FUND's $4,000
     [held] = [h for h in out["by_holding"] if h["name"] == "name:FUND"]
     [own] = [o for o in held["own"] if o["name"] == "name:XYZ"]
-    assert own["dollars"] == pytest.approx(4.0)
-    assert own["full_impact"] == pytest.approx(4.0 * own["d"]) and own["full_impact"] < 0
+    assert own["dollars"] == pytest.approx(2.0)
+    assert own["full_impact"] == pytest.approx(2.0 * own["d"]) and own["full_impact"] < 0
     assert out["own"]["name:XYZ"] == pytest.approx(own["full_impact"])
     _reconciles(out)
     w.store.remove(shock)
@@ -1790,9 +1805,32 @@ def test_a_step_between_replies_keeps_each_world_and_the_impact_by_its_computati
     assert step["at"] is not None
 
 
+def test_a_shock_returns_its_events_row_and_each_factor_the_store_moved_with_it(tmp_path):
+    """TOOLS.md 5: a statement returns what it changed. A shock on a factor returns its event's row and, in each world the
+    shock sets a price in, each factor the store moved there with the stated ones, with its move against the baseline;
+    the event in every world, its levels and its holdings, is get's."""
+    from harness.tools import Tools
+    from harness.web import Web
+    from harness.world import World as Harness
+    w = world(tmp_path, g={"SPY": 10_000.0, "UUP": 5_000.0, "USO": 5_000.0},
+              coefficients={"UUP": {"SPY": 1.4}, "USO": {"SPY": 0.0, "UUP": 0.5}})
+    tools = Tools(Harness(w.store, w.venues, Web(key="test")))
+    semis, oil = channel(w, "UUP"), channel(w, "USO")
+    e = event(w)
+    ok, got = tools.call("link", {"from_id": e, "relation": "consequence", "to_id": semis, "fields": {
+        "shock": {"value": -0.1, "against": schema.FOLLOWS, "note": "Beyond the market."}}})
+    assert ok, got
+    (now,) = got["events"]
+    assert set(now) == {"id", "row", "moving"} and now["row"]["full_impact"] is not None
+    assert [m["factor"] for m in now["moving"]["yes"]] == [oil] and "no" not in now["moving"]
+    assert now["moving"]["yes"][0]["move"] == pytest.approx(math.exp(0.5 * math.log(0.9)) - 1, abs=1e-6)
+    whole = tools.call("get", {"id": e})[1]
+    assert whole["levels"] and whole["holdings"] and whole["outcomes"]
+
+
 def test_editing_the_baseline_or_the_weight_returns_what_the_event_now_does(tmp_path):
-    """The baseline can be edited while shocks are stated against it; edit returns the event in every world, as a
-    shock's edit does."""
+    """The baseline can be edited while shocks are stated against it; edit returns the event's row, as a shock's edit
+    does, and the event in every world is get's."""
     from harness.tools import Tools
     from harness.web import Web
     from harness.world import World as Harness
@@ -1802,12 +1840,14 @@ def test_editing_the_baseline_or_the_weight_returns_what_the_event_now_does(tmp_
     e = event(w)
     w.link(e, "consequence", x, shock=0.2)
     ok, got = tools.call("edit", {"id": e, "field": "baseline", "value": "yes"})
-    assert ok and got["events"][0]["baseline"] == "yes"
-    (oil,) = [f for f in got["events"][0]["factors"] if f["factor"] == channel(w, "USO")]
+    assert ok and got["events"][0]["row"]["full_impact"] is not None
+    now = tools.call("get", {"id": e})[1]
+    assert now["baseline"] == "yes"
+    (oil,) = [f for f in now["factors"] if f["factor"] == channel(w, "USO")]
     assert oil["worlds"]["no"]["move"] == pytest.approx(0.2) and oil["worlds"]["no"]["by"] == "own"
     assert "yes" not in oil["worlds"]  # the baseline now, where nothing moves
     ok, got = tools.call("edit", {"id": e, "field": "priced_in", "value": stated(0.5)})
-    assert ok and {o["id"]: o for o in got["events"][0]["outcomes"]}["yes"]["q"] == pytest.approx(0.5)
+    assert ok and {o["id"]: o for o in tools.call("get", {"id": e})[1]["outcomes"]}["yes"]["q"] == pytest.approx(0.5)
 
 
 def test_a_fund_paying_twice_a_company_each_session_counts_the_companys_own_part_once():
@@ -1853,14 +1893,15 @@ def test_each_kind_of_shock_through_the_tools_returns_the_event_with_the_level_o
     w.link(e, "way", first, side="yes")
     w.link(e, "way", second, side="yes")
     w.chances(first, {"given": [e], "value": 0.5})
-    got = call("link", from_id=e, relation="consequence", to_id=spy, fields={"shock": stated(-0.1)})
-    assert set(got["events"][0]["levels"]) == {spy}
+    call("link", from_id=e, relation="consequence", to_id=spy, fields={"shock": stated(-0.1)})
+    assert set(call("get", id=e)["levels"]) == {spy}
     call("link", from_id=first, relation="consequence", to_id=spy, fields={"shock": stated(-0.2)})
     call("link", from_id=e, relation="consequence", to_id=tlt, fields={"shock": stated(0.5)})
     call("link", from_id=e, relation="consequence", to_id="name:NVDA", fields={"shock": stated(-0.2)})
     call("link", from_id=e, relation="consequence", to_id="name:FUND", fields={"shock": stated(-0.1)})
     before = output(w, e)["by_holding"]
-    now = call("link", from_id=first, relation="consequence", to_id="name:AMD", fields={"shock": stated(-0.3)})["events"][0]
+    call("link", from_id=first, relation="consequence", to_id="name:AMD", fields={"shock": stated(-0.3)})
+    now = call("get", id=e)
     levels = now["levels"]
     assert set(levels) == {spy, tlt, "name:NVDA", "name:FUND", "name:AMD"}
 
@@ -1956,3 +1997,44 @@ def test_a_shock_on_a_factors_proxy_is_stated_on_the_factor(tmp_path):
     with pytest.raises(StoreError, match=rf"{lid} states what name:XLE's price does in a world; as a factor's proxy its "
                                          r"price is the factor's own, so what it does is stated on the factor"):
         w.store.add("Factor", {"name": "energy", "proxy": "XLE", "order": 99})
+
+
+def test_a_consequence_read_gives_its_levels_to_the_cent_and_its_moves_to_six_places(tmp_path):
+    """A consequence read with get, and stated with link, gives its price's level in each world to the cent, as a price
+    is shown, and its whole move and its residual there to six places (TOOLS.md 5, 9). The Computation keeps them exact."""
+    from harness.tools import Tools
+    w = world(tmp_path, g={"SPY": 10000}, coefficients={"SPY": {}})
+    e = event(w, "E", .3)
+    lid = w.link(e, "consequence", channel(w, "SPY"), shock=-0.123456789)
+    for got in (Tools(w).get(lid), Tools(w).edit(lid, "shock", {"value": -0.123456789, "note": "the same shock"})):
+        levels, moves = got["derived"]["levels"]["value"], got["derived"]["moves"]["value"]
+        assert levels and all(round(x, 2) == x for x in levels.values())
+        assert moves and all(round(x, 6) == x for m in moves.values() for x in m.values() if isinstance(x, float))
+
+
+def test_a_consequence_gives_the_page_its_response_beside_its_whole_move_and_residual_and_get_does_not(tmp_path):
+    """MATH.md 1.3, 1.4: in each world a consequence applies in, the price's whole move compounds its response, the move
+    it would have there left unstated, with its residual. The consequence gives the response in the same terms
+    (`responses`), for the page: oil, which moves with the market at 0.6, as a fraction of its price; long Treasuries,
+    quoted as a yield of 4.2 at a duration of 17, in points of it, where the three add; NVDA, a company, at its betas.
+    It is no field of the link, so get of the consequence gives the whole move and the residual alone (TOOLS.md 5)."""
+    from harness.tools import Tools
+    w = holding_world(tmp_path, channels=("USO", "TLT"))
+    quoted(w, "TLT", 4.2, 17.0)
+    e = event(w, p=0.3)
+    spy, uso, tlt = (channel(w, t) for t in ("SPY", "USO", "TLT"))
+    w.link(e, "consequence", spy, shock=-0.1)
+    oil = w.link(e, "consequence", uso, shock=0.05)
+    bonds = w.link(e, "consequence", tlt, shock=-0.4)
+    nvda = w.link(e, "consequence", "name:NVDA", shock=-0.2)
+    for lid, compounds in ((oil, True), (bonds, False), (nvda, True)):
+        got = w.store.engine.value("consequence", lid).output
+        (world_,) = got["moves"]
+        x, r = got["moves"][world_], got["responses"][world_]
+        assert r is not None and r != 0.0
+        if compounds:
+            assert 1 + x["move"] == pytest.approx((1 + r) * (1 + x["against_what_it_follows"]), rel=1e-12)
+        else:  # points of a yield, which add
+            assert x["move"] == pytest.approx(r + x["against_what_it_follows"], rel=1e-12)
+        ok, read = Tools(w).call("get", {"id": lid})
+        assert ok and "responses" not in read["derived"] and "responses" not in str(read["derived"])

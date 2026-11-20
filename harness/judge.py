@@ -57,6 +57,7 @@ STATE_LIMIT = 50_000  # characters of the state
 ABOUT_MARKET = ("The texts below are a proposition, as an analyst wrote it, and a prediction market, as its venue words "
                 "it.")
 ABOUT_PAIR = "The texts below are two propositions, as an analyst wrote them."
+ABOUT_MARKETS = "The texts below are two prediction markets, as their venues word them."
 
 
 class JudgeError(Exception):
@@ -93,11 +94,13 @@ def plain_date(day: str) -> str:
     return f"{d:%B} {d.day}, {d.year}"
 
 
-def _situation(day: str, market: dict | None) -> str:
-    """Today's date, and where a market is read, whether it is open."""
+def _situation(day: str, markets: list[dict]) -> str:
+    """Today's date, and whether each market read is open: the market, or the first and the second."""
     out = f"Today is {plain_date(day)}."
-    if market is not None and "still open" in market:
-        out += " The market is open and has not resolved." if market["still open"] else " The market is closed."
+    names = ["The market"] if len(markets) == 1 else ["The first market", "The second market"]
+    for name, market in zip(names, markets):
+        if "still open" in market:
+            out += f" {name} is open and has not resolved." if market["still open"] else f" {name} is closed."
     return out
 
 
@@ -128,11 +131,12 @@ def proposition_text(c: dict, heading: str) -> str:
     return "\n".join(lines)
 
 
-def _market(c: dict) -> str:
+def _market(c: dict, which: str = "The") -> str:
     """A market as its venue words it, under plain labels: its event, question, rules, resolution source (for Kalshi, the
-    settlement sources it lists for the market's event, or else its series'), and close."""
+    settlement sources it lists for the market's event, or else its series'), and close. `which` heads it: the market,
+    or the first or the second of two."""
     venue = c.get("venue") or "its venue"
-    lines = [f"The prediction market, as {venue} words it:"]
+    lines = [f"{which} prediction market, as {venue} words it:"]
     if c.get("event"):
         lines.append(f"Event: {c['event']}")
     lines.append(f"Question: {c.get('market')}")
@@ -150,20 +154,23 @@ def _other(c: Any) -> str:
 
 
 def state(evidence: list[dict]) -> str:
-    """The evidence as the judge reads it, as plain text: what the texts are; the situation; then each text, the
-    proposition before the market, or the first proposition before the second."""
+    """The evidence as the judge reads it, as plain text: what the texts are; the situation; then each text in the order
+    the question reads them: the proposition before the market, the first proposition before the second, or the first
+    market before the second."""
     contents = [item["content"] for item in evidence]
-    market = next((c for c in contents if isinstance(c, dict) and "market" in c), None)
+    markets = [c for c in contents if isinstance(c, dict) and "market" in c]
     day = next((c["date"] for c in contents if isinstance(c, dict) and c.get("date")), None)
     props = [c for c in contents if isinstance(c, dict) and isinstance(c.get("proposition"), str)]
-    headings = iter(["The proposition, as an analyst wrote it:"] if market is not None or len(props) != 2 else
+    headings = iter(["The proposition, as an analyst wrote it:"] if markets or len(props) != 2 else
                     ["The first proposition, as an analyst wrote it:", "The second proposition, as an analyst wrote it:"])
-    parts = [ABOUT_MARKET if market is not None else ABOUT_PAIR] + ([_situation(day, market)] if day else [])
+    which = iter(["The"] if len(markets) != 2 else ["The first", "The second"])
+    about = ABOUT_MARKETS if len(markets) == 2 else ABOUT_MARKET if markets else ABOUT_PAIR
+    parts = [about] + ([_situation(day, markets)] if day else [])
     for c in contents:
         if isinstance(c, dict) and set(c) == {"date"}:
             continue
-        if c is market:
-            parts.append(_market(c))
+        if any(c is m for m in markets):
+            parts.append(_market(c, next(which, "A")))
         elif any(c is x for x in props):
             parts.append(proposition_text(c, next(headings, "A proposition, as an analyst wrote it:")))
         else:

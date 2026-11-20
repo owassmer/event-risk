@@ -14,7 +14,8 @@ from harness.derive.checks import market_questions
 from harness.judge import MODEL, STATE_LIMIT, FixtureJudge, JudgeError, SystemOne, TooLong, default_judge, state
 from harness.tools import Tools
 
-TAIL = " could not be read just now. Nothing was written, and the call can be made again."  # the judge is the store's own: no reading is named
+TAIL = (" could not be read: its source did not answer. Nothing was written, and making the call again asks the source"
+        " again.")  # the judge is the store's own: no reading is named
 from harness.world import World as Place
 from test_propagation import M1Q
 
@@ -240,3 +241,24 @@ def test_the_judge_reads_when_a_proposition_is_judged(kind, start, said):
     content = {"proposition": "T", "says": "The rate reaches 25%", "judged": JUDGED[kind],
                **({"window starts": start} if start else {}), "window ends": "2027-03-31"}
     assert said in proposition_text(content, "The proposition:").split("\n")
+
+
+def test_the_judge_reads_each_pair_under_the_heading_and_labels_for_what_its_two_texts_are(tmp_path):
+    """What the judge is given goes through judge.state for each pair it can be given, each text as its author states
+    it: a proposition and a market, two propositions, and two markets. Two markets, as an implication from one to the other asks them, are
+    named as two markets, each under its own label in the order the question reads them, each with whether it is open."""
+    from harness import judge, ledger
+    w = World(tmp_path / "scratch-pairs")
+    m, n = w.market("M", "Will M happen?", 0.3, 0.4), w.market("N", "Will N happen?", 0.5, 0.6)
+    p, q = w.prop("P"), w.prop("Q")
+    links = {"market and proposition": w.link(p, "implies", m), "two propositions": w.link(p, "implies", q),
+             "two markets": w.link(m, "implies", n)}
+    read = {k: state(ledger._question(w.store, w.store.get(lid))["evidence"]) for k, lid in links.items()}
+    one, pair, two = read["market and proposition"], read["two propositions"], read["two markets"]
+    assert one.startswith(judge.ABOUT_MARKET) and "\n\nThe prediction market, as " in one and "The market is open" in one
+    assert pair.startswith(judge.ABOUT_PAIR) and "The first proposition, as an analyst wrote it:" in pair
+    assert two.startswith(judge.ABOUT_MARKETS + "\n\nToday is ")
+    first, second = two.index("The first prediction market, as "), two.index("The second prediction market, as ")
+    assert first < two.index("Question: Will M happen?") < second < two.index("Question: Will N happen?")
+    assert "The first market is open and has not resolved. The second market is open and has not resolved." in two
+    assert "still open" not in two and "venue:" not in two  # no field is passed through as its raw key

@@ -44,7 +44,7 @@ from typing import Any, Callable
 
 import httpx
 
-from harness.venues.http import Cooldown, VenueError, VenueRefused, client, now
+from harness.venues.http import VenueError, VenueRefused, client, now
 
 URL = "https://www.treasurydirect.gov/TA_WS/securities/search"
 HELD = 200  # days: the oldest holdings a look-through reads stand at most this long before its as-of
@@ -60,7 +60,6 @@ def _day(value: Any) -> str | None:
 class Treasury:
     def __init__(self, *, http: httpx.Client | None = None):
         self.http = http or client(TIMEOUT)
-        self.cooldown = Cooldown("TreasuryDirect")
 
     def bills(self, asof: str) -> dict:
         """Every bill a fund's holdings read by `asof` can hold, each by its CUSIP, with its term and dates."""
@@ -68,16 +67,13 @@ class Treasury:
         start = (date.fromisoformat(asof) - timedelta(days=HELD)).isoformat()
         end = (date.fromisoformat(asof) + timedelta(days=366)).isoformat()
         params = {"type": "Bill", "format": "json", "dateFieldName": "maturityDate", "startDate": start, "endDate": end}
-        self.cooldown.check()
         try:
             response = self.http.get(URL, params=params)
         except httpx.HTTPError as e:
-            self.cooldown.failed()
             raise VenueError(f"TreasuryDirect: {e}") from None
         if response.status_code == 400:
             raise VenueRefused(f"TreasuryDirect refused our request for bills: {response.text[:200]}")
         if response.status_code != 200:
-            self.cooldown.failed()
             raise VenueError(f"TreasuryDirect answered {response.status_code}")
         try:
             body = response.json()
@@ -97,14 +93,11 @@ class Treasury:
         """The Treasury's daily par yield curve over a year, each day's tenors in years with their yields."""
         retrieved = now()
         params = {"data": "daily_treasury_yield_curve", "field_tdr_date_value": year}
-        self.cooldown.check()
         try:
             response = self.http.get(CURVE, params=params, follow_redirects=True)
         except httpx.HTTPError as e:
-            self.cooldown.failed()
             raise VenueError(f"the Treasury's yield curve: {e}") from None
         if response.status_code != 200:
-            self.cooldown.failed()
             raise VenueError(f"the Treasury answered {response.status_code} for its yield curve")
         try:
             root = ET.fromstring(response.content)

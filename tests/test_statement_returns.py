@@ -6,7 +6,7 @@ portfolio now owns, as its link does. Seven watched events, each moving the mark
 from __future__ import annotations
 
 from harness import ledger
-from harness.tools import Tools
+from harness.tools import Tools, _changed
 from harness.world import World
 from test_impact import channel
 
@@ -66,13 +66,28 @@ def test_a_removal_returns_the_events_what_went_reached_as_they_now_stand(events
     e1, e2, e3 = ids["E1"], ids["E2"], ids["E3"]
     (shock,) = w.store.links_of(e1, "consequence")
     out = call(tools, "remove", {"id": shock["id"]})  # the event it was on, now with no consequence
-    assert out["events"] == [ledger.event_now(w.store, e1)] and out["events"][0]["figures"] is None
+    assert out["events"] == [_changed(w.store, e1)] and out["events"][0]["figures"] is None
     r = w.prop("R", chance={"value": 0.5})
     link = call(tools, "link", {"from_id": e2, "relation": "implies", "to_id": r})
     out = call(tools, "remove", {"id": link["id"]})  # each event of the structure it was in
-    assert [e["id"] for e in out["events"]] == [e2] and out["events"] == [ledger.event_now(w.store, e2)]
+    assert [e["id"] for e in out["events"]] == [e2] and out["events"] == [_changed(w.store, e2)]
     (watch,) = [x for x in w.store.links_of("portfolio", "watches") if x["to"] == e3]
     assert "events" not in call(tools, "remove", {"id": watch["id"]})  # it leaves the ledger, and moves no other
     out = call(tools, "remove", {"id": channel(w, "EEM")})  # a factor reaches every event
     assert out["rows"] == rows_as_events_end(w.store) and e3 not in [x["id"] for x in out["rows"]]
     assert "events" not in out
+
+
+def test_a_note_that_names_a_market_returns_its_terms_and_its_book_as_any_statement_does(tmp_path):
+    """A note keeps a market it names (MATH.md 3.3), and, a statement that names a market, returns its question, its
+    rules, its resolution source and its close, and its book (TOOLS.md 5)."""
+    from test_impact import section_10
+    w = section_10(tmp_path)
+    m = w.market("9", "Will the US raise tariffs on one country by March 31?", 0.40, 0.50)
+    ok, out = w.tools.call("note", {"text": "This one asks about one country alone.", "about_ids": [m]})
+    assert ok, out
+    [shown] = out["markets"]
+    assert shown["market"] == m and shown["question"] == "Will the US raise tariffs on one country by March 31?"
+    assert (shown["bid"], shown["ask"]) == (0.40, 0.50) and "rules" in shown and "close_time" in shown
+    ok, out = w.tools.call("note", {"text": "No market here.", "about_ids": []})
+    assert ok and "markets" not in out

@@ -134,13 +134,13 @@ def test_nested_funds_expand_once_more_with_the_floor_on_the_product(store):
           ("E", "CS"))
     put_constituents(store, "F1", [("A", 0.5, "Equity"), ("B", 0.3, "Equity"), ("F2", 0.2, "Equity")])
     put_constituents(store, "F2", [("C", 0.5, "Equity"), ("D", 0.39, "Equity"), ("F3", 0.1, "Equity"),
-                                   ("E", 0.01, "Equity")])
+                                   ("E", 0.002, "Equity")])
     hold(store, {"ticker": "F1", "dollars": 10000.0})
     out = lookthrough(store)
     assert link_dollars(out, "F1", "F2") == pytest.approx(2000.0)
     assert link_dollars(out, "F2", "C") == pytest.approx(1000.0)
     assert link_dollars(out, "F2", "F3") == pytest.approx(200.0)  # a fund at the next depth is booked whole
-    assert "looks_through_to:name:F2>name:E" not in out["links"]  # 0.2 * 0.01 is under the floor
+    assert "looks_through_to:name:F2>name:E" not in out["links"]  # 0.2 * 0.002 of the portfolio: under the floor
     assert out["e"] == pytest.approx({"name:A": 5000.0, "name:B": 3000.0, "name:C": 1000.0, "name:D": 780.0,
                                       "name:F3": 200.0})  # E, under the floor, reaches no name
     assert e(store, "F1") == 0.0 and e(store, "F2") == 0.0  # an expanded fund has e = 0
@@ -195,10 +195,44 @@ def test_a_funds_parts_are_its_rows_exposures_per_dollar_whatever_its_price(stor
             {k: first["funds"][fund][k] for k in ("parts", "rest")}
 
 
+def test_the_floor_is_a_companys_share_of_the_portfolio_summed_over_every_fund_that_holds_it(store):
+    """MATH.md 3.1: how much a company matters is its share of the portfolio after look-through. C is 0.6% of F1 and of F2,
+    each a twentieth of the portfolio: 0.03% through each, under the floor alone, 0.06% together, which names it. E is
+    0.6% of F1 alone: 0.03%, no name. A is 0.1% of G, which is nine tenths of the portfolio: 0.09%, named; under a
+    floor on a share of the fund, 0.25%, it would have been left out while C and E were each named in their fund."""
+    names(store, ("F1", "ETF"), ("F2", "ETF"), ("G", "ETF"), ("A", "CS"), ("B", "CS"), ("C", "CS"), ("D", "CS"),
+          ("E", "CS"))
+    put_constituents(store, "F1", [("C", 0.006, "Equity"), ("E", 0.006, "Equity"), ("B", 0.988, "Equity")])
+    put_constituents(store, "F2", [("C", 0.006, "Equity"), ("D", 0.994, "Equity")])
+    put_constituents(store, "G", [("A", 0.001, "Equity"), ("B", 0.999, "Equity")])
+    hold(store, {"ticker": "F1", "dollars": 5000.0}, {"ticker": "F2", "dollars": 5000.0},
+         {"ticker": "G", "dollars": 90000.0})
+    out = lookthrough(store)
+    assert out["e"]["name:C"] == pytest.approx(60.0)  # 30.0 through each fund
+    assert link_dollars(out, "F1", "C") == pytest.approx(30.0) and link_dollars(out, "F2", "C") == pytest.approx(30.0)
+    assert out["e"]["name:A"] == pytest.approx(90.0)  # 0.1% of the fund that is most of the portfolio
+    assert "name:E" not in out["e"]  # 0.03% of the portfolio, in one fund
+
+
+def test_the_floors_base_is_each_holding_at_the_close_its_days_move_is_measured_from():
+    """The look-through's line reads each holding's share of the portfolio at its shares times the close its day's move
+    is measured from, at any as-of, so a minute's mark moves no company across it; a holding with no such close, as cash
+    or a contract, at its value now."""
+    from harness.derive.portfolio import floor_base
+    holds = {"holds": {
+        "link:1": {"security": "F", "quantity": 10.0, "price": 120.0, "previous_close": 100.0, "dollars": 1200.0},
+        "link:2": {"security": "CASH:USD", "quantity": 1000.0, "price": 1.0, "dollars": 1000.0},
+        "link:3": {"security": "market:kalshi:X", "quantity": 100.0, "price": 0.5, "dollars": 50.0},
+        "link:4": {"security": "F", "quantity": 5.0, "price": 120.0, "previous_close": 100.0, "dollars": 600.0}}}
+    assert floor_base(holds) == pytest.approx({"F": 1500 / 2550, "CASH:USD": 1000 / 2550,
+                                               "market:kalshi:X": 50 / 2550})  # F's 15 shares at 100
+
+
 def test_a_funds_rows_are_a_value_of_their_own_which_a_price_that_moves_leaves_as_it_was(store):
     """MATH.md 3.1: a fund's rows are what it holds, which a source's publication changes and a price does not. They are a
-    value of their own (fund_rows), which the look-through names and does not copy, so a price that moves leaves them
-    one Computation, and only the look-through's dollars are worked out again."""
+    value of their own (fund_rows), which the look-through names and does not copy. Which securities they reach by name
+    is read against each holding's share of the portfolio (the floor's base), so a price that moves works them out
+    again: to the same rows, and, a company being far from the floor, to the same names; only the dollars move."""
     names(store, ("F1", "ETF"), ("F2", "ETF"), ("A", "CS"), ("B", "CS"), ("C", "CS"))
     put_constituents(store, "F1", [("A", 0.3, "Equity"), ("B", 0.1, "Equity"), ("F2", 0.6, "Equity")])
     put_constituents(store, "F2", [("C", 0.7, "Equity"), ("A", 0.3, "Equity")])
@@ -208,8 +242,11 @@ def test_a_funds_rows_are_a_value_of_their_own_which_a_price_that_moves_leaves_a
     looked = store.engine.value("lookthrough", "portfolio").basis
     assert store.computation(looked)["inputs"]["fund_rows"]["basis"] == rows  # named, by its Computation
     put_bars(store, "F1", {"2026-11-03": 100.0, ASOF: 97.13}, fetched="2026-11-05T15:00:00+00:00")
-    assert lookthrough(store)["e"] != first["e"]  # the dollars move with the price
-    assert store.engine.value("fund_rows", "portfolio").basis == rows  # what the funds hold does not
+    again = lookthrough(store)
+    assert again["e"] != first["e"]  # the dollars move with the price
+    assert set(again["e"]) == set(first["e"])  # and the companies named do not
+    after = store.engine.value("fund_rows", "portfolio")
+    assert after.output["rows"] == store.computation(rows)["output"]["rows"]  # nor what the funds hold
 
 
 def test_a_name_is_held_through_the_funds_the_portfolio_holds_not_the_funds_inside_them(store):
@@ -231,11 +268,11 @@ def test_a_name_is_held_through_the_funds_the_portfolio_holds_not_the_funds_insi
 
 def test_a_null_weight_and_a_sub_floor_weight_reach_no_name(store):
     names(store, ("G", "ETF"), ("A", "CS"), ("B", "CS"), ("C", "CS"), ("D", "CS"))
-    put_constituents(store, "G", [("A", 0.6, "Equity"), ("B", None, "Equity"), ("C", 0.002, "Equity"),
-                                  ("D", 0.396, "Equity")])
+    put_constituents(store, "G", [("A", 0.6, "Equity"), ("B", None, "Equity"), ("C", 0.0004, "Equity"),
+                                  ("D", 0.3996, "Equity")])  # C at 0.04% of the portfolio, under the floor
     hold(store, {"ticker": "G", "dollars": 1000.0})
     out = lookthrough(store)
-    assert out["e"] == pytest.approx({"name:A": 600.0, "name:D": 396.0})  # the fund's own response carries the rest
+    assert out["e"] == pytest.approx({"name:A": 600.0, "name:D": 399.6})  # the fund's own response carries the rest
     assert set(out["links"]) == {"looks_through_to:name:G>name:A", "looks_through_to:name:G>name:D"}
     with pytest.raises(StoreError):  # a constituent that reaches no name is no Name of the portfolio
         store.get("name:B")
@@ -276,7 +313,7 @@ def test_a_treasury_bill_and_a_money_market_fund_are_the_funds_cash_whatever_wor
     def money_market(subject, covering):
         asked.append(("money_market", subject))
         return {"payload": {"status": "OK", "fund": subject, "money_market": subject == "GVMXX"},
-                "request": {"method": "GET", "url": "https://www.sec.gov/cgi-bin/browse-edgar"},
+                "request": {"method": "GET", "url": "https://efts.sec.gov/LATEST/search-index"},
                 "retrieved_at": "2026-11-04T19:00:00+00:00", "range": covering}
 
     store.fetchers.update({"bills": bills, "money_market": money_market})
@@ -297,7 +334,7 @@ def test_a_money_market_fund_held_directly_is_cash_and_moves_with_nothing(store)
 
     def money_market(subject, covering):
         return {"payload": {"status": "OK", "fund": subject, "money_market": subject == "MMF"},
-                "request": {"method": "GET", "url": "https://www.sec.gov/cgi-bin/browse-edgar"},
+                "request": {"method": "GET", "url": "https://efts.sec.gov/LATEST/search-index"},
                 "retrieved_at": FETCHED, "range": covering}
 
     def nport(subject, covering):
@@ -338,7 +375,7 @@ def test_a_fund_that_maps_nothing_and_one_without_constituents_are_booked_whole(
                                     ("USD", 0.05, "Cash")])
     put_constituents(store, "GOLDT", [], status="NOT_AUTHORIZED")
     store.put_data("nport", "GOLDT", {"status": "NOT_FOUND", "fund": "GOLDT", "error": "GOLDT filed no Form N-PORT"},
-                   {"method": "GET", "url": "https://www.sec.gov/cgi-bin/browse-edgar"}, retrieved_at=FETCHED,
+                   {"method": "GET", "url": "https://efts.sec.gov/LATEST/search-index"}, retrieved_at=FETCHED,
                    range=(ASOF, ASOF))  # a grantor trust files none
     hold(store, {"ticker": "BND", "dollars": 1000.0}, {"ticker": "GOLDT", "dollars": 500.0})
     out = lookthrough(store)
@@ -363,7 +400,7 @@ def test_a_mutual_fund_is_read_from_its_form_n_port_report_whole_and_its_holding
              "weight": 0.1, "currency": "USD", "effective_date": "2026-09-30"}]
     store.put_data("nport", "VMF", {"status": "OK", "fund": "VMF", "effective_date": "2026-09-30", "net_assets": 1e9,
                                    "results": rows},
-                   {"method": "GET", "url": "https://www.sec.gov/cgi-bin/browse-edgar"}, retrieved_at=FETCHED,
+                   {"method": "GET", "url": "https://efts.sec.gov/LATEST/search-index"}, retrieved_at=FETCHED,
                    range=(ASOF, ASOF))
     hold(store, {"ticker": "VMF", "dollars": 1000.0})
     out = lookthrough(store)
@@ -385,7 +422,7 @@ def test_a_funds_holdings_are_those_published_as_of_the_latest_date_whichever_so
     store.put_data("nport", "F", {"status": "OK", "fund": "F", "effective_date": filed, "net_assets": 1e9, "results": [
         {"constituent_ticker": "B", "figi": "FIGIB", "asset_category": "EC", "issuer_category": "CORP", "weight": 1.0,
          "currency": "USD", "effective_date": filed}]},
-                   {"method": "GET", "url": "https://www.sec.gov/cgi-bin/browse-edgar"}, retrieved_at=FETCHED,
+                   {"method": "GET", "url": "https://efts.sec.gov/LATEST/search-index"}, retrieved_at=FETCHED,
                    range=(ASOF, ASOF))
     hold(store, {"ticker": "F", "dollars": 1000.0})
     out = lookthrough(store)
@@ -406,7 +443,7 @@ def test_a_mutual_fund_whose_fund_an_exchange_also_lists_reads_that_classs_holdi
                                     "results": [{"constituent_ticker": "B", "figi": "FIGIB", "asset_category": "EC",
                                                  "issuer_category": "CORP", "weight": 1.0, "currency": "USD",
                                                  "effective_date": "2026-06-30"}]},
-                   {"method": "GET", "url": "https://www.sec.gov/cgi-bin/browse-edgar"}, retrieved_at=FETCHED,
+                   {"method": "GET", "url": "https://efts.sec.gov/LATEST/search-index"}, retrieved_at=FETCHED,
                    range=(ASOF, ASOF))
     hold(store, {"ticker": "MFX", "dollars": 1000.0})
     out = lookthrough(store)

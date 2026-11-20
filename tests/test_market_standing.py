@@ -51,8 +51,8 @@ def test_a_chance_given_a_market_reads_its_price_as_that_propositions_probabilit
     w.link("portfolio", "watches", e)
     [row] = ledger_read(w.store)["rows"]
     assert row["rule"] == "derived" and row["derivation"] == [
-        {"given": [m], "given_not": [], "probability": 0.3, "markets": [m], "share": 0.8, "chance": f"{e}.chances[0]"},
-        {"given": [], "given_not": [m], "probability": 0.7, "markets": [m], "share": 0.05, "chance": f"{e}.chances[1]"}]
+        {"given": [m], "given_not": [], "probability": 0.3, "markets": [m], "share": 0.8, "by": "chance"},
+        {"given": [], "given_not": [m], "probability": 0.7, "markets": [m], "share": 0.05, "by": "chance"}]
 
 
 def test_a_books_reading_is_dated_and_its_last_successful_check_moves_with_each_read_that_finds_it(tmp_path):
@@ -161,13 +161,42 @@ def test_two_markets_at_two_deadlines_stand_as_the_rungs_of_a_ladder_at_the_date
         chances(w, e, {"given": [second], "given_not": [first], "reading": "even"})
 
 
+@pytest.mark.parametrize("asked", ["first", "second"])
+def test_a_market_rung_a_proposition_asks_through_its_no_side_keeps_its_place_in_the_ladder(tmp_path, asked):
+    """The same two markets as rungs, one of them asked by a proposition through its No side ("not by the first date",
+    or "not by the second"), so it stands as that proposition false. Its place is the chance's as stated: the earlier
+    rung given not, the later given. So the earlier still implies E and E the later, the range runs from the first
+    market's bid to the second's ask, 0.19 to 0.51, and even through time E is 0.20 + (61/91) x 0.30. At a constant
+    hazard the rungs read 0.20 and 0.50, the market's own probabilities, not the propositions': 1 - F = 0.80 x
+    (0.50 / 0.80)^(61/91). The record decides E through the same placing: the earlier market settling Yes makes E
+    true."""
+    from harness import record
+    w = World(tmp_path / f"no-side-{asked}")
+    first, second = w.market("t1", "By the first date?", 0.19, 0.21), w.market("t2", "By the second?", 0.49, 0.51)
+    q = w.prop(f"Not by the {asked} date", end="2026-12-31" if asked == "first" else "2027-04-01")
+    w.link(q, "asks", first if asked == "first" else second, side="no")
+    e = w.prop("E", end="2027-03-02", start="2026-11-04")
+    rungs = {"given": [second], "given_not": [first], "through": {first: "2026-12-31", second: "2027-04-01"}}
+    chances(w, e, {**rungs, "reading": "even"})
+    assert tuple(w.interval(e)) == pytest.approx((0.19, 0.51))
+    assert p(w, e) == pytest.approx(0.20 + 61 / 91 * 0.30)
+    chances(w, e, {**rungs, "reading": "hazard"})
+    assert p(w, e) == pytest.approx(1 - 0.80 * (0.50 / 0.80) ** (61 / 91))
+    w.link("portfolio", "watches", e)
+    record.reply(w.store, session="s", turn=1, stopped=False)
+    [frozen] = [v["frozen"] for v in record.replies(w.store)]
+    assert [(d["proposition"], d.get("outcome")) for d in record.determine(frozen, {first: 1})] == [(e, 1)]
+    w.store.close()
+
+
 def test_a_market_no_chance_or_link_names_any_longer_is_not_kept(w):
     m = w.market("m", "Will it happen?", 0.29, 0.31)
     e = w.prop("E")
     chances(w, e, {"given": [m], "value": 0.8}, {"given_not": [m], "value": 0.05})
     assert w.store.type_of(m) == "Market"
-    chances(w, e, {"value": 0.3})
-    assert w.store.type_of(m) is None
+    w.store.edit(e, "chances", [stated({"value": 0.3}), {"given": [m], "value": None},
+                                {"given_not": [m], "value": None}])
+    assert w.store.type_of(m) is None  # the chances that named it taken away, each by what it was given
 
 
 def test_a_contract_held_on_a_market_that_stands_as_itself_pays_as_often_as_it_holds_in_each_world(tmp_path):
@@ -205,11 +234,12 @@ def test_a_statement_that_equates_a_proposition_with_a_market_says_so_and_names_
                               f"market have the same outcomes")
     assert got["propositions"][m] == {"range": [0.29, 0.31], "probability": 0.3}
     b = w.prop("B", chance=0.5)
-    got = Tools(w).edit(e, "chances", [stated({"given": [m, b], "value": 1.0}), stated({"given_not": [m], "value": 0.0})])
+    got = Tools(w).edit(e, "chances", [stated({"given": [m, b], "value": 1.0}), {"given": [m], "value": None}])
     assert "claim" not in got["markets"][0]
     q = w.prop("Q", chance=0.4)
     lid = w.link(q, "asks", m, side="yes", taken=stated(False))
-    got = Tools(w).edit(e, "chances", [stated({"given": [m], "value": 0.5})])
+    got = Tools(w).edit(e, "chances", [stated({"given": [m], "value": 0.5}), {"given": [m, b], "value": None},
+                                       {"given_not": [m], "value": None}])
     assert got["markets"][0]["asked_by"] == {"proposition": q, "link": lid, "side": "yes", "taken": False}
     left = w.store.get(e)["derived"]["left_open"]["value"]  # m stands as Q, at Q's 0.4 and not at m's price
     assert (left["lo"], left["hi"]) == pytest.approx((0.5 * 0.4, 0.5 * 0.4 + 0.6))
@@ -246,7 +276,8 @@ def test_a_market_a_chance_names_is_rewound_with_the_chance(w):
     w.store.checkpoint("before")
     chances(w, e, {"given": [m], "value": 0.8}, {"given_not": [m], "value": 0.05})
     w.store.checkpoint("named")
-    chances(w, e, {"value": 0.3})
+    w.store.edit(e, "chances", [stated({"value": 0.3}), {"given": [m], "value": None},
+                                {"given_not": [m], "value": None}])
     assert w.store.type_of(m) is None
     w.store.rewind("named")
     assert w.store.type_of(m) == "Market" and p(w, e) == pytest.approx(0.275)

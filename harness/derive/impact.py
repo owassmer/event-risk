@@ -43,11 +43,11 @@ from __future__ import annotations
 import math
 
 from harness import schema
-from harness.derive import episode, option_funds, outcomes, structure, valuation, worlds
+from harness.derive import channels, distribution, episode, option_funds, outcomes, structure, valuation, worlds
 from harness.derive.channels import ordered_channels, unpriced_names
-from harness.derive.engine import Derivation, Inputs, Unavailable
+from harness.derive.engine import Derivation, Inputs, Refused, Unavailable
 from harness.derive.markets import probability
-from harness.derive.outcomes import root_of, ways_under
+from harness.derive.outcomes import root_of, tree as outcome_tree
 from harness.derive.portfolio import held_name, ticker_of
 from harness.derive.structure import node
 
@@ -114,8 +114,7 @@ def _statements(ctx: Inputs, pid: str) -> tuple[list[dict], list[tuple[str, dict
     """An event's ways, at any depth, and what it and each way state of the prices in its worlds: each consequence,
     with the proposition it is on, and each value stated for a holding (`worth`). An event that states none and whose
     portfolio holds no contract has nothing to value."""
-    links = lambda oid: ctx.links(oid, "way", "both")  # noqa: E731
-    way_nodes = ways_under(links, pid, lambda r: structure.bands(ctx, r))
+    way_nodes = outcome_tree(ctx, pid)
     ways = [w["id"] for w in way_nodes]
     stated_on = [(on, link) for on in (pid, *ways) for link in consequences(ctx, on)]  # the event's, and each way's
     worth_on = [link for on in (pid, *ways) for link in ctx.links(on, "worth")]
@@ -210,7 +209,7 @@ def _reads(ctx: Inputs, pid: str, stated: dict, ways: list[str], stated_on: list
         whole_names.add(target)
     fund_rows = ctx.value("fund_rows", "portfolio", ref=True)  # each fund's rows, which its contracts are read from
     option_terms = option_funds.inputs(ctx, ctx.payload(lookthrough), ctx.payload(fund_rows)["rows"],
-                                       stated["window_end"], exclude=whole_names)
+                                       distribution.event_date(ctx, pid), exclude=whole_names)
     option_remainders = valuation.remainder_inputs(ctx, option_terms)
     return {"channels": channels,
             "coefficients": {c: fits[c]["coefficients"] for c in channels},
@@ -264,6 +263,76 @@ def _applies(m: dict) -> dict[str, dict]:
     return out
 
 
+class Responses:
+    """How a price responds to the factors (MATH.md 1.6): a name's betas, its local ones where it is quoted in another
+    currency (`local_b`); a response at betas b to the factors' compounded moves (`at`); and a name's price at a set of
+    factor moves against where it stands with none (`level`), its local response times its currency's rate, the level of
+    the factor whose proxy the rate is, in the direction the proxy quotes it, or else the currency's own response. A
+    price moving from one set of factor moves to another moves by the ratio of its levels at them (`departure`)."""
+
+    def __init__(self, ids: list[str], coef: dict, fitted: dict):
+        self.ids = ids
+        self.fitted = fitted or {}
+        fits = self.fitted.get("fits") or {}
+        self.currencies = self.fitted.get("currencies") or {}
+        self.columns = {c: worlds.orthogonal(ids, coef, {k: float(k == c) for k in ids}) for c in ids}
+        self.abroad = {n: f["currency"] for n, f in fits.items() if (f or {}).get("currency")}
+        self.rate_by: dict[str, str] = {}  # the factor whose proxy is each currency's rate, or its betas
+        for fx in self.abroad.values():
+            cur = fx["currency"]
+            if cur not in self.rate_by:
+                by = (self.currencies.get(cur) or {}).get("by") or fx.get("by")
+                self.rate_by[cur] = by if by in ids else "betas"
+
+    def b_of(self, nid: str) -> dict:
+        return ((self.fitted.get("objects") or {}).get(nid) or {}).get("fields", {}).get("betas") or {}
+
+    def local_b(self, n: str) -> dict:
+        b = self.b_of(n)
+        if n not in self.abroad:
+            return b
+        cb = (self.currencies.get(self.abroad[n]["currency"]) or {}).get("b") or {}
+        return {c: b.get(c, 0.0) - cb.get(c, 0.0) for c in self.ids}
+
+    def inverse(self, n: str) -> bool:
+        """Whether the proxy of n's currency quotes its rate the other way, units of the currency per dollar."""
+        cur = self.abroad[n]["currency"]
+        return ((self.currencies.get(cur) or {}).get("direction") or self.abroad[n].get("direction")) == "inverse"
+
+    def at(self, b: dict, logs: dict[str, float]) -> float:
+        """A response at betas b, one plus its move: compounded on the factors' moves, exp(sum of b_raw ln(1 + x)),
+        with b_raw = T'b its betas on the raw factors; a factor worth nothing there has no compounded move, and enters
+        at its simple move, times (1 + b_raw x)."""
+        ids = self.ids
+        x = {c: math.expm1(logs[c]) for c in ids}
+        raw = {c: sum(b.get(k, 0.0) * self.columns[c][k] for k in ids) for c in ids}
+        live = sum(raw[c] * logs[c] for c in ids if math.isfinite(logs[c]))
+        dead = math.prod(1.0 + raw[c] * x[c] for c in ids if not math.isfinite(logs[c]))
+        return math.exp(live) * dead
+
+    def rate(self, n: str, logs: dict[str, float]) -> float:
+        """The rate of name n's currency at the factors' compounded moves `logs`, against where it stands with none: the
+        level of the factor whose proxy it is, in the direction the proxy quotes it, or else its own response; 1 for a
+        name quoted in dollars."""
+        if n not in self.abroad:
+            return 1.0
+        cur = self.abroad[n]["currency"]
+        by = self.rate_by[cur]
+        if by in self.ids:
+            return math.exp(-logs[by] if self.inverse(n) else logs[by])
+        return self.at((self.currencies.get(cur) or {}).get("b") or {}, logs)
+
+    def level(self, n: str, logs: dict[str, float]) -> float:
+        """Name n's price in dollars at the factors' compounded moves `logs`, against where it stands with none: its
+        local response times its currency's rate."""
+        return self.at(self.local_b(n), logs) * self.rate(n, logs)
+
+    def departure(self, n: str, logs: dict[str, float], ref: dict[str, float]) -> float:
+        """What name n does when the factors move from `ref` to `logs`, each a set of compounded moves: the ratio of its
+        levels at them, so that it moves with the factors at its betas from where it stood."""
+        return self.level(n, logs) / self.level(n, ref)
+
+
 class Moves:
     """Steps 2 and 3 for an event's worlds (MATH.md 1.3, 1.4), which no probability or weight enters: which shock applies
     in each world; every factor's compounded move against the baseline, set or filled (`logs`, `x`), and its compounded
@@ -274,12 +343,13 @@ class Moves:
     def __init__(self, m: dict, fitted: dict):
         self.W = [w["id"] for w in m["worlds"]]
         self.ids, self.coef = m["channels"], m["coefficients"]
+        self.references = m.get("joint_references") or {}  # where the rows put each joint world the analyst states
         ids, W = self.ids, self.W
         cov = worlds.covariance(ids, self.coef, m["variances"])
         self.applies = applies = _applies(m)
-        self.fitted = fitted or {}
-        fits = self.fitted.get("fits") or {}
-        self.currencies = currencies = self.fitted.get("currencies") or {}
+        self.r = r = Responses(ids, self.coef, fitted)
+        self.fitted, self.currencies, self.abroad, self.columns = r.fitted, r.currencies, r.abroad, r.columns
+        currencies = r.currencies
         # step 2: each factor's compounded move against the baseline in each world, set or filled: a shock on a price is
         # a fraction of it, ln(1 + x); one on a factor quoted as a yield is in points, ln(1 + x) = -duration * shock / 100
         yields = m.get("yields") or {}
@@ -312,23 +382,20 @@ class Moves:
         # earlier factors' residuals; a factor at zero there has no compounded move, and no residual after it has one
         self.z = {w: worlds.orthogonal(ids, self.coef, logs[w]) if all(math.isfinite(v) for v in logs[w].values())
                   else {c: None for c in ids} for w in W}
-        self.columns = {c: worlds.orthogonal(ids, self.coef, {k: float(k == c) for k in ids}) for c in ids}
         # step 3: each name a shock sets, its whole move against the baseline, in its own currency
-        self.abroad = {n: f["currency"] for n, f in fits.items() if (f or {}).get("currency")}
         shocked = sorted({t for w in W for t in applies[w] if t.startswith("name:")})
         self.whole = {n: {w: self._stated_whole(applies[w].get(n), n, w) for w in W} for n in shocked}
         # each currency's rate against the baseline: its proxy's level where a factor's proxy is its rate, in the
         # direction the proxy quotes it, or else its compounded response to the factors (1.6)
         self.rate_base: dict[str, dict[str, float]] = {}
-        self.rate_by: dict[str, str] = {}  # the factor whose proxy is each currency's rate, or its betas
+        self.rate_by = r.rate_by  # the factor whose proxy is each currency's rate, or its betas
         for n, fx in self.abroad.items():
             cur = fx["currency"]
             if cur in self.rate_base:
                 continue
-            by = (currencies.get(cur) or {}).get("by") or fx.get("by")
-            self.rate_by[cur] = by if by in ids else "betas"
+            by = self.rate_by[cur]
             if by in ids:
-                inverse = ((currencies.get(cur) or {}).get("direction") or fx.get("direction")) == "inverse"
+                inverse = r.inverse(n)
                 x_by = self.x
                 self.rate_base[cur] = {w: (1.0 / (1.0 + x_by[w][by]) if inverse and 1.0 + x_by[w][by] > TOL else
                                            (1.0 + x_by[w][by] if not inverse else 0.0)) for w in W}
@@ -345,24 +412,21 @@ class Moves:
         return r * (1.0 + a["shock"]) - 1.0 if a is not None else r - 1.0
 
     def b_of(self, nid: str) -> dict:
-        return ((self.fitted.get("objects") or {}).get(nid) or {}).get("fields", {}).get("betas") or {}
+        return self.r.b_of(nid)
 
     def local_b(self, n: str) -> dict:
-        b = self.b_of(n)
-        if n not in self.abroad:
-            return b
-        cb = (self.currencies.get(self.abroad[n]["currency"]) or {}).get("b") or {}
-        return {c: b.get(c, 0.0) - cb.get(c, 0.0) for c in self.ids}
+        return self.r.local_b(n)
 
     def response(self, b: dict, w: str) -> float:
-        """A response at betas b, one plus its move against the baseline in world w: compounded on the factors' moves,
-        exp(sum of b_raw ln(1 + x)), with b_raw = T'b its betas on the raw factors; a factor worth nothing there has no
-        compounded move, and enters at its simple move, times (1 + b_raw x)."""
-        ids, logs, x = self.ids, self.logs[w], self.x[w]
-        raw = {c: sum(b.get(k, 0.0) * self.columns[c][k] for k in ids) for c in ids}
-        live = sum(raw[c] * logs[c] for c in ids if math.isfinite(logs[c]))
-        dead = math.prod(1.0 + raw[c] * x[c] for c in ids if not math.isfinite(logs[c]))
-        return math.exp(live) * dead
+        """A response at betas b, one plus its move against the baseline in world w (Responses.at)."""
+        return self.r.at(b, self.logs[w])
+
+    def departure(self, n: str, w: str) -> float:
+        """What a name does in a joint world the analyst states beyond where the rows put it (MATH.md 1.9): it moves with
+        the factors at its betas, its currency's rate with it, from where the rows put them (`references`) to where the
+        joint world has them (Responses.departure)."""
+        ref = self.references.get(w)
+        return 1.0 if ref is None else self.r.departure(n, self.logs[w], ref)
 
     def against(self, n: str, *, responding: bool = False) -> dict[str, float]:
         """A name's price in each world against its price in the baseline (1.6): the whole move a shock settles where
@@ -387,8 +451,8 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
     try:
         q = weights or worlds.weights(ws, m.get("tree"), {n: v["q"] for n, v in (m.get("priced_in") or {}).items()})
     except worlds.Unholdable as e:  # stated weights that cannot hold together: check() lists them (1.10)
-        return {"weights_cannot_hold": {"priced_in": m.get("priced_in"), "why": str(e)}, "why": str(e), "p": m["p"],
-                "baseline": m["baseline"]}
+        return {"weights_cannot_hold": {"why": str(e)}, "priced_in": m.get("priced_in"), "why": str(e), "p": m["p"],
+                "baseline": m["baseline"]}  # each stated weight's reading stands whether or not they hold together
     looked, fitted = load(m["lookthrough"]), load(m["betas"])
     unpriced = unpriced_names(fitted)
     mv = Moves(m, fitted)  # steps 2 and 3: every move against the baseline, before any weight
@@ -431,7 +495,9 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
         if joint is None:
             return mv.against(n, responding=responding)
         own = mv.against(n, responding=responding) if any(w not in joint for w in W) else {}
-        return {w: joint[w] if w in joint else own[w] for w in W}
+        moving = m.get("joint_moving") or {}  # a stated joint world's names that move with what it changes
+        return {w: (joint[w] * (mv.departure(n, w) if responding or n in moving.get(w, ()) else 1.0))
+                if w in joint else own[w] for w in W}
 
     def own_price(n: str, *, responding: bool = False) -> dict[str, float]:
         """A name's price in each world against today: its move against the baseline (against_baseline), placed once
@@ -630,10 +696,18 @@ def compute(m: dict, load, *, weights: dict[str, float] | None = None) -> dict:
                 for n, terms in worth_terms.items() for world, claim in terms.items()
                 if (anchor := claim.get("anchor"))},
             "responding_ratios": normal,
-            "worth": {n: {"levels": values, "considerations": {w: t["link"] for w, t in worth_terms[n].items()}, "c": next(i["c"] for i in m["worth"] if i["target"] == n),
-                           "implied": valuation.implied_from_values(values,
-                               next(i["c"] for i in m["worth"] if i["target"] == n), ws, q)}
+            "worth": {n: _worth_shown(n, values, worth_terms[n], next(i["c"] for i in m["worth"] if i["target"] == n),
+                                      ws, q)
                       for n, values in worth_values.items()}}
+
+
+def _worth_shown(n: str, values: dict[str, float], terms: dict, c: float, ws: list[dict], q: dict) -> dict:
+    """A holding valued by what it is worth in each world (MATH.md 1.6): its value there (`levels`), the statements that
+    give each, its price today, each side's mean of its values with each world's share (valuation.value_sides), and the
+    weight its price implies from them."""
+    sides = valuation.value_sides(values, ws, q)
+    return {"levels": values, "considerations": {w: t["link"] for w, t in terms.items()}, "c": c, "sides": sides,
+            "implied": valuation.implied_from_values(values, c, ws, q, sides)}
 
 
 def _parts(W: list[str], ids: list[str], g: dict, ut: dict, by_holding: list[dict], A: dict) -> dict[str, dict]:
@@ -648,6 +722,30 @@ def _parts(W: list[str], ids: list[str], g: dict, ut: dict, by_holding: list[dic
             for o in h["own"]:
                 own[o["name"]] = own.get(o["name"], 0.0) + o["worlds"][w]
         out[w] = {"factors": factors, "own": own, "curve": A[w] - sum(factors.values()) - sum(own.values())}
+    return out
+
+
+def baseline_parts(parts: dict[str, dict], base: str, set_in: dict[str, set[str]]) -> dict[str, dict]:
+    """Each world's P&L against the baseline in three parts (MATH.md 1.3, 1.6), from the parts of what moved it in each
+    world (_parts) less the baseline's: what comes through the prices a statement sets there, each factor it sets at
+    its dollar beta times its placed move and what each stated company does beyond its response (`stated`); what comes
+    through the factors moving with them (`moving`), the largest of them named (`largest_moving`); and what compounding
+    and a holding's terms add (`rest`). The three add to the world's P&L against the baseline. `set_in` gives the
+    factors a statement sets in each world."""
+    b = parts[base]
+    out = {}
+    for w, p in parts.items():
+        if w == base:
+            continue
+        fs = {c: v - b["factors"].get(c, 0.0) for c, v in p["factors"].items()}
+        moving = {c: v for c, v in fs.items() if c not in set_in.get(w, ())}
+        stated = math.fsum(v for c, v in fs.items() if c in set_in.get(w, ())) + \
+            math.fsum(p["own"].values()) - math.fsum(b["own"].values())
+        top = max(moving, key=lambda c: abs(moving[c])) if moving else None
+        out[w] = {"stated": stated, "moving": math.fsum(moving.values()),
+                  **({"largest_moving": {"factor": top, "dollars": moving[top]}}
+                     if top is not None and round(moving[top], 2) != 0.0 else {}),
+                  "rest": p["curve"] - b["curve"]}
     return out
 
 
@@ -743,14 +841,21 @@ def _shares(m: dict, looked: dict, W: list[str], R: dict, own: dict, named: list
     price, and its remainder is that less what the names and the funds it holds at the next level contribute. A name's
     share is its exposure times its placed move, R - 1, in each world. Each share keeps its parts: its dollar beta times
     the placed factors' moves, what it does beyond its response (`own`), and the curve, what compounding and its terms
-    add beyond them; a share is kept wherever it shows anything (_shows)."""
+    add beyond them; a share is kept wherever it shows anything (_shows). Each figure is given at each side, and, where
+    a way has ways of its own, at that way (`outcomes`), as the outcome tree reads the P&L there (worlds.outcome_mean),
+    so that the parts add to the P&L at every outcome."""
     funds = looked.get("funds") or {}
     reaches = looked.get("reaches") or {}
     held_set = {nid for nid in m["holds"].values() if nid in named and (funds.get(ticker_of(nid)) or {}).get("expanded")}
 
-    def sides(vals: dict[str, float]) -> dict:
+    parents = m.get("tree") or {}
+    nested = [n for n in parents if n not in ("yes", "no")]  # the ways that have ways of their own
+
+    def sides(vals: dict[str, float]) -> dict:  # each figure at each outcome, as the tree reads the P&L there
         ys, ns = (worlds.side_mean(m["worlds"], vals, s) for s in ("yes", "no"))
-        return {"full_impact": ys - ns, "yes": ys, "no": ns, "worlds": vals}
+        return {"full_impact": ys - ns, "yes": ys, "no": ns, "worlds": vals,
+                **({"outcomes": {n: worlds.outcome_mean(m["worlds"], parents, vals, n) for n in nested}}
+                   if nested else {})}
 
     by_holding: list[dict] = []
     remainders: dict[str, dict] = {}
@@ -877,7 +982,7 @@ IMPACT_FIELDS = ("u_E", "full_impact", "contributors", "by_holding", "yes", "no"
                  "worlds")
 
 
-IMPACT = Derivation("impact", 42, "Proposition", _impact_inputs, compute, fields=IMPACT_FIELDS,
+IMPACT = Derivation("impact", 48, "Proposition", _impact_inputs, compute, fields=IMPACT_FIELDS,
                     applies=lambda store, pid: store.watched(pid))
 
 # The first version of the impact whose manifest holds what the analyst states of a price as a fraction of it: a shock,
@@ -1003,14 +1108,14 @@ def _against_compute(m: dict, load) -> dict:
     return {"event": m["event"], "baseline": base, "outcomes": tree,
             "worlds": {w: {k: leaf[w][k] for k in ("side", "parent", "title") if leaf[w].get(k)} for w in W},
             **{k: got[k] for k in ("against_baseline", "own_against_baseline", "setting", "episodes", "names_set",
-                                   "whole", "d", "at_zero")},
+                                   "whole", "d", "at_zero", "parts")},
             "consequences": {lid: {k: v for k, v in c.items() if k not in placed_}
                              for lid, c in got["consequences"].items()},
             "worth": {n: {k: w[k] for k in ("levels", "considerations", "c")} for n, w in (got.get("worth") or {}).items()},
             "by_holding": held, "A": A, **({"waiting": m["waiting"]} if m.get("waiting") else {})}
 
 
-AGAINST_BASELINE = Derivation("against_baseline", 4, "Proposition", _against_inputs, _against_compute,
+AGAINST_BASELINE = Derivation("against_baseline", 6, "Proposition", _against_inputs, _against_compute,
                               applies=lambda store, pid: store.watched(pid))
 
 
@@ -1034,7 +1139,9 @@ FOLLOWED = "against_what_it_follows"  # its move against where what it follows p
 def _consequence_compute(m: dict, load) -> dict:
     """The price's level today and in each world, and in each world the consequence applies in its move against the
     baseline and against what it follows, in the terms a shock on it is stated in (MATH.md 1.3, 1.4): a fraction of the
-    price, or points of a factor's yield. As the event's impact placed them: nothing is computed here."""
+    price, or points of a factor's yield; and its response there, the move it would have left unstated, in the same
+    terms (`responses`, read by the page and no field of the link). As the event's impact placed them: nothing is
+    computed here."""
     found = (load(m["impact"]).get("consequences") or {}).get(m["link"]) or {}
     terms = {"duration": m["duration"]} if m.get("duration") is not None else {}
 
@@ -1044,14 +1151,89 @@ def _consequence_compute(m: dict, load) -> dict:
             return {MOVE: worlds.in_its_terms(terms, x["raw"]),
                     FOLLOWED: worlds.in_its_terms(terms, math.expm1(own)) if own is not None else None}
         return {MOVE: x["whole"], FOLLOWED: x.get("d")}
+
+    def response(x: dict) -> float | None:  # the move it would have there left unstated, in the same terms
+        if "factor" in found:
+            implied = x.get("implied")
+            return worlds.in_its_terms(terms, math.expm1(implied)) if implied is not None else None
+        return x.get("betas")
+    ws = found.get("worlds") or {}
     return {"target": m["target"], "c": found.get("c"), "shock": found.get("shock"),
             schema.AGAINST: found.get(schema.AGAINST), "levels": found.get("levels"),
-            "moves": {w: stated_form(x) for w, x in (found.get("worlds") or {}).items()},
+            "moves": {w: stated_form(x) for w, x in ws.items()},
+            # the page's, beside the whole move and the residual: no field of the link, so get does not give it
+            "responses": {w: response(x) for w, x in ws.items()},
             **{k: found[k] for k in ("yield", "yields", "currency", "rate", "rate_by") if k in found}}
 
 
-CONSEQUENCE = Derivation("consequence", 10, "consequence", _consequence_inputs, _consequence_compute,
+CONSEQUENCE = Derivation("consequence", 11, "consequence", _consequence_inputs, _consequence_compute,
                          fields=("levels", "moves"))
+
+
+# ---------------------------------------------------------------- the past windows a shock is sized from
+
+
+def _windows_inputs(ctx: Inputs, lid: str) -> dict:
+    """What measures the price a consequence moves over each past window its shock is sized from (ONTOLOGY.md 2, MATH.md 3.2): the
+    factors' window, for a factor (window_returns), and the name's, for a name (name_window), each read as its own
+    value, so that the window reads as the analyst read it with window_returns; or why it gives the price no move, a
+    window that ends after the as-of among them, which the computation refuses."""
+    link = ctx.link(lid)
+    windows = (link["stated"].get("shock") or {}).get(schema.WINDOWS)
+    if not windows:
+        raise Unavailable(f"{lid}'s shock is sized from no past window")
+    target = link["to"]
+    out = {"link": lid, "target": target, "windows": windows}
+    if target.startswith("factor:"):
+        out["duration"] = ctx.object(target)["stated"].get("duration")
+        subjects = [("window_returns", channels.window_subject(w["start"], w["end"])) for w in windows]
+    else:
+        subjects = [("name_window", valuation.name_window_subject(w["start"], w["end"], target)) for w in windows]
+    measured = []
+    for name, subject in subjects:
+        try:
+            measured.append(ctx.value(name, subject, ref=True))
+        except Unavailable as e:  # the window gives the price no move: a read still under way is Waiting, not this
+            measured.append({"why": str(e)})
+    return {**out, "measured": measured}
+
+
+def _windows_compute(m: dict, load) -> dict:
+    """The price's move over each past window its shock is sized from, and its residual over it, in the terms a shock
+    on it is stated in (MATH.md 1.3, 3.2): as window_returns gives the factor its move and residual, in points of its
+    yield for a factor quoted as one; as it gives a name its move and its residual against its response at its betas
+    fitted up to the window's start. Each names the two sessions it ran between and the Computation it was read from.
+    A residual that is not measured, as where an earlier factor's proxy has no move over the window, is None. The
+    shock stands as stated: these are what the price did, beside it. A window over which the price has no move, one
+    that ends after the as-of among them, is refused with why (Refused), and the statement naming it fails, as one
+    naming such an episode does."""
+    terms = {"duration": m["duration"]} if m.get("duration") is not None else {}
+    out = []
+    for i, (w, ref) in enumerate(zip(m["windows"], m["measured"])):
+        refuse = f"{m['link']}.shock.windows[{i}]: "
+        if "why" in ref:
+            raise Refused(refuse + ref["why"], [m["link"]])
+        got = load(ref)
+        if m["target"].startswith("factor:"):
+            c = m["target"]
+            move, residual = got["moves"].get(c), got["own_part"].get(c)
+            if move is None:
+                proxy = got["proxies"].get(c)
+                raise Refused(refuse + ((got.get("why") or {}).get(proxy) or
+                                        f"{proxy} has no move over the window, {w['start']} to {w['end']}"), [m["link"]])
+            figures = {"sessions": got["sessions"][c], MOVE: worlds.in_its_terms(terms, move),
+                       FOLLOWED: None if residual is None else worlds.in_its_terms(terms, residual)}
+        else:
+            figures = {"sessions": got["sessions"], MOVE: got["move"], FOLLOWED: got.get("residual")}
+        out.append({"start": w["start"], "end": w["end"], **figures, "basis": ref["basis"]})
+    return {"windows": out}
+
+
+# what the price did over each past window a shock is sized from: what the store checks at the write
+# (Store._check_windows) and the page shows beside the shock (ONTOLOGY.md 2), read as engine.value("shock_windows", lid); a
+# field of no link, since the analyst reads the same figures with window_returns
+SHOCK_WINDOWS = Derivation("shock_windows", 1, "consequence", _windows_inputs, _windows_compute,
+                           applies=lambda store, lid: False)
 
 
 def metric_level(ctx: Inputs, mid: str) -> dict:
@@ -1104,6 +1286,6 @@ def _worth_compute(m: dict, load) -> dict:
     return (load(m["impact"]).get("worth") or {}).get(m["target"]) or {}
 
 
-WORTH = Derivation("worth", 3, "worth", _worth_inputs, _worth_compute, fields=("levels", "implied"))
+WORTH = Derivation("worth", 4, "worth", _worth_inputs, _worth_compute, fields=("levels", "implied"))
 
-DERIVATIONS = (CONSEQUENCE, QUOTES, WORTH, IMPACT, AGAINST_BASELINE)
+DERIVATIONS = (CONSEQUENCE, SHOCK_WINDOWS, QUOTES, WORTH, IMPACT, AGAINST_BASELINE)

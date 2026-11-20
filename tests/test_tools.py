@@ -70,7 +70,8 @@ def test_add_returns_the_object_and_refuses_a_missing_field_or_source(tools):
     ok, got = tools.call("add", {"type": "Proposition", "fields": {
         "title": "T", "text": "The rate reaches 25%", "comparison": "occurs", "window_end": "2027-03-31",
         "kind": "hitting"}})
-    assert ok and got["id"].startswith("prop:") and got["stated"]["title"] == "T" and "derived" in got
+    assert ok and got["id"].startswith("prop:") and "derived" in got and "stated" not in got  # the statement is the
+    assert tools.store.stated_of(got["id"])["title"] == "T"  # analyst's own, and the store holds it
     refused(tools, "add", {"type": "Proposition", "fields": {"title": "U", "comparison": "occurs",
                                                              "window_end": "2027-03-31", "kind": "hitting"}},
             "Proposition requires text")
@@ -162,6 +163,11 @@ def test_a_consequence_runs_to_a_factor_or_a_name_and_a_shock_on_it_is_stated_on
                             "fields": {"shock": stated(0.05)}}, "consequence runs to Factor or Name")
     refused(tools, "link", {"from_id": e, "relation": "consequence", "to_id": oil,
                             "fields": {"shock": stated(0.05), "meaning": "gap"}}, "'meaning' is not one")
+    out = refused(tools, "link", {"from_id": e, "relation": "consequence", "to_id": "name:NVDA",
+                                  "fields": {"shock": {"value": 0.05, "source_id": sid}}}, "")
+    assert out["error"].startswith(f"consequence.shock.passages: {sid} is cited with no passage quoted. A basis that "
+                                   f'cites a page quotes its passages word for word: {{"value": ..., "source_id": '
+                                   f'"{sid}", "passages": ["..."]}}')
 
 
 def test_a_stated_chance_that_breaks_a_rule_is_refused_and_one_that_holds_returns_its_structure(tools):
@@ -175,11 +181,11 @@ def test_a_stated_chance_that_breaks_a_rule_is_refused_and_one_that_holds_return
     refused(tools, "edit", {"id": e, "field": "chances", "value": [stated({"given": [e], "value": 0.5})]},
             "is given prop:1 itself")
     ok, got = tools.call("edit", {"id": e, "field": "chances", "value": [stated({"given": [b], "value": 0.5})]})
-    assert ok and got["stated"]["chances"][0]["given"] == [b]
+    assert ok and tools.store.stated_of(e)["chances"][0]["given"] == [b]
     o = got["propositions"][e]["left_open"]  # E rests on B, itself open: fixing B is what closes E
     assert set(got["propositions"]) == {e, b} and o["settled_by"] == [] and o["with"] == [b]
     out = refused(tools, "remove", {"id": b}, "edit or remove those first")
-    assert out["dependents"] == [f"{e}.chances[0]"]
+    assert out["dependents"] == [f"the chance of {e} given {b}"]
 
 
 def test_a_statement_whose_structure_the_solver_cannot_read_in_time_fails_with_why_and_writes_nothing(tools, monkeypatch):
@@ -204,7 +210,7 @@ def test_note_edit_and_remove(tools):
     assert ok and n["links"][0]["relation"] == "about" and n["links"][0]["other"] == t
     refused(tools, "note", {"text": "x", "about_ids": ["prop:999"]}, "not in the store")
     ok, edited = tools.call("edit", {"id": t, "field": "title", "value": "T2"})
-    assert ok and edited["stated"]["title"] == "T2"
+    assert ok and tools.store.stated_of(t)["title"] == "T2"
     sid = page(tools, "level", "The rate is 22 percent.")
     dated = tools.call("edit", {"id": sid, "field": "dated", "value": "2026-11-02", "source_id": sid})[1]
     assert dated["dated"] == "2026-11-02" and "text" not in dated and dated["length"] == len("The rate is 22 percent.")
@@ -484,8 +490,9 @@ def test_a_write_whose_required_read_fails_writes_nothing_and_fails_the_call_unt
     w.store.fetchers["book"] = down
     version = w.store.version
     ok, got = tools.call("link", {"from_id": r, "relation": "asks", "to_id": m})
-    assert not ok and got == {"error": f"The book of {m} could not be read just now. Nothing was written, and the call "
-                                       f"can be made again.", "dependents": []}  # the reading, by what it reads
+    assert not ok and got == {"error": f"The book of {m} could not be read: its source did not answer. Nothing was "
+                                       f"written, and making the call again asks the source again.",
+                              "dependents": []}  # the reading, by what it reads; failed at once, so in no time named
     assert w.store.links_of(r, "asks") == [] and not w.store._market_kept(m)  # nothing written
     assert w.store.version == version  # rolled back: no version, and every figure reads the store as it was
     w.store.fetchers["book"] = book
@@ -519,10 +526,17 @@ def test_window_returns_are_how_the_channels_moved_over_any_dates(tmp_path):
         w.store.put_data(row["kind"], row["subject"], w.store.data_payload(row["id"]), {"url": "test:history"},
                          retrieved_at="2026-11-05T02:00:00+00:00", range=("2013-01-01", "2026-11-04"))
     ok, got = tools.call("window_returns", {"start": "2019-01-02", "end": "2019-02-01"})
-    assert not ok and got["error"].startswith("no factor's proxy has a close at both ends of the window: SPY has no "
-                                              "close from 2019-01-02 to 2019-02-01")
-    ok, got = tools.call("window_returns", {"start": "2026-10-03", "end": "2026-10-05"})  # a Saturday's close
-    assert not ok and "SPY has no close on 2026-10-03" in got["error"]
+    assert not ok and got["error"].startswith("no factor's proxy has a move over the window: SPY has no close from "
+                                              "2019-01-02 to 2019-02-01")
+    # a date with no session reads the last close on or before it, and the two sessions are named (MATH.md 3.2): from a
+    # Saturday, Friday's close; to a Sunday, the same Friday's, so the window holds no session after its start's close
+    ok, got = tools.call("window_returns", {"start": "2026-10-03", "end": "2026-10-05"})
+    assert ok and got["factors"][0]["sessions"] == ["2026-10-02", "2026-10-05"]
+    assert got["factors"][0]["move"] == pytest.approx(out["closes"]["SPY"]["2026-10-05"] /
+                                                      w.store.engine.value("window_returns", "window:2026-10-02:2026-10-05")
+                                                      .output["closes"]["SPY"]["2026-10-02"] - 1)
+    ok, got = tools.call("window_returns", {"start": "2026-10-03", "end": "2026-10-04"})
+    assert not ok and "SPY has no close after 2026-10-02 through 2026-10-04" in got["error"]
 
 
 # ---------------------------------------------------------------- the ledger's order and check's gaps
@@ -575,7 +589,8 @@ def test_check_lists_exactly_what_the_work_is_missing_or_contradicts(events):
     store = w.store
     gaps = check(store)
     assert set(gaps) == {"fields_contradict", "differs", "cannot_hold", "stretched", "weights_cannot_hold", "values_contradict_price",
-                         "price_at_zero_where_priced", "shocks_differ"}
+                         "price_at_zero_where_priced", "shocks_differ", "joint_names_no_outcome", "joint_statements_overlap",
+                         "joint_episodes_differ", "stated_on_composite"}
     assert all(not v for v in gaps.values()), gaps  # nothing missing or contradicted
     bare = w.prop("Bare")
     w.link("portfolio", "watches", bare)
@@ -618,13 +633,14 @@ def test_the_portfolio_holdings_and_exposure_are_facts_and_run_no_search(tmp_pat
     assert held["NVDA"]["session_move"] == pytest.approx(closes["price"] / closes["previous_close"] - 1)
     assert held["FUND"]["fund"]["looked_through"] is True and cash == [{"cash": 1000.0, "currency": "USD",
                                                                         "dollars": 1000.0, "weight": 0.1}]
-    names = {n["name"]: n for n in got["by_company"] if n.get("name")}
-    assert names["name:NVDA"]["dollars"] == pytest.approx(5000 + 4000 * 0.6) and names["name:NVDA"]["direct"] == 5000.0
-    assert names["name:NVDA"]["through"] == {"FUND": pytest.approx(2400.0)} and names["name:XOM"]["direct"] == 0.0
-    assert got["by_company"][0]["name"] == "name:NVDA"  # largest first
-    assert sum(c.get("dollars", 0.0) for c in got["by_company"]) == pytest.approx(got["value"])  # it sums to the whole
-    for listed in (got["by_industry"], got["by_country"]):
-        assert sum(c["dollars"] for c in listed) == pytest.approx(got["value"])
+    names = {n["id"]: n for n in got["by_company"] if n.get("id")}
+    assert set(names["name:NVDA"]) == {"id", "company", "weight"}  # one compact form for every company
+    assert names["name:NVDA"]["weight"] == pytest.approx((5000 + 4000 * 0.6) / 10000.0)
+    assert got["by_company"][0]["id"] == "name:NVDA"  # largest first
+    for listed in (got["by_company"], got["by_industry"], got["by_country"]):  # each sums to the whole
+        assert sum(c["weight"] for c in listed) == pytest.approx(1.0, abs=1e-4)
+    assert all(g["id"].startswith(("industry:", "country:")) for g in got["by_industry"] + got["by_country"]
+               if "kind" not in g and g.get("id"))
     ok, got = tools.call("exposure", {})
     assert ok
     months = [c["largest_month_applied"] for c in got["factors"]]
@@ -636,9 +652,9 @@ def test_the_portfolio_holdings_and_exposure_are_facts_and_run_no_search(tmp_pat
 
 def test_the_portfolio_reads_as_what_it_owns_wherever_the_analyst_reads_it(tmp_path):
     """TOOLS.md 5: get on the portfolio, an edit of it, and a holding linked or edited each give what the portfolio owns as
-    adding it does, in one form: the companies below every fund's floor summed with how many they are (XYZ, 0.1% of
-    FUND), never listed one by one; each industry's and country's companies once, under each company; dollars to the
-    cent. get adds the dollar beta and the volatility, each with its basis, and the links."""
+    adding it does, in one form: the companies below the floor summed with how many they are (XYZ, 0.1% of FUND,
+    0.04% of the portfolio), never listed one by one; each industry and country by its id, its companies read with it.
+    get adds the dollar beta and the volatility, each with its basis, and the links."""
     import numpy as np
     from massive_data import closes_from, put_bars, put_constituents, put_reference, random_returns
     rng = np.random.default_rng(5)
@@ -659,12 +675,12 @@ def test_the_portfolio_reads_as_what_it_owns_wherever_the_analyst_reads_it(tmp_p
     assert set(got["derived"]) == {"dollar_beta", "volatility"} and got["derived"]["volatility"]["basis"]
     assert {link["relation"] for link in got["links"]} >= {"holds"}
     rest = [c for c in got["by_company"] if "companies" in c]
-    assert [(r["companies"], r["dollars"]) for r in rest] == [(1, 4.0)]  # XYZ, summed: 0.001 of FUND's $4,000
+    assert [(r["companies"], r["weight"]) for r in rest] == [(1, round(4.0 / got["value"], 5))]  # XYZ, $4
     assert "XYZ" not in str(got["by_company"])
     for listed in (got["by_company"], got["by_industry"], got["by_country"]):
-        assert all("names" not in g and g["dollars"] == round(g["dollars"], 2) for g in listed)
-    [nvda] = [c for c in got["by_company"] if c.get("name") == "name:NVDA"]
-    assert nvda["through"] == {"FUND": 2400.0} and nvda["direct"] == 5000.0
+        assert all("names" not in g and "dollars" not in g for g in listed)
+    [nvda] = [c for c in got["by_company"] if c.get("id") == "name:NVDA"]
+    assert nvda["weight"] == round(7400.0 / got["value"], 5)  # how it is held is its own get
     ok, linked = tools.call("link", {"from_id": "portfolio", "relation": "holds", "to_id": "name:AAPL",
                                      "fields": {"dollars": 1000.0}})
     assert ok, linked
@@ -714,27 +730,38 @@ def test_get_reads_a_market_the_store_does_not_hold_from_its_venue_and_keeps_not
     ok, got = tools.call("get", {"id": "market:polymarket:516710"})
     assert ok and got["kept"] is False and got["question"].startswith("Will the US effective tariff rate")
     assert got["rules"].startswith("Resolves Yes if the Yale Budget Lab") and got["close_time"] == "2027-03-31"
-    # The fixture's as-of, 2026-11-04, is before the read: Polymarket's history gives the day's price alone, no quote.
-    assert (got["bid"], got["ask"], got["price"], got["history_price"]) == (None, None, None, 0.42)
-    assert got["price_date"] == "2026-10-01" and got["depth"] is None
+    # The fixture's as-of, 2026-11-04, is before the read: Polymarket's history keeps the book's midpoint alone, so the
+    # market's price is its last point by then, at that point's moment, with no bid or ask.
+    assert (got["bid"], got["ask"], got["price"]) == (None, None, 0.42)
+    assert got["price_date"] == "2026-10-01" and got["depth"] is None and got["quoted_at"].startswith("2026-10-0")
     assert snapshot(tools.store)["tables"]["market"] == before["tables"]["market"] == []
     assert snapshot(tools.store)["tables"]["data"] == before["tables"]["data"]
     refused(tools, "get", {"id": "market:polymarket:999999"}, "Polymarket lists no market 999999")
 
 
 def test_a_failed_call_names_each_reading_it_could_not_obtain_and_an_error_of_ours_names_none(tmp_path, caplog):
-    """TOOLS.md 5: a call that needs readings the store could not obtain names them, three at most and the rest counted;
-    an error of ours that escapes a call fails it with nothing written and that sentence alone, the error itself in the
-    trace and the log."""
+    """TOOLS.md 5: a call that needs readings the store could not obtain names them, three at most and the rest counted,
+    with what their sources did: did not answer, in the longest time one was asked for where it was a second or more,
+    making the call again asking again; or refused the request, where every one answered with a refusal. An error of
+    ours that escapes a call fails it with nothing written and that sentence alone, the error itself in the trace and
+    the log."""
     from breakdown import World as Scratch
     from harness.tools import unread
-    tail = " could not be read just now. Nothing was written, and the call can be made again."
-    assert unread(["the daily prices of NVDA from 2024-11-12 to 2026-11-12"]) == \
-        "The daily prices of NVDA from 2024-11-12 to 2026-11-12" + tail
-    assert unread(["the holdings of SPY", "the book of market:kalshi:K"]) == \
-        "The holdings of SPY and the book of market:kalshi:K" + tail
-    assert unread([f"the reference for T{k}" for k in range(5)]) == \
-        "The reference for T0, the reference for T1, the reference for T2 and 2 other readings" + tail
+
+    def failed(what, seconds=0.2, refused=False):
+        return {"what": what, "seconds": seconds, "refused": refused}
+    assert unread([failed("the daily prices of NVDA from 2024-11-12 to 2026-11-12", 64.6)]) == \
+        ("The daily prices of NVDA from 2024-11-12 to 2026-11-12 could not be read: its source did not answer in 65 "
+         "seconds. Nothing was written, and making the call again asks the source again.")
+    assert unread([failed("the holdings of SPY", 1.2), failed("the book of market:kalshi:K", 30.0),
+                   failed("the reference for T", 40.0, refused=True)]) == \
+        ("The holdings of SPY, the book of market:kalshi:K and the reference for T could not be read: their sources "
+         "did not answer in 30 seconds. Nothing was written, and making the call again asks them again.")
+    assert unread([failed("the reference for T", 0.4, refused=True)]) == \
+        "The reference for T could not be read: its source refused the request. Nothing was written."
+    assert unread([failed(f"the reference for T{k}") for k in range(5)]) == \
+        ("The reference for T0, the reference for T1, the reference for T2 and 2 other readings could not be read: "
+         "their sources did not answer. Nothing was written, and making the call again asks them again.")
     w = Scratch(tmp_path / "scratch-escape")
     tools = Tools(World(w.store, w.venues))
     r = w.prop("R")

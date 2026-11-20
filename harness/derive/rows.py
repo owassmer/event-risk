@@ -231,6 +231,14 @@ def report_option_key(row: dict) -> str | None:
     return f"{what}|{d['expiry']}|{d['right']}|{strike_text(d['strike'])}@{row['effective_date']}"
 
 
+def us_listed_terms(d: dict) -> bool:
+    """Whether a report's option can be a contract listed in the US, whose listings state the terms the report leaves
+    out (Massive.option_listings): its strike in dollars, as every such contract's is (Form N-PORT's
+    `exercisePriceCurCd`, `strike_currency`). A strike in another currency is another contract, even where its figure,
+    expiry and right are a listing's; one whose currency is unstated has a term no source states."""
+    return d.get("strike_currency") == "USD"
+
+
 def _report_option(row: dict, d: dict, net_assets: Any, options: dict, payoff: dict) -> dict:
     """A report's option, where the report is the fund's rows (MATH.md 3.1): its terms as the report states them, and
     those it does not state (its exercise style, the shares each contract controls) from the listed contracts its
@@ -242,7 +250,10 @@ def _report_option(row: dict, d: dict, net_assets: Any, options: dict, payoff: d
     contract no listed one matches, an over-the-counter or FLEX one, or one whose stated strike its listing does not
     carry."""
     found = (options.get("report") or {}).get(report_option_key(row) or "") or {}
-    listings = [c for c in found.get("listings") or [] if isinstance(c, dict)]
+    # a listing a standard contract, or one listed before Massive stated a type: a binary's strike is a figure of a
+    # company's reported KPI, or pays a fixed sum, and is no price of the shares the report's contract is on
+    listings = [c for c in found.get("listings") or [] if isinstance(c, dict) and c.get("type") in (None, "standard")] \
+        if us_listed_terms(d) else []
     styles = {c.get("exercise_style") for c in listings} - {None}
     units = {c.get("shares_per_contract") for c in listings} - {None}
     style = next(iter(styles)) if len(styles) == 1 else None
@@ -1187,8 +1198,8 @@ def slope_reference(rows: list[dict]) -> dict | None:
     companies are established, or one company, and its shares, if it holds any, are that reference's. A swap on a fund
     whose returns follow the index refers to the index. A share is the
     reference's where its identifiers are the company's, or one of the index's companies', or it is a fund whose
-    returns follow the index (`followers`); the shares that are not may come to less than the floor in all, the share
-    of a fund the look-through counts as negligible (portfolio.FLOOR), such as a company the index has just left. A
+    returns follow the index (`followers`); the shares that are not may come to less than a negligible part of the
+    fund in all (portfolio.FUND_NEGLIGIBLE), such as a company the index has just left. A
     fund holding an option is not measured: its slope would be the options' average delta over the window, not
     today's, and its options count at their own. Returns `{to, rows, shares, series, named_by}`: the reference as the
     rows give it, the rows the slope stands for, and the series its values are read under for an index."""
@@ -1202,7 +1213,7 @@ def slope_reference(rows: list[dict]) -> dict | None:
     if "index" in first and (not first["index"].get("figi") or not first.get("companies")
                              or not first["index"].get("values")):
         return None  # an index is measured on where its values are read and its companies are established
-    from harness.derive.portfolio import FLOOR  # the look-through's line for a negligible part of a fund
+    from harness.derive.portfolio import FUND_NEGLIGIBLE  # a negligible part of a fund
 
     shares, other = [], 0.0
     for r in rows:
@@ -1211,7 +1222,7 @@ def slope_reference(rows: list[dict]) -> dict | None:
                 shares.append(r)
             else:
                 other += abs(r.get("weight") or 0.0)
-    if other >= FLOOR:
+    if other >= FUND_NEGLIGIBLE:
         return None
     return {"to": first, "rows": [id(r) for r in linear], "shares": [id(r) for r in shares],
             "series": (first.get("index") or {}).get("values"),

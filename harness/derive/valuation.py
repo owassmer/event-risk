@@ -149,10 +149,10 @@ def contract_inputs(ctx: Inputs, pid: str, tree: dict, *, through: str | None = 
     for hid, by_world in probabilities.items():
         held = holdings[hid]
         listing = ctx.value("market_listing", held["name"])
-        close = listing["output"].get("close_time")
+        close = listing["output"].get("close_time")  # its close, the New York date its venue's client gives (ny_date)
         if not close:
             raise Unavailable(f"{held['name']}'s payment date is needed to value its held contract")
-        close = datetime.fromisoformat(close.replace("Z", "+00:00")).astimezone(series.NY).isoformat()
+        close = close[:10]
         life = years(asof, close)
         if life > 0 and curves is None:
             curves = curve_inputs(ctx, asof)
@@ -265,7 +265,9 @@ def _fit_before_compute(a: dict, load) -> dict:
     """The security's close on the day, its betas fitted on its history up to that day as every fit is (3.2), and that
     close carried to today by its response to the factors' moves since, compounded: `carried`. A listing abroad's
     local part is kept beside its whole response: its betas in its own currency, which a window measures it by. Its
-    residual's history to that day, and its covariance with the factors then, are what its draws vary by (1.8)."""
+    residual's history to that day, and its covariance with the factors then, are what its draws vary by (1.8). A
+    history of fewer than two sessions to the day still gives betas, leaning on the prior as every short fit does,
+    and no covariance (`state_covariance` None): the draws that need it say so where they read it."""
     fm = channels._factors_compute(a["factors"], load)
     mdl = channels.model(fm)
     found = history.returns(a["name"], load, mdl.sessions)["dollar"]
@@ -299,9 +301,8 @@ def _fit_before_compute(a: dict, load) -> dict:
     residual = estimate.residuals(mdl.x, mdl.ok, fit["session"], found)
     state = np.column_stack([mdl.x, residual])
     good = estimate.common(state)
-    if np.count_nonzero(good) < 2:
-        raise Unavailable("the company on its own needs at least two observed sessions to carry its uncertainty")
-    state_covariance = estimate.covariances(state, good, mdl.settings.memory)[2] / estimate.centring(good, mdl.settings.memory)
+    state_covariance = (estimate.covariances(state, good, mdl.settings.memory)[2] /
+                        estimate.centring(good, mdl.settings.memory)) if np.count_nonzero(good) >= 2 else None
     return {"date": a["day"], "observed_price": start, "factor_moves": dict(zip(a["factors"]["channels"], factor_moves)),
             "carried": start * math.exp(float(full @ np.asarray(factor_moves))),
             "raw_betas": dict(zip(a["factors"]["channels"], map(float, full))),
@@ -311,10 +312,10 @@ def _fit_before_compute(a: dict, load) -> dict:
                 "local_betas": dict(zip(current.channels, map(float, current.orthogonal(fit["local_full"]))))}
                if a.get("currency") else {}),
             "returns": found, "residuals": estimate.pack(residual), "sessions": mdl.sessions,
-            "state_covariance": state_covariance.tolist()}
+            "state_covariance": None if state_covariance is None else state_covariance.tolist()}
 
 
-FIT_BEFORE = Derivation("fit_before", 3, "Name", _fit_before_inputs, _fit_before_compute,
+FIT_BEFORE = Derivation("fit_before", 4, "Name", _fit_before_inputs, _fit_before_compute,
                         applies=lambda store, subject: False)
 
 
@@ -334,8 +335,8 @@ def _name_window_inputs(ctx: Inputs, subject: str) -> dict:
     price, and a fund valued by its terms is what its terms give (1.6): neither has a fit read for it."""
     start, end, nid = subject.split(":", 2)
     asof = portfolio.asof_of(ctx)
-    if start > asof:
-        raise Unavailable(f"the window begins on {start}, after the as-of, {asof}")
+    if end > asof:
+        raise Unavailable(channels.past_window(end, asof))
     looked = ctx.payload(ctx.value("lookthrough", "portfolio", ref=True)) or {}
     info = (looked.get("kinds") or {}).get(nid) or {}
     security = info.get("security") or info.get("beta") or portfolio.ticker_of(nid)
@@ -368,30 +369,44 @@ def _name_window_inputs(ctx: Inputs, subject: str) -> dict:
     if calendar is None:
         raise Unavailable("no factor's proxy is listed in the US, and a window is measured over New York's sessions")
     # its own series first, so that a call reading several names, and the factors' window, starts their reads together
-    items = history.moves_inputs_many(ctx, [calendar, security], (start, min(end, asof)), record=record)
+    items = history.moves_inputs_many(ctx, [calendar, security], (channels.window_reach(start), end), record=record)
     out.update({"record": list(record), "calendar": items[calendar], "series": items[security],
                 "factors": ctx.value("window_returns", channels.window_subject(start, end), ref=True)})
     if terms is not None:
         return {**out, "terms": terms}
-    return {**out, "fit": ctx.value("fit_before", f"{security}@{start}", ref=True)}
+    # its response reads every factor's residual over the window; where a factor's proxy has no close at an end of it
+    # (one younger than the window, whose history then gives no fit before it either), its move stands alone
+    residuals = ctx.value("window_returns", channels.window_subject(start, end))["output"]["own_part"]
+    if any(x is None for x in residuals.values()):
+        return out
+    try:  # its fit on its history before the window; a read that waits waits, and fails the call where it fails
+        return {**out, "fit": ctx.value("fit_before", f"{security}@{start}", ref=True)}
+    except Unavailable as e:  # none exists: said once the move is measured, so a name with no history then is refused
+        return {**out, "unfitted": str(e)}  # for its missing close, in the words every window uses
 
 
 def _name_window_compute(m: dict, load) -> dict:
     """A name's move over a past window, what holding it earned less the income it accrued, as a factor's is (MATH.md
-    3.2); its response over the window at its betas as fitted up to the window's start, exp(b . z) on the factors'
-    residuals over it (1.6); and its residual, (1 + move) / (1 + response) - 1 (1.3, 1.4). Each is a fraction of the
-    price a shock on the name is stated on: a listing abroad's in its own currency, at its local betas, with its rate in
-    dollars' move beside them. A factor's proxy gives its move, its residual being its factor's; a fund valued by its
-    terms gives its move with what its terms are written on, its residual in a world being against what they give
-    there. A name with no close at an end of the window, or a factor with none, has no figures over it."""
+    3.2), between its last close on or before the start and its last on or before the end, the two sessions named
+    (`sessions`); its response over the window at its betas as fitted up to the window's start, exp(b . z) on the
+    factors' residuals over it (1.6); and its residual, (1 + move) / (1 + response) - 1 (1.3, 1.4). Each is a fraction
+    of the price a shock on the name is stated on: a listing abroad's in its own currency, between its own last
+    closes, each by the New York session it belongs to, at its local betas, with its rate in dollars' move between
+    the same two closes beside them. A factor's proxy gives its move, its residual being its factor's; a fund valued
+    by its terms gives its move with what its terms are written on, its residual in a world being against what they
+    give there. A name with no move over the window has no figures over it. Where a factor's proxy has none, the
+    factors' residuals over it are not known, so the name's move stands without its response and residual. Where its
+    move is measured and no fit before the window exists, the name is refused with the fit's reason. `factors` is the
+    Computation of the factors over the window (window_returns), which the page opens beside the name's."""
     start, end = m["window"]
     factors = load(m["factors"])
-    out: dict = {"name": m["name"], "window": [start, end]}
+    out: dict = {"name": m["name"], "window": [start, end], "factors": m["factors"]["basis"]}  # the factors over it
     if "proxy_of" in m:
         move = factors["moves"].get(m["proxy_of"])
         if move is None:
-            raise Unavailable(f"{m['security']} has no close at both ends of the window, {start} to {end}")
-        return {**out, "move": move, "proxy_of": m["proxy_of"]}
+            raise Unavailable((factors.get("why") or {}).get(m["security"]) or
+                              f"{m['security']} has no move over the window, {start} to {end}")
+        return {**out, "sessions": factors["sessions"][m["proxy_of"]], "move": move, "proxy_of": m["proxy_of"]}
     sessions = sorted(portfolio.closes(m["calendar"], load))
     item = m["series"]
     since, until = m["record"]
@@ -400,23 +415,23 @@ def _name_window_compute(m: dict, load) -> dict:
         moving, rates_ = history.local_moves(item, load, sessions, since=since, until=until)
     else:
         moving = history.moves(item, load, sessions, since=since, until=until)
-    move = moving(start, end)
+    between = moving.between(start, end)
+    move = moving(*between) if between else None
     if move is None:
-        held = [d for d in (start, end) if d not in moving.closes]
-        raise Unavailable(f"{m['security']} has no close on {' or '.join(held)}" if held else
-                          f"{m['security']} has no return on a session between {start} and {end}")
-    out["move"] = move
+        raise Unavailable(channels.unmeasured(m["security"], moving, start, end))
+    out.update({"sessions": list(between), "move": move})
     if abroad:
-        missing = [d for d in (start, end) if not rates_.get(d)]
+        missing = [d for d in between if not rates_.get(d)]
         if missing:
             raise Unavailable(f"{m['security']}'s rate in dollars has no price at its close on {' or '.join(missing)}")
-        out.update({"currency": item["currency"], "rate_move": rates_[end] / rates_[start] - 1.0})
+        out.update({"currency": item["currency"], "rate_move": rates_[between[1]] / rates_[between[0]] - 1.0})
     if "terms" in m:
         return {**out, "terms": m["terms"]}
-    unmoved = [factors["proxies"][c] for c, x in factors["moves"].items() if x is None]
-    if unmoved:
-        raise Unavailable(f"{', '.join(unmoved)} {'has' if len(unmoved) == 1 else 'have'} no close at both ends of the "
-                          f"window, so the factors' moves over it, and {m['security']}'s response, are not known")
+    if "unfitted" in m:  # its move is measured, and no fit before the window exists to give its response
+        raise Unavailable(f"{m['security']} has no betas fitted on its history up to {start}, the window's start, to "
+                          f"measure its response by: {m['unfitted']}")
+    if "fit" not in m:  # a factor's proxy has no move over the window
+        return out
     fit = load(m["fit"])
     betas = fit["local_betas"] if abroad else fit["betas"]
     z = {c: math.log1p(a) for c, a in factors["own_part"].items()}
@@ -424,7 +439,7 @@ def _name_window_compute(m: dict, load) -> dict:
     return {**out, "response": response, "residual": (1.0 + move) / (1.0 + response) - 1.0, "betas": betas}
 
 
-NAME_WINDOW = Derivation("name_window", 1, "Name", _name_window_inputs, _name_window_compute,
+NAME_WINDOW = Derivation("name_window", 6, "Name", _name_window_inputs, _name_window_compute,
                          applies=lambda store, subject: False)
 DERIVATIONS = (FIT_BEFORE, NAME_WINDOW)
 
@@ -484,20 +499,36 @@ def worth_values(m: dict, load, ratios, factors: dict[str, dict[str, float]]) ->
     return out, terms
 
 
-def implied_from_values(values: dict[str, float], current: float, ws: list[dict], q: dict) -> float | None:
-    """The weight a holding's price implies on the event (MATH.md 1.6): (c - N) / (Y - N), with Y and N its stated
-    values' means over the Yes and the No side, each world at its share of the weight today's prices carry on its
-    side, or of its probability where they carry none there. None where the two sides' values are the same."""
-    def mean(side):
+def value_sides(values: dict[str, float], ws: list[dict], q: dict) -> dict[str, dict]:
+    """A holding's stated values on each side (MATH.md 1.6): their mean, each world at its share, and what the shares are
+    by: the weight today's prices carry on the side (`weight`), or, where they carry none there, the probabilities
+    (`probability`), or, where the side has neither and one world, that world (`one world`). A side of several worlds
+    with neither has no mean."""
+    out = {}
+    for side in ("yes", "no"):
         selected = [w["id"] for w in ws if w["side"] == side]
         weight = sum(q[w] for w in selected)
+        p = sum(w["p"] for w in ws if w["side"] == side) if weight <= 0 else 0.0
         if weight > 0:
-            return sum(q[w] * values[w] for w in selected) / weight
-        p = sum(w["p"] for w in ws if w["side"] == side)
-        if p > 0:
-            return sum(w["p"] * values[w["id"]] for w in ws if w["side"] == side) / p
-        return values[selected[0]] if len(selected) == 1 else None
-    y, n = mean("yes"), mean("no")
+            got = {"mean": sum(q[w] * values[w] for w in selected) / weight,
+                   "shares": {w: q[w] / weight for w in selected}, "by": "weight"}
+        elif p > 0:
+            got = {"mean": sum(w["p"] * values[w["id"]] for w in ws if w["side"] == side) / p,
+                   "shares": {w["id"]: w["p"] / p for w in ws if w["side"] == side}, "by": "probability"}
+        elif len(selected) == 1:
+            got = {"mean": values[selected[0]], "shares": {selected[0]: 1.0}, "by": "one world"}
+        else:
+            got = {"mean": None}
+        out[side] = got
+    return out
+
+
+def implied_from_values(values: dict[str, float], current: float, ws: list[dict], q: dict,
+                        sides: dict | None = None) -> float | None:
+    """The weight a holding's price implies on the event (MATH.md 1.6): (c - N) / (Y - N), with Y and N its stated
+    values' means over the Yes and the No side (value_sides). None where the two sides' values are the same."""
+    sides = sides or value_sides(values, ws, q)
+    y, n = sides["yes"]["mean"], sides["no"]["mean"]
     if y is None or n is None or abs(y - n) <= 1e-12:
         return None
     return (current - n) / (y - n)
@@ -580,8 +611,8 @@ def zero_drift(ratios: np.ndarray) -> np.ndarray:
 
 
 def value_state(m: dict, load, centre: dict, world: str, factors: dict, names: dict,
-                variances: dict, at: str, *, expiry_states: dict | None = None,
-                contract_payoffs: dict | None = None, receipt: dict | None = None) -> dict:
+                variances: dict, at: str, *, contract_payoffs: dict | None = None,
+                receipt: dict | None = None) -> dict:
     """Each holding's value at each draw of one world's state, in today's dollars (MATH.md 1.6, "One valuation, read
     twice"; 1.8): the factors and names as drawn, ratios to today, valued by the terms the row's centre read them by.
 
@@ -613,108 +644,99 @@ def value_state(m: dict, load, centre: dict, world: str, factors: dict, names: d
     channels_ = m["channels"]
     factor_cov = np.asarray(variances.get("__factor_covariance__", np.diag([variances.get(c, 0) for c in channels_])))
 
-    def ordinary(n, state=None):
-        ns = names if state is None else state["names"]
-        if n in ns:
-            return np.asarray(ns[n], dtype=float)
+    def ordinary(n):
+        if n in names:
+            return np.asarray(names[n], dtype=float)
         return ones * (actual.get(n) or centre.get("reference_ratios", {}).get(n) or {}).get(world, 1.0)
 
-    def responding(n, state=None):
-        ns = names if state is None else state["names"]
-        if "response:" + n in ns:
-            return np.asarray(ns["response:" + n], dtype=float)
+    def responding(n):
+        if "response:" + n in names:
+            return np.asarray(names["response:" + n], dtype=float)
         base = (actual.get(n) or {}).get(world, 1.0)
         before = response.get(n, {}).get(world, base)
         if base:
-            return ordinary(n, state) * before / base
+            return ordinary(n) * before / base
         if not before:
             return np.zeros(count)
         raise Unavailable(f"{n}'s zero-price world needs its same unconstrained company state through the fund")
 
-    def name_price(n, state=None):
-        cache_key = (n, id(state))
-        if cache_key in cache:
-            return cache[cache_key]
-        if cache_key in evaluating:
+    def name_price(n):
+        if n in cache:
+            return cache[n]
+        if n in evaluating:
             raise Unavailable("the share considerations have a circular valuation")
-        evaluating.add(cache_key)
-        ns = names if state is None else state["names"]
-        fs = factors if state is None else state["factors"]
+        evaluating.add(n)
         if n in worth:
             claim = worth[n][world]
             amount = ones * claim["fixed"]
             cash = claim.get("cash") or {}
             if cash.get("fx"):
                 fx = cash["fx"]
-                amount = amount + cash["pv"] * fx["c"] * name_price(fx["name"], state)
+                amount = amount + cash["pv"] * fx["c"] * name_price(fx["name"])
             if claim.get("shares"):
                 share = claim["shares"]
-                amount = amount + share["quantity"] * share["price"] * name_price(share["name"], state)
+                amount = amount + share["quantity"] * share["price"] * name_price(share["name"])
             if claim.get("anchor"):
                 anchor = claim["anchor"]
                 placed = centre["placed"][world]
                 key = anchor["state_key"]
-                if key in ns:
-                    amount = amount + anchor["amount"] * np.asarray(ns[key])
+                if key in names:
+                    amount = amount + anchor["amount"] * np.asarray(names[key])
                 else:
                     active = [c for c in channels_ if placed[c] > -1]
                     positions = [channels_.index(c) for c in active]
                     b = np.array([anchor["raw_betas"].get(c, 0) for c in active])
-                    full_cov = factor_cov if state is None else np.asarray((state.get("variances") or {}).get("__factor_covariance__", factor_cov))
-                    cov = full_cov[np.ix_(positions, positions)]
-                    log_extra = np.column_stack([np.log(np.maximum(fs[c], 1e-300) / (1 + placed[c]))
+                    cov = factor_cov[np.ix_(positions, positions)]
+                    log_extra = np.column_stack([np.log(np.maximum(factors[c], 1e-300) / (1 + placed[c]))
                                                   for c in active]) if active else np.zeros((count, 0))
                     correction = .5 * (float(b @ np.diag(cov)) - float(b @ cov @ b))
                     base = anchor["amount"] * raw_response(anchor["raw_betas"], placed)
                     amount = amount + base * zero_drift(np.exp(log_extra @ b + correction))
             result = amount / claim["c"]
         elif n in declared and n not in stated_by:
-            result = ordinary(n, state)
+            result = ordinary(n)
         elif n in option_books:
-            result = option_fund(n, state)
+            result = option_fund(n)
         elif n in multiples:
             spec = multiples[n]
             ref = spec["reference"]
             base = (actual.get(ref) or centre.get("reference_ratios", {}).get(ref) or {}).get(world, 1)
-            extra = name_price(ref, state) / base if base > 0 else ones
+            extra = name_price(ref) / base if base > 0 else ones
             multiplier = spec["multiple"]
             jump = ((unstated if n in stated_by else actual).get(n) or {}).get(
                 world, max(1 + multiplier * (base - 1), 0.0))
-            variance = variances if state is None else state.get("variances") or {}
-            reference_variance = variance.get(ref, 0) if np.ptp(extra) else 0.0
+            reference_variance = variances.get(ref, 0) if np.ptp(extra) else 0.0
             growth = zero_drift(np.power(np.maximum(extra, 1e-300), multiplier) * math.exp(
                 -.5 * multiplier * (multiplier - 1) * reference_variance))
             extras = multiple_extras(components, n, ref, multiplier)
             before = sum(weight * (actual.get(child, {}).get(world, 1) - response.get(child, {}).get(world, 1))
                          for child, weight in extras.items())
-            outside = sum((weight * (name_price(child, state) - responding(child, state))
+            outside = sum((weight * (name_price(child) - responding(child))
                            for child, weight in extras.items()), np.zeros(count))
             result = np.maximum((jump - before) * growth + outside, 0.0) if jump > 0 else np.zeros(count)
         elif n in components:
-            result = responding(n, state).copy()
+            result = responding(n).copy()
             for child, weight in components[n].items():
-                result += weight * (name_price(child, state) - responding(child, state))
+                result += weight * (name_price(child) - responding(child))
             result = np.maximum(result, 0.0)
         else:
-            result = ordinary(n, state)
+            result = ordinary(n)
         if n in stated_by:
             result = result * stated_by[n]
-        evaluating.remove(cache_key)
-        cache[cache_key] = result
+        evaluating.remove(n)
+        cache[n] = result
         return result
 
-    def reference(ref, state=None):
-        fs = factors if state is None else state["factors"]
+    def reference(ref):
         n = ref.get("name") or (f"name:{ref['basket']}" if ref.get("basket") else None)
         if n is not None:
-            return name_price(n, state)
+            return name_price(n)
         for c, ticker in (m.get("proxies") or {}).items():
-            if ticker == ref["ticker"] and c in fs:
-                return np.asarray(fs[c])
+            if ticker == ref["ticker"] and c in factors:
+                return np.asarray(factors[c])
         raise Unavailable(f"{ref['ticker']}'s price in the same state is needed to value its contract")
 
     option_values, groups, group_of, pricing = {}, {}, {}, set()
-    dated_states = {day: {**state, "at": day} for day, state in (expiry_states or {}).items()}
     for fund, book in option_books.items():
         for index, contract in enumerate(book["contracts"]):
             ref = contract["reference"]
@@ -723,21 +745,18 @@ def value_state(m: dict, load, centre: dict, world: str, factors: dict, names: d
             groups.setdefault(key, []).append((fund, index, book, contract))
             group_of[fund, index] = key
 
-    def price_option_group(key, requested_state=None):
-        requested = (key, id(requested_state))
-        if requested in pricing:
+    def price_option_group(key):
+        # each contract a book holds outlives the date drawn on (option_funds.inputs cuts the books at it), so it is
+        # valued as it stands on that date, at its underlying's level in the state drawn (1.6)
+        if key in pricing:
             raise Unavailable("the option books contain a circular underlying valuation")
-        pricing.add(requested)
+        pricing.add(key)
         entries = groups[key]
         _, _, book, contract = entries[0]
         expiry = contract["expiry"]
-        at_date = at[:10] if requested_state is None else requested_state["at"]
-        end = min(at_date, expiry)
+        end = min(at[:10], expiry)
         elapsed = years(book["asof"], end)
-        state = dated_states.get(expiry) if expiry < at_date else requested_state
-        if expiry < at_date and state is None:
-            raise Unavailable(f"the option expiring {expiry} needs the state at its expiry")
-        ratio = reference(contract["reference"], state)
+        ratio = reference(contract["reference"])
         spot = contract["underlying_today"] * ratio * math.exp((contract["rate"] - contract["yield"]) * elapsed)
         at_close = datetime.combine(date.fromisoformat(end), time(16), series.NY).isoformat()
         remaining = max(contract.get("years", options.life(expiry, at_close) + elapsed) - elapsed, 0.0) if end < expiry else 0.0
@@ -750,25 +769,24 @@ def value_state(m: dict, load, centre: dict, world: str, factors: dict, names: d
                                   for c in contracts])
         discount = math.exp(-contract["rate"] * elapsed)
         for j, (fund, index, _, _) in enumerate(entries):
-            option_values[fund, index, id(requested_state)] = values[:, j] * discount
-        pricing.remove(requested)
+            option_values[fund, index] = values[:, j] * discount
+        pricing.remove(key)
 
-    def option_fund(n, state=None):
+    def option_fund(n):
         book = option_books[n]
         for index in range(len(book["contracts"])):
-            if (n, index, id(state)) not in option_values:
-                price_option_group(group_of[n, index], state)
-        sleeve = sum((contract["units_per_nav"] * option_values[n, index, id(state)]
+            if (n, index) not in option_values:
+                price_option_group(group_of[n, index])
+        sleeve = sum((contract["units_per_nav"] * option_values[n, index]
                       for index, contract in enumerate(book["contracts"])), np.zeros(count))
         if book["full"]:
             result = ones * (1 - book["sleeve_today"]) + sleeve
             for share in book["shares"]:
-                result += share["weight"] * (reference(share["reference"], state) - 1)
+                result += share["weight"] * (reference(share["reference"]) - 1)
         else:
             rem = "remainder:" + n
             baseline = (centre.get("remainder_ratios") or {}).get(rem, {}).get(world, 1)
-            ns = names if state is None else state["names"]
-            result = sleeve + (1 - book["sleeve_today"]) * np.asarray(ns.get(rem, ones * baseline))
+            result = sleeve + (1 - book["sleeve_today"]) * np.asarray(names.get(rem, ones * baseline))
         return np.maximum(result, 0)
 
     contracts = {c["holding"]: c for c in m.get("contracts", [])}

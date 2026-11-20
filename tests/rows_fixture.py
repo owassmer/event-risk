@@ -82,8 +82,13 @@ def _compute(m, load):
         return {"ticker": ticker, "kind": kind} if kind in ("name", "fund") else {"ticker": None}
 
     constituents = load(m["fund_rows"])["rows"]
-    return {**portfolio.booked({"asof": m["asof"], "holdings": {"output": load(m["holdings"])}}, references,
-                               constituents, resolved, Lookup(lambda kind, subject: None, m["asof"]), Kinds()),
+    holdings = load(m["holdings"])
+    # what the line names, as the reading of the rows works it out (portfolio._rows_reads)
+    named = portfolio.floor_named(references, constituents, resolved, portfolio.floor_base(holdings),
+                                  holdings)
+    return {**portfolio.booked({"asof": m["asof"], "holdings": {"output": holdings}, "named": sorted(named)},
+                               references, constituents, resolved, Lookup(lambda kind, subject: None, m["asof"]),
+                               Kinds()),
             "multiples": portfolio.multiples(constituents, resolved)}
 
 

@@ -28,7 +28,7 @@ A company listed only abroad has two kinds, `earnings` and `ratings`, read from 
 
 ## The venues' markets
 
-`search_markets(text, proposition_id)` searches the venues for markets that bear on a proposition, passing your words to each venue's own search. Each venue ranks what it lists, and the search returns each venue's ten most relevant families that have a market open at the as-of, the venues taking turns. A family of up to twelve open markets lists them, each with its id, question, close date, bid, ask, price and depth. A larger family comes as how many it holds, each market's question in its venue's words, and the span of their closes; a ladder of strikes comes as its first and last question and its strikes. `get` reads the family whole, with each book.
+`search_markets(text, proposition_id)` searches the venues for markets that bear on a proposition, passing your words to each venue's own search. Each venue ranks what it lists, and the search returns each venue's ten most relevant families that have a market open at the as-of, the venues taking turns. A family of up to twelve open markets lists them, each with its id, question, bid, ask, price and depth, and its close date where it differs from the family's. A larger family comes as how many it holds, each market's question in its venue's words, and the span of their closes; a ladder of strikes comes as its first and last question and its strikes. `get` reads the family whole, with each book.
 
 - A venue's search matches a market's own words. Search in the words a market's question would use, with the date where the event has one.
 - A search has one page. A narrower text reaches what a broader one did not return.

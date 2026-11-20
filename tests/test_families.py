@@ -32,7 +32,7 @@ def test_a_family_that_holds_families_is_read_whole_at_its_level(world):
     found = world.read_family("family:kalshi:series:KXFED")  # series, event, market: three levels from the top
     assert (found["title"], found["open_families"]) == ("Fed funds rate", 2)
     assert [f["family"] for f in found["families"]] == ["family:kalshi:KXFED-26DEC", "family:kalshi:KXFED-27JAN"]
-    rows = [flat({"columns": found["columns"], "markets": f["markets"]})[0] for f in found["families"]]
+    rows = [flat({**f, "columns": found["columns"]})[0] for f in found["families"]]
     assert [r["id"] for r in rows] == ["market:kalshi:KXFED-26DEC-T4.50", "market:kalshi:KXFED-27JAN-T4.50"]
     assert [r["closes"] for r in rows] == ["2026-12-09", "2027-01-27"] and rows[0]["price"] == pytest.approx(0.335)
     assert world.store.db.execute("SELECT count(*) FROM data WHERE kind IN ('market', 'book')").fetchone()[0] == 0

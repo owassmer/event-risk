@@ -96,10 +96,11 @@ def test_a_fund_the_look_through_expands_is_measured_against_its_fit_a_fund_on_o
     fnd, lev, spy = out["names"]
     assert {"response", FOLLOWED, "betas"} <= set(fnd)
     c = closes(funds, "LEV")
-    assert lev == {"name": "name:LEV", MOVE: pytest.approx(c[END] / c[START] - 1, rel=1e-12),
+    assert lev == {"name": "name:LEV", "sessions": [START, END], MOVE: pytest.approx(c[END] / c[START] - 1, rel=1e-12),
                    "terms": {"reference": "name:IDX", "multiple": 3.0}, "basis": lev["basis"]}
     market = out["factors"][0]
-    assert spy == {"name": "name:SPY", MOVE: market[MOVE], "proxy_of": market["factor"], "basis": spy["basis"]}
+    assert spy == {"name": "name:SPY", "sessions": [START, END], MOVE: market[MOVE], "proxy_of": market["factor"],
+                   "basis": spy["basis"]}
 
 
 def test_a_window_over_many_names_stands_aside_once_for_all_their_reads(tmp_path):
@@ -178,7 +179,105 @@ def test_a_name_with_no_history_at_the_window_fails_the_call_with_why(funds):
     # a window the factors' proxies have no close over fails with that reason, whichever names are given with it
     ok, got = Tools(World(funds, None)).call("window_returns", {"start": "2019-01-02", "end": "2019-02-01",
                                                                 "names": ["name:ZZZ", "name:A"]})
-    assert not ok and got["error"].startswith("no factor's proxy has a close at both ends of the window")
+    assert not ok and got["error"].startswith("no factor's proxy has a move over the window: SPY has no close from")
+
+
+def test_a_listing_abroad_whose_market_was_closed_on_the_windows_end_runs_between_its_own_last_closes(tmp_path):
+    """One rule for a window's ends (MATH.md 3.2): the last close on or before each date. A listing abroad's closes are
+    each by the New York session it belongs to, so where its market was closed on a day New York traded, its window
+    runs to its own close before, named, its rate's move between the same two closes."""
+    store, _ = abroad_store(tmp_path, np.random.default_rng(7), channel=("C:KRWUSD", "KRW", "USD"))
+    try:
+        with_history(store)
+        payload = kept(store, "home", ABROAD)
+        payload["results"] = [r for r in payload["results"] if r["session"] != END]  # its market closed on END
+        store.put_data("home", ABROAD, payload, {"url": "test:closed"}, retrieved_at="2026-11-05T03:00:00+00:00",
+                       range=("2013-01-01", ASOF))
+        (got,) = window(store, [f"name:{ABROAD}"])["names"]
+        local = {r["session"]: r["c"] for r in payload["results"]}
+        before = max(d for d in local if d < END)
+        rate = {datetime.fromtimestamp(r["t"] / 1000, NY).date().isoformat(): r["c"]
+                for r in kept(store, "hourly", "C:KRWUSD")["results"]}
+        assert got["sessions"] == [START, before]
+        assert got[MOVE] == pytest.approx(local[before] / local[START] - 1, rel=1e-12)
+        assert got["rate_move"] == pytest.approx(rate[before] / rate[START] - 1, rel=1e-12)
+    finally:
+        store.close()
+
+
+def test_a_factor_whose_proxy_is_younger_than_the_window_leaves_unmeasured_each_residual_that_reads_it(funds):
+    """MATH.md 3.2: a factor's residual over a window is its move less what the earlier factors' residuals give it. A proxy
+    with no close at the window's start has no move over it, so neither its residual nor that of a later factor that
+    reads it is measured: each is None, where both read as if the young factor had not moved. A name's own move over
+    the window stands, without the response and the residual the factors' residuals would give it, where the call
+    failed for every name."""
+    rng = np.random.default_rng(11)
+    put_bars(funds, "YNG", closes_from(dict(zip(DAYS[-30:], rng.normal(0, 0.01, 30)))))  # its history begins after START
+    put_bars(funds, "LTR", closes_from(dict(zip(DAYS, rng.normal(0, 0.01, len(DAYS))))))
+    funds.add("Factor", {"name": "the young factor", "proxy": "YNG", "order": 2})
+    funds.add("Factor", {"name": "the later factor", "proxy": "LTR", "order": 3})
+    with_history(funds)
+    later_id = next(c["id"] for c in funds.query("Factor") if c["stated"]["proxy"] == "LTR")
+    assert all(funds.engine.value("orthogonalize", later_id).output["coefficients"].values())  # it reads both
+    out = window(funds, ["name:A"])
+    market, young, later = out["factors"]
+    assert market[FOLLOWED] == pytest.approx(market[MOVE], rel=1e-12)
+    assert young[MOVE] is None and young[FOLLOWED] is None
+    c = closes(funds, "LTR")
+    assert later[MOVE] == pytest.approx(c[END] / c[START] - 1, rel=1e-12) and later[FOLLOWED] is None
+    (a,) = out["names"]
+    ca = closes(funds, "A")
+    assert a == {"name": "name:A", "sessions": [START, END], MOVE: pytest.approx(ca[END] / ca[START] - 1, rel=1e-12),
+                 "basis": a["basis"]}
+
+
+def test_a_name_listed_on_the_windows_start_is_measured_against_its_prior_and_one_with_no_fit_then_fails(funds):
+    """A fit leans on its prior as far as its history leaves it unsettled. A company whose first close is the
+    window's start has its move over the window, and its betas then are a share's prior, a beta of 1 to the market:
+    its response is the market's move and its residual what that leaves. Where the factors themselves cannot be
+    estimated on the history to the window's start, no name has a fit then, and a name named is refused with why,
+    where the call gave its move alone and said nothing of its response."""
+    put_reference(funds, "FRESH", "CS")
+    rng = np.random.default_rng(5)
+    listed = DAYS[DAYS.index(START) + 1:]  # its returns begin the session after its first close, the window's start
+    put_bars(funds, "FRESH", closes_from(dict(zip(listed, rng.normal(0, 0.01, len(listed))))))
+    with_history(funds)
+    out = window(funds, ["name:FRESH"])
+    (fresh,) = out["names"]
+    c = closes(funds, "FRESH")
+    market = out["factors"][0]
+    assert fresh["sessions"] == [START, END] and fresh[MOVE] == pytest.approx(c[END] / c[START] - 1, rel=1e-12)
+    assert fresh["betas"] == pytest.approx({market["factor"]: 1.0})
+    assert fresh["response"] == pytest.approx(market[FOLLOWED], rel=1e-12)
+    assert (1 + fresh[MOVE]) == pytest.approx((1 + fresh["response"]) * (1 + fresh[FOLLOWED]), rel=1e-12)
+    young = DAYS[DAYS.index(START) - 1:]  # its first close is two sessions before the start: two returns by then
+    put_bars(funds, "YNG", closes_from(dict(zip(young, rng.normal(0, 0.01, len(young))))))
+    funds.add("Factor", {"name": "the young factor", "proxy": "YNG", "order": 2})
+    with_history(funds)
+    ok, got = Tools(World(funds, None)).call("window_returns", {"start": START, "end": END, "names": ["name:A"]})
+    assert not ok and got["error"].startswith(
+        f"A has no betas fitted on its history up to {START}, the window's start, to measure its response by: the "
+        f"factors' proxies share 2 sessions in common in the two years to {START}, from {young[0]}, too few to measure "
+        f"how 2 factors move together")
+    assert window(funds, [])["factors"][1][MOVE] is not None  # every proxy moves over the window itself
+
+
+def test_the_sessions_the_factors_proxies_share_are_named_in_the_two_years_to_the_date_one_session_whole():
+    """MATH.md 3.2: the common history is the two years to the date the factors are read for. A refusal names how many
+    sessions the proxies share in it and the first, the one where it is one, and none where there are none."""
+    from harness.derive.channels import _shared
+    assert _shared(300, ["2025-01-02", "2025-01-03"], "2026-11-04T15:30:00-05:00") == \
+        "300 sessions in common in the two years to 2026-11-04, from 2025-01-02"
+    assert _shared(1, ["2026-09-08"], "2026-09-10") == "1 session in common in the two years to 2026-09-10, 2026-09-08"
+    assert _shared(0, [], "2026-09-10") == "no session in common in the two years to 2026-09-10"
+
+
+def test_a_window_that_ends_after_the_as_of_says_a_past_window_ends_by_it(funds):
+    """A past window ends at a close on or before the as-of (ONTOLOGY.md 2.1, MATH.md 3.2): one ending later is refused with that
+    rule, for the factors and for a name, in place of a missing close."""
+    for names in ([], ["name:A"]):
+        ok, got = Tools(World(funds, None)).call("window_returns", {"start": START, "end": "2027-01-04", "names": names})
+        assert not ok and got["error"] == f"a past window ends on or before the as-of, {ASOF}, and this one ends 2027-01-04"
 
 
 def test_a_listing_abroad_is_measured_in_its_own_currency_at_its_local_betas_with_its_rates_move_beside(tmp_path):
@@ -208,3 +307,13 @@ def test_a_listing_abroad_is_measured_in_its_own_currency_at_its_local_betas_wit
         assert (1 + got[MOVE]) == pytest.approx((1 + got["response"]) * (1 + got[FOLLOWED]), rel=1e-12)
     finally:
         store.close()
+
+
+def test_a_names_window_names_the_factors_over_it_and_the_tool_does_not_return_it(funds):
+    """A name's window gives the Computation of the factors over the same window (`factors`, window_returns'), which
+    the page opens beside the name's; window_returns, which the analyst reads, gives its figures and not that."""
+    from harness.derive.channels import window_subject
+    from harness.derive.valuation import name_window_subject
+    got = funds.engine.value("name_window", name_window_subject(START, END, "name:A"))
+    assert got.output["factors"] == funds.engine.value("window_returns", window_subject(START, END)).basis
+    assert "factors" not in window(funds, ["name:A"])["names"][0]

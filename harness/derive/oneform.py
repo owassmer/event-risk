@@ -630,16 +630,20 @@ def _exact(rows: Rows, z: np.ndarray, L: np.ndarray, t: np.ndarray, w: np.ndarra
 
 
 def targets(model: Model) -> dict[str, dict]:
-    """Each proposition's price to stay near: its deepest taken book's that has a price and a spread, the first linked
-    among books of equal depth. A book whose bid and ask meet holds its proposition by its bounds."""
+    """Each proposition's price to stay near: its deepest taken book's that has a price, the first linked among books
+    of equal depth, and of those, one whose quotes were observed before one whose were not. A price observed without its
+    quotes (3.3: a venue's history that keeps only the book's midpoint) is a book whose spread is the whole of 0 to 1:
+    half a spread of 0.5, a depth of 0, so it bounds nothing and gives way to every observed book. A book whose bid and
+    ask meet holds its proposition by its bounds."""
     out: dict[str, dict] = {}
     for b in model.books:
-        if b.get("price") is None or b.get("bid") is None or b.get("ask") is None:
+        if b.get("price") is None:
             continue
+        rank = (_depth(b), b.get("bid") is not None and b.get("ask") is not None)
         have = out.get(b["on"])
-        if have is None or _depth(b) > have["depth"]:
-            out[b["on"]] = {"link": b["link"], "price": b["price"], "half": _half(b), "depth": _depth(b)}
-    return {p: t for p, t in out.items() if t["half"] > TOL}
+        if have is None or rank > have["rank"]:
+            out[b["on"]] = {"link": b["link"], "price": b["price"], "half": _half(b), "depth": _depth(b), "rank": rank}
+    return {p: {k: v for k, v in t.items() if k != "rank"} for p, t in out.items() if t["half"] > TOL}
 
 
 def reading(model: Model, rows: Rows) -> dict[str, float] | None:
@@ -855,6 +859,56 @@ def _read(model: Model) -> dict:
 
 def _union(a, b) -> list[str]:
     return list(dict.fromkeys([*a, *b]))
+
+
+# ---------------------------------------------------------------- the range a chance can take
+
+
+def chance_ranges(m: dict, keys=None) -> dict[str, dict]:
+    """For each chance (those `keys` names, where given), the least and the most its figure can be with every link and
+    every other chance kept and each taken book within its bid and ask (MATH.md 1.2): {key: {"lo", "hi"}}. Within it the
+    chance holds with no book stretched and no statement waiting; outside it, a book is stretched or the statements
+    cannot hold. Where the other statements stretch a book themselves, it is read within the stretch they need. A chance
+    whose other statements cannot hold among themselves, or leave what it is given no probability, has {"why"}."""
+    model = compile(m)
+    base = statements(model)
+    out: dict[str, dict] = {}
+    for c in model.chances:
+        if keys is not None and c["key"] not in keys:
+            continue
+        rest = Rows(model.n)
+        for r, lo, hi, t in zip(base.rows, base.lo, base.hi, base.tags):
+            if t != (c["key"],):
+                rest.add(r, lo, hi, t)
+        if not feasible(rest):
+            out[c["key"]] = {"why": "others"}
+            continue
+        got = _share(model, with_books(model, rest, stretches(model, rest)), c)
+        out[c["key"]] = got if got is not None else {"why": "given"}
+    return out
+
+
+def _share(model: Model, rows: Rows, c: dict) -> dict | None:
+    """The least and the most of P(of and cond) / P(cond) over the sets the rows hold, by Charnes and Cooper's
+    transformation: with y = x / P(cond) and t = 1 / P(cond), the share is the linear P(of and cond) . y over
+    y >= 0, t >= 0, each row's bounds scaled by t, and P(cond) . y = 1. None where no set gives cond a probability."""
+    k = _clique_of(model, (c["of"], *c["given"], *c["given_not"]))
+    cond = {**dict.fromkeys(c["given"], True), **dict.fromkeys(c["given_not"], False)}
+    scaled = Rows(model.n + 1)
+    for r, lo, hi in zip(rows.rows, rows.lo, rows.hi):
+        if lo == hi:
+            scaled.add(np.append(r, -lo), 0.0, 0.0)
+            continue
+        if lo > -INF:
+            scaled.add(np.append(r, -lo), 0.0, INF)
+        if hi < INF:
+            scaled.add(np.append(r, -hi), -INF, 0.0)
+    scaled.add(np.append(_indicator(model, k, cond), 0.0), 1.0, 1.0)
+    prog = Program(scaled, np.zeros(model.n + 1), np.full(model.n + 1, INF))
+    got = _extent(prog, np.append(_indicator(model, k, {**cond, c["of"]: True}), 0.0), why=False)
+    if got is None:
+        return None
+    return {"lo": _clip(got["lo"]), "hi": _clip(got["hi"])}
 
 
 def _stretched(model: Model, stretch: dict) -> list[dict]:

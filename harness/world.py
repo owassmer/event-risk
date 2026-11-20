@@ -27,6 +27,8 @@ from harness.venues.markets import FAMILIES, LARGE, NY
 from harness.web import Web, WebError, html_text
 
 EXCERPT = 1500  # the characters of a fetched page's body that fetch_source returns
+# A document in the SEC's archive: `https://www.sec.gov/Archives/edgar/data/{CIK}/{accession, its 18 digits}/{name}`.
+SEC_FILING = re.compile(r"^https?://www\.sec\.gov/Archives/edgar/data/(\d+)/(\d{18})/([^/?#]+)$")
 LISTED = 500  # the characters of each document a company search lists
 # A company's record, by kind: what it is, as a sentence names it, and the parameters that date it: its lower bound,
 # which the company's listing date sets, since a ticker can have been another company's, and its upper bound, which
@@ -59,6 +61,17 @@ ABROAD = ("earnings", "ratings")
 # the search names, and Benzinga's own reading of how much an event matters.
 DROPPED = ("benzinga_id", "company_name", "ticker", "last_updated", "importance", "images")
 NO_PRICE = {"bid": None, "ask": None, "price": None, "depth": None}
+
+
+def _by_query(queries: list[str], results: list[dict]) -> list[dict]:
+    """A web search's pages under the query each was found by, each query once and in the order it was searched, a
+    query that found none with none; and last, without a query, each page the search's answer cited and no query
+    listed."""
+    grouped: dict[str, list[dict]] = {q: [] for q in queries}
+    for r in results:
+        grouped.setdefault(r.get("query") or "", []).append({k: v for k, v in r.items() if k != "query"})
+    cited = grouped.pop("", [])
+    return [{"query": q, "results": rows} for q, rows in grouped.items()] + ([{"results": cited}] if cited else [])
 
 
 class World:
@@ -202,7 +215,8 @@ class World:
         return {"id": fid, "type": "Family", "kept": False, "venue": venue, "title": whole.get("title"),
                 "closes": whole.get("closes"), **({"within": within[above["id"]]} if above else {}),
                 "columns": list(COLUMNS),
-                "markets": rows_of(venue, list(opened.items()), quotes, many=len(markets) > 1),
+                "markets": rows_of(venue, list(opened.items()), quotes, many=len(markets) > 1,
+                                   closes=whole.get("closes")),
                 **({"closed": closed} if closed else {}), **({"kept": kept} if kept else {}),
                 **({"prices_as_of": asof} if past and opened else {})}
 
@@ -526,7 +540,7 @@ class World:
         a currency or crypto pair its source quotes (its hourly prices over the window, which a factor on it reads). A
         source that answers it lists no such thing gives False. A read that fails past its retries raises Waiting
         (harness.store), and an answer that says neither (a refusal for the key's plan) raises VenueError, so a call
-        that needs the answer fails with nothing written and can be made again."""
+        that needs the answer fails with nothing written, and made again asks the source again."""
         from harness.derive import series
 
         asof = asof or self._asof()
@@ -573,13 +587,17 @@ class World:
         rows: list[dict] = []
         if kind == "news":
             for r in results:
+                # what an article is to open and judge it by: when it was published, who wrote it, its headline and
+                # teaser, the companies it names, and its page, which holds it whole at its address; its address
+                # where it has no page. The publisher's channels and tags are filters of the search (params).
                 row = {"published": r.get("published"), "author": r.get("author"), "title": _plain(r.get("title")),
-                       "teaser": _plain(r.get("teaser")), "channels": r.get("channels") or [],
-                       "tags": r.get("tags") or [], "tickers": r.get("tickers") or [], "url": r.get("url")}
+                       "teaser": _plain(r.get("teaser")), "tickers": r.get("tickers") or []}
                 body = html_text(r["body"]).strip() if r.get("body") else ""
                 if body and r.get("url"):  # its headline and teaser say what it holds: its page, without an excerpt
                     row["page"] = {k: v for k, v in page(r["url"], f"# {row['title'] or ''}\n\n{body}").items()
                                    if k != "excerpt"}
+                else:
+                    row["url"] = r.get("url")
                 rows.append(row)
             return rows
         text_of = {"risk_factors": lambda r: (r.get("supporting_text") or "").strip(),
@@ -632,18 +650,39 @@ class World:
         with self.store.lock:
             search = self.store.record_search("search_web", params or {}, found["results"],
                                               proposition_id=proposition_id, query=text, call=call)
-        return {"search": search, "query": text, "params": params or {}, **found}
+        return {"search": search, "query": text, **({"params": params} if params else {}),
+                "results": _by_query(found["queries"], found["results"]),
+                **({"errors": found["errors"]} if found.get("errors") else {})}
 
     def fetch_source(self, url: str, text: str | None = None) -> dict:
         """The page's full text, held in the store: kept as a Source once it is cited for a stated
         fact or linked as evidence. A page the store holds is not fetched again. Given words to find in it, the passages
         that contain them come back with it, as get(id, text) finds them (store.find), each quoted from the page as a
-        basis quotes it: the words a search's quoted passage gave are found in the page in the one call that reads it."""
+        basis quotes it: the words a search's quoted passage gave are found in the page in the one call that reads it.
+        A document a company filed at the SEC, by its address in the SEC's archive, is read as the filing it belongs to
+        (harness.venues.sec `filing`): the document, and after it each exhibit 99 the filing furnishes, where an 8-K's
+        or a 6-K's press release is, under the address given."""
         if not isinstance(url, str) or not re.match(r"^https?://\S+$", url):
             raise StoreError(f"{url!r} is not an http or https URL: a page is fetched by one")
         with self.store.lock:
             held = self.store.held_page(url)
         title = None
+        filed = SEC_FILING.match(url)
+        if held is None and filed:
+            cik, accession, document = filed.groups()
+            subject = f"{cik.zfill(10)}/{accession[:10]}-{accession[10:12]}-{accession[12:]}/{document}"
+            with self.store.lock:
+                asof = self.store.meta("asof") or self.today()
+            try:  # the SEC is read outside the store's lock
+                found = self.store.fetch_data("sec_document", subject, covering=(asof, asof))
+            except Unavailable as e:
+                raise StoreError(str(e)) from None
+            with self.store.lock:
+                doc = self.store.data_payload(found["id"]) or {}
+                if (doc.get("text") or "").strip():
+                    held = self.store.put_page(url, doc["text"], retrieved_at=found["retrieved_at"])
+            if held is None:
+                raise StoreError(f"the SEC's archive holds no text at {url}")
         if held is None:
             try:  # the page is fetched outside the store's lock
                 page = self.web.fetch(url)
@@ -685,15 +724,17 @@ def interleave(found: dict[str, list]) -> list[tuple[str, Any]]:
 
 
 # A compact market row. Its depth is in dollars (MATH.md 3.3), and its header says so, as a table's header does: in a
-# row a bare number stands beside quotes between 0 and 1. The field is `depth` wherever else a market is read.
-COLUMNS = ("id", "question", "closes", "bid", "ask", "price", "depth ($)")
+# row a bare number stands beside quotes between 0 and 1. The field is `depth` wherever else a market is read. Its close
+# comes last, and only where it is not its family's, which the family gives once.
+COLUMNS = ("id", "question", "bid", "ask", "price", "depth ($)", "closes, where not the family's")
 
 
-def rows_of(venue: str, markets: list[tuple[str, dict]], quotes: dict[str, dict], *, many: bool) -> list[list]:
+def rows_of(venue: str, markets: list[tuple[str, dict]], quotes: dict[str, dict], *, many: bool,
+            closes: str | None = None) -> list[list]:
     """Markets as compact rows, in their venue's order: each its id; its question, or, in a family of several, its own
-    name among them, which the family's title completes; its close date; its book's best bid and ask, and its price,
-    their midpoint, none on a side with no quote (MATH.md 3.3; three places); and its depth (whole dollars). Every other
-    field, the rules and the book's levels among them, is one get away."""
+    name among them, which the family's title completes; its book's best bid and ask, and its price, their midpoint,
+    none on a side with no quote (MATH.md 3.3; three places); its depth (whole dollars); and its close date where it is
+    not its family's (`closes`). Every other field, the rules and the book's levels among them, is one get away."""
     forms, out = FORMS[venue], []
 
     def at(q: dict, key: str) -> float | None:
@@ -702,8 +743,9 @@ def rows_of(venue: str, markets: list[tuple[str, dict]], quotes: dict[str, dict]
     for mid, record in markets:
         listing, q = forms.listing(record), quotes.get(mid) or {}
         name = forms.label(record) if many else None
-        out.append([mid, name or listing["question"], listing["close_time"], at(q, "bid"), at(q, "ask"), at(q, "price"),
-                    round(q["depth"]) if q.get("depth") is not None else None])
+        out.append([mid, name or listing["question"], at(q, "bid"), at(q, "ask"), at(q, "price"),
+                    round(q["depth"]) if q.get("depth") is not None else None]
+                   + ([listing["close_time"]] if listing["close_time"] != closes else []))
     return out
 
 
@@ -714,7 +756,7 @@ def entry(venue: str, fid: str, title: str | None, closes: str | None, opened: l
     are open, what each asks (asked), and the span of their closes, read whole by its id."""
     out = {"family": fid, "venue": venue, "title": title, "closes": closes, **({"within": within} if within else {})}
     if len(opened) <= LARGE:
-        return {**out, "markets": rows_of(venue, opened, quotes, many=many)}
+        return {**out, "markets": rows_of(venue, opened, quotes, many=many, closes=closes)}
     questions, ladders = asked(venue, opened)
     closes_ = sorted(c for c in (FORMS[venue].listing(r)["close_time"] for _, r in opened) if c)
     return {**out, "open_markets": len(opened), **({"questions": questions} if questions else {}),
@@ -861,14 +903,11 @@ def _short_hash(text: str) -> str:
 def _price_fields(q: dict) -> dict:
     """A market's price as a read shows it: its price where both sides quote, its best bid and ask, its depth, and
     its last trade with its time, with the reason where there is no book; the moment its quotes stand at, when the
-    book it rests on was read; at a past as-of, the day of the venue's closing quotes where it rests on them, and,
-    where its venue's history holds a price alone, that price."""
+    book it rests on was read; and at a past as-of, where it rests on its venue's history, that price's New York day."""
     out = {"price": q.get("price"), "bid": q.get("bid"), "ask": q.get("ask"), "depth": q.get("depth"),
            "last_trade": q.get("last_trade"), **({"quoted_at": q["quoted_at"]} if q.get("quoted_at") else {})}
     if q.get("past"):
         out.update({k: q.get(k) for k in ("price_date",) if q.get(k)})
-        if q.get("history_price") is not None:
-            out["history_price"] = q["history_price"]
     if q.get("reason"):
         out["reason"] = q["reason"]
     return out

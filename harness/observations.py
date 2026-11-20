@@ -56,17 +56,17 @@ SHARED = ("ticker_ref", "ticker_on", "listings", "company_listings", "cusip_list
           "sec_tickers",
           "sec_funds", "bills",
           "money_market", "ncen", "tracker", "closed_at",
-          "nport_report", "ncen_report", "listing_sector", "listing_symbol", "profile", "company_record",
+          "nport_report", "ncen_report", "listing_symbol", "profile", "company_record",
           "sec_filings", "sec_document", "option", "pair", "yield_curve", "option_at", "option_contract",
-          "minutes", "option_listings")
+          "minutes", "option_listings", "lei", "ticker_isin")
 CHUNK = 500  # the subjects one lookup asks at once
 
-# The kinds whose answer is about no date: OpenFIGI maps an identifier as it stands, and Coinbase Exchange lists a pair
-# or does not, with no as-of to ask either for, so the answer is kept and served by subject, whatever range a store
+# The kinds whose answer is about no date: OpenFIGI maps an identifier as it stands, GLEIF the issuer of an ISIN, and
+# Coinbase Exchange lists a pair or does not, with no as-of to ask either for, so the answer is kept and served by subject, whatever range a store
 # asks it under.
 UNDATED = ("figi", "figi_cusip", "figi_ticker", "figi_class", "figi_listing", "figi_isin", "isin_listings",
-           "figi_index", "pair",
-           "listing_sector", "listing_symbol", "profile")  # the last three name their month in their subject
+           "figi_index", "pair", "lei",
+           "listing_symbol", "profile")  # the last two name their month in their subject
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS answers (

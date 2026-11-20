@@ -306,3 +306,90 @@ def test_at_a_sources_pace_a_read_for_later_takes_its_turn_after_the_reads_a_cal
     other.start()
     other.join(5)
     assert seen == [True]  # run on a thread of a client's own pool, the read still carries its mark
+
+
+# A stock's rows over a window its ticker changed in (`_joined`, `tenure`): Massive's events, references, bars and
+# splits, stubbed by ticker and day.
+
+def _ms(day: str) -> int:
+    import datetime as dt
+    return int(dt.datetime.fromisoformat(day + "T17:00:00+00:00").timestamp() * 1000)
+
+
+def listing(events: dict, identity: dict, bars: dict, splits: dict | None = None):
+    """Routes for Massive: `events` {ticker: [(date, ticker)]}, `identity` {(ticker, day): (cik, figi, list_date)},
+    `bars` {ticker: [(day, close)]}, `splits` {ticker: [(execution_date, from, to)]}."""
+    def routes(path, query):
+        if path.endswith("/events"):
+            t = path.split("/")[-2]
+            if t not in events:
+                return 404, {"status": "NOT_FOUND"}
+            return 200, {"status": "OK", "results": {"events": [
+                {"type": "ticker_change", "date": d, "ticker_change": {"ticker": n}} for d, n in events[t]]}}
+        if path.startswith("/v3/reference/tickers/"):
+            found = identity.get((path.rsplit("/", 1)[-1], query.get("date")))
+            if not found:
+                return 404, {"status": "NOT_FOUND"}
+            cik, figi, listed = found
+            return 200, {"status": "OK", "results": {"cik": cik, "composite_figi": figi, "list_date": listed}}
+        if path.startswith("/v2/aggs/ticker/"):
+            parts = path.split("/")
+            t, start, end = parts[4], parts[8], parts[9]
+            return 200, {"status": "OK", "results": [{"t": _ms(d), "c": c} for d, c in bars.get(t, []) if start <= d <= end]}
+        if path == "/stocks/v1/splits":
+            return 200, {"status": "OK", "results": [
+                {"ticker": query["ticker"], "execution_date": d, "split_from": f, "split_to": t}
+                for d, f, t in (splits or {}).get(query["ticker"], []) if d >= query.get("execution_date.gte", "")]}
+        return 404, {"status": "NOT_FOUND"}
+    return routes
+
+
+DAYS = ["2026-06-01", "2026-06-12", "2026-06-16", "2026-07-01", "2026-07-02", "2026-08-03", "2026-11-13"]
+
+
+def test_a_company_reorganized_under_a_holding_company_keeps_its_listings_history():
+    # A new CIK and new FIGIs from the day of the change, the listing date kept: the days before are the listing's.
+    massive, _ = client(listing(
+        events={"ABC": [("2026-07-02", "ABC")]},
+        identity={("ABC", "2026-07-01"): ("111", "FIGI-OLD", "1920-03-25"), ("ABC", "2026-11-13"): ("222", "FIGI-NEW", "1920-03-25")},
+        bars={"ABC": [(d, 100.0 + i) for i, d in enumerate(DAYS)]}))
+    got = massive.bars("ABC", "2026-06-01", "2026-11-13")["payload"]
+    assert [r["c"] for r in got["results"]] == [100.0 + i for i in range(len(DAYS))]
+
+
+def test_a_ticker_another_listing_held_keeps_that_listings_rows_out():
+    # Another company's own CIK, FIGI and listing date: its rows under the ticker are no part of the listing's history.
+    massive, _ = client(listing(
+        events={"ABC": [("2026-07-02", "ABC")]},
+        identity={("ABC", "2026-07-01"): ("999", "FIGI-FUND", "2001-07-27"), ("ABC", "2026-11-13"): ("222", "FIGI-NEW", "1969-12-04")},
+        bars={"ABC": [(d, 100.0 + i) for i, d in enumerate(DAYS)]}))
+    got = massive.bars("ABC", "2026-06-01", "2026-11-13")["payload"]
+    assert got["tenure"] == [{"ticker": "ABC", "from": "2026-07-02", "to": "2026-11-13"}]
+    assert [r["c"] for r in got["results"]] == [104.0, 105.0, 106.0]
+
+
+def test_a_temporary_ticker_that_listed_nothing_before_leaves_the_current_tickers_own_earlier_rows_standing():
+    # HWI from 2026-06-15 to 06-28, HW before and after, one company throughout; HWI names nothing before its event,
+    # and every row is under HW, already on today's share basis (a later split under HW is not applied again).
+    massive, _ = client(listing(
+        events={"HW": [("2026-06-15", "HWI"), ("2026-06-29", "HW")]},
+        identity={("HW", "2026-06-14"): ("333", "FIGI-HW", "1929-09-19"), ("HW", "2026-06-28"): ("333", "FIGI-HW", "1929-09-19"),
+                  ("HW", "2026-11-13"): ("333", "FIGI-HW", "1929-09-19")},
+        bars={"HW": [(d, 200.0 + i) for i, d in enumerate(DAYS)]},
+        splits={"HW": [("2026-08-01", 1, 2)]}))
+    got = massive.bars("HW", "2026-06-01", "2026-11-13")["payload"]
+    assert got["tenure"][0] == {"ticker": "HW", "from": "2026-06-01", "to": "2026-06-14"}
+    assert got["tenure"][1]["read"] == "HW"
+    assert [r["c"] for r in got["results"]] == [200.0 + i for i in range(len(DAYS))]
+
+
+def test_an_earlier_tickers_rows_are_put_on_todays_share_basis_by_the_splits_after_it():
+    # OLD to NEW on 2026-07-02, a 2-for-1 split under NEW after it: OLD's rows halve, NEW's stand as Massive gives them.
+    massive, _ = client(listing(
+        events={"NEW": [("2026-01-02", "OLD"), ("2026-07-02", "NEW")]},
+        identity={},
+        bars={"OLD": [(d, 100.0) for d in DAYS if d < "2026-07-02"], "NEW": [(d, 50.0) for d in DAYS if d >= "2026-07-02"]},
+        splits={"NEW": [("2026-08-01", 1, 2)]}))
+    got = massive.bars("NEW", "2026-06-01", "2026-11-13")["payload"]
+    assert [t["ticker"] for t in got["tenure"]] == ["OLD", "NEW"]
+    assert [r["c"] for r in got["results"]] == [50.0] * len(DAYS)

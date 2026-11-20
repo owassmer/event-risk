@@ -171,11 +171,11 @@ def test_a_note_a_statement_rests_on_stays_while_it_does(w):
     e, other = w.prop("E"), w.prop("Other")
     w.store.edit(e, "chances", [{"value": 0.3, "note": REASON}])
     note = w.store.stated_of(e)["chances"][0]["note"]
-    err = refused(w, lambda: w.store.remove(note), re.escape(f"{note} is the basis of {e}.chances[0]: restate it "
-                                                              f"with another basis, or remove it, first"))
-    assert err.dependents == [f"{e}.chances[0]"]
+    err = refused(w, lambda: w.store.remove(note), re.escape(f"{note} is the basis of the chance of {e} stated on its "
+                                                              f"own: restate it with another basis, or remove it, first"))
+    assert err.dependents == [f"the chance of {e} stated on its own"]
     [tie] = [a["id"] for a in w.store.links_of(note, "about")]
-    refused(w, lambda: w.store.remove(tie), re.escape(f"{note} is the basis of {e}.chances[0], and stays a note "
+    refused(w, lambda: w.store.remove(tie), re.escape(f"{note} is the basis of the chance of {e} stated on its own, and stays a note "
                                                       f"about {e}"))
     also = w.store.link(note, "about", other)["id"]  # the analyst can say the reasoning bears elsewhere too
     w.store.remove(also)
@@ -243,6 +243,8 @@ def test_a_passage_a_shock_a_chance_or_a_market_not_taken_cites_opens_marked_on_
     """The inspector finds each passage by the field that cites it: a shock's, a way's chance given its event, and the
     reason a market is not taken."""
     import hashlib
+    import re
+    from html import unescape
     e, a = w.prop("E", baseline="no"), w.prop("A")
     sid = page(w, "In the last episode, X fell by a tenth, half of it in one way, and the book was one trader's.",
                "https://example.org/episode")
@@ -252,6 +254,8 @@ def test_a_passage_a_shock_a_chance_or_a_market_not_taken_cites_opens_marked_on_
     w.store.edit(a, "chances", [{"given": [e], "value": 0.5, "source_id": sid, "passages": [cited["share"]]}])
     w.store.link(e, "asks", w.market("M", "E?", 0.39, 0.41), {"taken": {"value": False, "source_id": sid,
                                                                        "passages": [cited["taken"]]}})
-    for passage in cited.values():
-        html = view(w.store, f"x:passage:{sid}:{hashlib.sha256(passage.encode()).hexdigest()[:12]}")["html"]
-        assert f"<mark>{passage}</mark>".replace("'", "&#x27;") in html, passage
+    for passage in cited.values():  # opened at it, the page's text marks it as the one opened, and the others quoted
+        html = unescape(view(w.store, f"x:passage:{sid}:{hashlib.sha256(passage.encode()).hexdigest()[:12]}")["html"])
+        text = re.search(r'data-md="([^"]*)"', html).group(1)
+        assert re.findall("\ue002(.*?)\ue003", text) == [passage], passage
+        assert sorted(re.findall("\ue000(.*?)\ue001", text)) == sorted(p for p in cited.values() if p != passage)

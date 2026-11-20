@@ -189,22 +189,6 @@ class VenueRefused(VenueError):
     """A venue refused the request itself: asking again would not change its answer."""
 
 
-class Cooldown:
-    """A source that did not answer is not asked again for a while: each request in that while fails at once, so a
-    read that would wait on it, held under the store's lock, does not wait on it twice in a minute."""
-
-    def __init__(self, name: str, seconds: float = 60.0):
-        self.name, self.seconds = name, seconds
-        self._until = 0.0
-
-    def check(self) -> None:
-        if time.monotonic() < self._until:
-            raise VenueError(f"{self.name} did not answer a moment ago; it is asked again shortly")
-
-    def failed(self) -> None:
-        self._until = time.monotonic() + self.seconds
-
-
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 

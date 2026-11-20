@@ -122,7 +122,7 @@ def answered_with_exposures(store: Store, call: str, out: dict) -> None:
                        ["output"])["g"]
         assert {c["factor"]: c["dollar_beta"] for c in out["factors"]} == pytest.approx(g)
     elif call == "a consequence":
-        assert out["events"][0]["factors"] and out["events"][0]["holdings"]
+        assert out["events"][0]["row"]["full_impact"] is not None  # the row reads the betas the exposures fit
     else:
         assert out["dollar_beta"] is not None
 
@@ -160,8 +160,8 @@ def test_a_call_that_needs_the_exposures_fails_where_a_read_they_need_has_failed
     name, given = NEEDS[call]
     ok, out = tools.call(name, given)
     assert not ok and out["dependents"] == [] and re.fullmatch(  # the reading named by what it reads, nothing more
-        r"The dividends of NVDA from \d{4}-\d\d-\d\d to \d{4}-\d\d-\d\d could not be read just now\. Nothing was "
-        r"written, and the call can be made again\.", out["error"])
+        r"The dividends of NVDA from \d{4}-\d\d-\d\d to \d{4}-\d\d-\d\d could not be read: its source did not answer\. "
+        r"Nothing was written, and making the call again asks the source again\.", out["error"])
     assert written(store) == before
     store.fetchers["dividends"] = real
     ok, out = tools.call(name, given)

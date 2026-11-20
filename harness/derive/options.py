@@ -278,7 +278,7 @@ def worlds_value(*, kind: str, style: str, strike: float, years: float, rate: fl
     the contract's terms allow at any volatility raises ValueError, as a missing or ill-formed term does. The search is
     the one its delta makes (_implied).
 
-    At a draw at the horizon's end (MATH.md 1.8) the same contract is valued by `value` at this volatility, with the
+    At a draw on the event's date (MATH.md 1.8) the same contract is valued by `value` at this volatility, with the
     life it has left there; a contract that has expired by then is its payoff, paid once.
     """
     _terms(kind, style, strike, years, rate, dividend_yield)

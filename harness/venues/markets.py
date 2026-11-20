@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -50,15 +50,21 @@ log = logging.getLogger("harness.venues")
 
 
 def ny_date(value: Any) -> str | None:
-    """The New York date of a time: an ISO string, or milliseconds since the epoch."""
+    """The New York date of a time: an ISO string with its offset, or milliseconds since the epoch; a date alone is that
+    date. A time with no offset names no moment, so it gives none, as `moment` reads it: read in the zone of the machine
+    reading it, it would give another date on another machine."""
     if value in (None, ""):
         return None
     try:
         if isinstance(value, (int, float)):
-            moment = datetime.fromtimestamp(value / 1000, timezone.utc)
+            at = datetime.fromtimestamp(value / 1000, timezone.utc)
+        elif "T" not in str(value) and " " not in str(value).strip():
+            return date.fromisoformat(str(value).strip()).isoformat()
         else:
-            moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return moment.astimezone(NY).date().isoformat()
+            at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if at.tzinfo is None:
+            return None
+        return at.astimezone(NY).date().isoformat()
     except (TypeError, ValueError, OverflowError):
         return None
 

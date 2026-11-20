@@ -75,22 +75,37 @@ JUDGED = {"hitting": "at any time in its window", "level_at_date": "on its windo
 
 
 def proposition_content(ctx: Inputs, pid: str) -> dict:
-    """A proposition as the analyst wrote it: its title and text, when it is judged (at any time in its window, on its
-    window's end, or at the scheduled decision then) with its window as stated, its level on its metric, and
-    its resolution source."""
+    """A proposition as the analyst wrote it (stated_proposition), its metric read from the store."""
     found = ctx.object(pid)
     if found["type"] != "Proposition":
         _refuse(pid, found["type"])
     s = found["stated"]
+    return stated_proposition(s, metric(ctx, s["metric"]) if _measured(s) else None)
+
+
+def _measured(s: dict) -> bool:
+    """Whether the judge reads a proposition's metric: a level on it, or the occurrence it names."""
+    return bool(s.get("metric")) and ((s.get("value") is not None and s.get("comparison") in RELATIONS)
+                                       or s.get("comparison") == "occurs")
+
+
+def stated_proposition(s: dict, of: dict | None = None) -> dict:
+    """A proposition as the analyst wrote it, from its stated fields: its title and text, when it is judged (at any
+    time in its window, on its window's end, or at the scheduled decision then) with its window as stated, its level on
+    its metric, a band's from its lower end to its upper, and its resolution source. `of` is its metric as the judge
+    reads it (metric), where it has a level or names an occurrence; a record's copy gives it from its own fields."""
     out = {"proposition": s["title"], "says": s["text"], "judged": JUDGED[s["kind"]]}
     if s.get("window_start"):
         out["window starts"] = s["window_start"]
     out["window ends"] = s["window_end"]
-    if s.get("metric") and s.get("value") is not None and s.get("comparison") in RELATIONS:
-        out["level"] = f"{RELATIONS[s['comparison']]} {number(s['value'])}"
-        out["of"] = metric(ctx, s["metric"])
-    elif s.get("metric") and s.get("comparison") == "occurs":  # the occurrence it is true on
-        out["of"] = metric(ctx, s["metric"])
+    if _measured(s) and s.get("comparison") != "occurs":
+        level = f"{RELATIONS[s['comparison']]} {number(s['value'])}"
+        if s.get("upper_comparison") in RELATIONS and s.get("upper_value") is not None:
+            level += f" and {RELATIONS[s['upper_comparison']]} {number(s['upper_value'])}"
+        out["level"] = level
+        out["of"] = of
+    elif _measured(s):  # the occurrence it is true on
+        out["of"] = of
     if s.get("resolution_source"):
         out["resolved by"] = s["resolution_source"]
     return out

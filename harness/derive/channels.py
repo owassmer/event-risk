@@ -93,6 +93,14 @@ def _factors_inputs(ctx: Inputs, subject: str) -> dict:
             "pairs": {c["id"]: q for c, item in zip(channels, items) if (q := _quote_of(ctx, item))}}
 
 
+def _shared(n: int, days: list[str], asof: str) -> str:
+    """The sessions the factors' proxies share in the common history, the two years to the date the factors are read
+    for (MATH.md 3.2), as a refusal names them: how many, and the first, or the one."""
+    span = f"in common in the two years to {asof[:10]}"
+    return f"no session {span}" if n == 0 else f"1 session {span}, {days[0]}" if n == 1 else \
+        f"{n} sessions {span}, from {days[0]}"
+
+
 def _factors_compute(m: dict, load) -> dict:
     """The proxies' returns on each session of the window, none where a proxy has none on it; the common history, the
     sessions on which every proxy has one; and over it the channels' mean, same-session covariance Gamma_0, covariance
@@ -103,8 +111,7 @@ def _factors_compute(m: dict, load) -> dict:
     t_len, k = len(sessions) - 1, len(m["channels"])
     if t_len < 2:  # the window's sessions are the first channel's proxy's closes: fewer than two returns to the as-of,
         # none where it has no close to the as-of at all
-        held = f"1 session in common in the window, {sessions[1]}" if t_len == 1 else \
-            "no session in common in the window"
+        held = _shared(max(t_len, 0), sessions[1:2], m["asof"])
         raise Refused(f"the factors' proxies share {held}, too few to measure how {k} factors move together",
                       [m["channels"][0]])
     _one_rate_one_channel(m)
@@ -116,7 +123,7 @@ def _factors_compute(m: dict, load) -> dict:
     ok = estimate.common(x)
     n = int(ok.sum())
     days = [sessions[t + 1] for t in np.flatnonzero(ok)]
-    held = f"{n} sessions in common in the window, from {days[0]}" if n else "no session in common in the window"
+    held = _shared(n, days, m["asof"])
     if n <= k:  # the covariance of k channels needs more sessions than channels: named, the proxies with the fewest
         counts = (~np.isnan(x)).sum(axis=0)  # returns, whose history is what a correction lengthens
         raise Refused(f"the factors' proxies share {held}, too few to measure how {k} factors move together",
@@ -154,7 +161,7 @@ def _one_rate_one_channel(m: dict) -> None:
         seen[key] = (cid, ticker)
 
 
-FACTORS = Derivation("factors", 4, "Portfolio", _factors_inputs, _factors_compute,
+FACTORS = Derivation("factors", 5, "Portfolio", _factors_inputs, _factors_compute,
                      applies=lambda store, entity: False, stage="exposures")
 
 
@@ -710,6 +717,12 @@ def window_subject(start: str, end: str) -> str:
     return f"window:{start}:{end}"
 
 
+def past_window(end: str, asof: str) -> str:
+    """Why a window that ends after the as-of has no move over it: a past window ends at a close on or before the
+    as-of (ONTOLOGY.md 2.1, MATH.md 3.2). One sentence for every window, an episode's and one a shock is sized from as well."""
+    return f"a past window ends on or before the as-of, {asof}, and this one ends {end}"
+
+
 def _ref(value: dict) -> dict:
     return {"derivation": value["derivation"], "subject": value["subject"], "basis": value["basis"],
             "sha256": digest(value["output"])}
@@ -732,20 +745,41 @@ def window_record(start: str, end: str, asof: str) -> tuple[str, str]:
             min(asof, (date.fromisoformat(end) + reach).isoformat()))
 
 
+def window_reach(start: str) -> str:
+    """The first date a window's prices are read from: a fortnight before its start, so that the last close on or
+    before the start is read whatever holidays and weekends come before it (series.Moves.between)."""
+    return (date.fromisoformat(start) - timedelta(days=14)).isoformat()
+
+
+def unmeasured(ticker: str, moving: series.Moves, start: str, end: str) -> str:
+    """Why a price has no move over a window (MATH.md 3.2): it has no close on or before the window's start, or none after
+    that one through its end, or a session between them with no return."""
+    days = sorted(moving.closes)
+    if not any(d <= start for d in days):
+        after = next((d for d in days if start < d <= end), None)
+        return (f"{ticker} has no close on or before {start}; its first close after it is {after}" if after else
+                f"{ticker} has no close from {start} to {end}")
+    got = moving.between(start, end)
+    if got is None:
+        return f"{ticker} has no close after {max(d for d in days if d <= start)} through {end}"
+    return f"{ticker} has no return on a session between {got[0]} and {got[1]}"
+
+
 def _window_inputs(ctx: Inputs, subject: str) -> dict:
-    """Each factor's proxy series over the window, with its distributions from where the window's record begins
-    (window_record), and the orthogonalization it goes through. Every proxy is read at once (moves_inputs_many), so a
-    window the store holds none of is one round of reads."""
+    """Each factor's proxy series over the window, from a fortnight before its start (window_reach), with its
+    distributions from where the window's record begins (window_record), and the orthogonalization it goes through.
+    Every proxy is read at once (moves_inputs_many), so a window the store holds none of is one round of reads. A
+    window that ends after the as-of is refused by its dates."""
     _, start, end = subject.split(":")
     asof = asof_of(ctx)
-    if start > asof:
-        raise Unavailable(f"the window begins on {start}, after the as-of, {asof}")
-    # each proxy's prices read over the window itself, to the as-of at the latest, and its distributions over the
-    # window's record: a window within the history the factors are estimated on is read from that history's own
-    # reading, and one before it reads nothing the history reads where its record ends before the as-of
+    if end > asof:
+        raise Unavailable(past_window(end, asof))
+    # each proxy's prices read over the window itself, and its distributions over the window's record: a window within
+    # the history the factors are estimated on is read from that history's own reading, and one before it reads
+    # nothing the history reads where its record ends before the as-of
     record = window_record(start, end, asof)
     found = [(c, ctx.value("orthogonalize", c["id"])) for c in ordered_channels(ctx)]
-    items = history.moves_inputs_many(ctx, [orth["output"]["proxy"] for _, orth in found], (start, min(end, asof)),
+    items = history.moves_inputs_many(ctx, [orth["output"]["proxy"] for _, orth in found], (window_reach(start), end),
                                       record=record)
     channels = [{"channel": c["id"], "name": c["stated"]["name"], "orthogonalization": _ref(orth),
                  "series": items[orth["output"]["proxy"]]} for c, orth in found]
@@ -755,43 +789,43 @@ def _window_inputs(ctx: Inputs, subject: str) -> dict:
 
 
 def _window_compute(m: dict, load) -> dict:
-    """Each proxy's move from the close of start to the close of end, what holding it earned less the income it
-    accrued (series.window_move), and each factor's residual over it (MATH.md 1.3, 3.2): the compounded move, ln(1 + r),
-    less its coefficients on the earlier factors' residuals, given as a move, e^z - 1 (`own_part`), so that the window
-    stated back by its residuals reproduces its moves. A proxy with no close at an end of the window has none, and a
-    residual of 0."""
+    """Each proxy's move over the window, what holding it earned less the income it accrued (series.Moves), between its
+    last close on or before the start and its last on or before the end, the two sessions named (`sessions`); and each
+    factor's residual over it (MATH.md 1.3, 3.2): the compounded move, ln(1 + r), less its coefficients on the earlier
+    factors' residuals, given as a move, e^z - 1 (`own_part`), so that the window stated back by its residuals
+    reproduces its moves. A listing abroad runs between its own last closes, each by the New York session it belongs
+    to, so a day its market was closed reads its close before. A proxy with no move over the window gives none, so
+    neither its residual nor that of any later factor whose residual reads it is measured: each is None."""
     start, end = m["window"]
-    found_closes, moves, orthogonalized = {}, {}, {}
+    found_closes, moves, between, orthogonalized, why = {}, {}, {}, {}, {}
     listed = next((c["series"] for c in m["channels"] if c["series"]["kind"] == "listing"), None)
     sessions = sorted(closes(listed, load)) if listed else []  # New York's sessions, the market's own (calendar_inputs)
     for c in m["channels"]:
         cid, item = c["channel"], c["series"]
         moving = history.moves(item, load, sessions, since=m["record"][0], until=m["record"][1])
-        found = moving.closes
-        found_closes[item["ticker"]] = {d: v for d, v in sorted(found.items()) if start <= d <= end}
-        r = moving(start, end)
+        found_closes[item["ticker"]] = {d: v for d, v in sorted(moving.closes.items()) if start <= d <= end}
+        between[cid] = moving.between(start, end)
+        r = moving(*between[cid]) if between[cid] else None
         moves[cid] = r
         if r is None:
-            orthogonalized[cid] = 0.0
-            continue
+            why[item["ticker"]] = unmeasured(item["ticker"], moving, start, end)
         coefficients = load(c["orthogonalization"])["coefficients"]
-        orthogonalized[cid] = math.log1p(r) - sum(beta * orthogonalized[earlier] for earlier, beta in coefficients.items())
-    if all(r is None for r in moves.values()):  # no proxy has a close at both ends of the window
-        def lacks(t: str) -> str:
-            held = found_closes[t]
-            missing = [d for d in (start, end) if d not in held]
-            return f"{t} has no close from {start} to {end}" if not held else \
-                f"{t} has no close on {' or '.join(dict.fromkeys(missing))}"
-        raise Unavailable(f"no factor's proxy has a close at both ends of the window: "
-                          f"{'; '.join(lacks(t) for t in found_closes)}")
+        if r is None or any(orthogonalized[earlier] is None for earlier, beta in coefficients.items() if beta):
+            orthogonalized[cid] = None
+            continue
+        orthogonalized[cid] = math.log1p(r) - sum(beta * orthogonalized[earlier] for earlier, beta in coefficients.items()
+                                                  if beta)
+    if all(r is None for r in moves.values()):  # no proxy moves over the window
+        raise Unavailable(f"no factor's proxy has a move over the window: {'; '.join(why.values())}")
     return {"window": [start, end], "closes": found_closes, "moves": moves,
-            "own_part": {c: math.expm1(z) for c, z in orthogonalized.items()},
-            "proxies": {c["channel"]: c["series"]["ticker"] for c in m["channels"]}}
+            "sessions": {c: list(b) if b else None for c, b in between.items()},
+            "own_part": {c: None if z is None else math.expm1(z) for c, z in orthogonalized.items()},
+            "proxies": {c["channel"]: c["series"]["ticker"] for c in m["channels"]}, **({"why": why} if why else {})}
 
 
 # window_returns(start, end): how the factors moved over a past window. It gives no object a field: the tool
 # reads its Computation by subject, window:{start}:{end}.
-WINDOW_RETURNS = Derivation("window_returns", 16, "Factor", _window_inputs, _window_compute,
+WINDOW_RETURNS = Derivation("window_returns", 18, "Factor", _window_inputs, _window_compute,
                             applies=lambda store, entity: False)
 
 DERIVATIONS = (FACTORS, ORTHOGONALIZE, BETAS, G, VOLATILITY, PROXY_PRICE, WINDOW_RETURNS)

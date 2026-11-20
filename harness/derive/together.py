@@ -28,11 +28,13 @@ from datetime import date
 import numpy as np
 
 from harness import schema
-from harness.derive import distribution, impact, markets, oneform, outcomes, portfolio, structure, valuation, worlds
+from harness.derive import (distribution, episode, impact, markets, oneform, option_funds, outcomes, portfolio,
+                            structure, valuation, worlds)
 from harness.derive.engine import Derivation, Refused, Unavailable
 from harness.store import StoreError
 
 TOL = 2e-8
+EPISODE = "an episode"  # what two joint worlds that each name an episode state, where neither is within the other
 
 
 def project(prior, A, b):
@@ -490,11 +492,19 @@ def _identified(model, points, pid, seen=frozenset()):
         for values in itertools.product((False, True), repeat=len(parents)) for case in [dict(zip(parents, values))])
 
 
+def _changes(stated: float, rows: float) -> bool:
+    """Whether a compounded move a statement gives a factor departs from the one the rows give it: a price at zero in
+    both is where the rows have it."""
+    if not (math.isfinite(stated) and math.isfinite(rows)):
+        return stated != rows
+    return abs(stated - rows) > TOL
+
+
 def contract_states_for_cases(ctx, cases, *, through=None, receipt=None):
     """The shared contract truth states conditional on an event's terminal worlds.
 
-    Without a horizon, unrelated holdings have no entry: learning the event leaves
-    their mark. With a horizon, unsettled contracts due by then join by their stated
+    Without a date, unrelated holdings have no entry: learning the event leaves
+    their mark. With the date the worlds are drawn on, unsettled contracts due by then join by their stated
     probability; disconnected structures are independent. No market q invents a p.
     """
     seeds = list(dict.fromkeys(p for case in cases.values() for p in case))
@@ -509,18 +519,21 @@ def contract_states_for_cases(ctx, cases, *, through=None, receipt=None):
             if settlement.get("settled"):
                 continue
             if not close:
-                raise Unavailable(f"{held['to']}'s payment date is needed to value its contract through the horizon")
+                raise Unavailable(f"{held['to']}'s payment date is needed to say whether it pays by {through}, "
+                                  f"the date the outcomes are drawn on")
             if close > through:
                 continue
             asks = ctx.links(held["to"], "asks", direction="in")
             if not asks:
-                raise Unavailable(f"{held['to']} pays by the horizon but has no linked proposition with a probability")
+                raise Unavailable(f"{held['to']} pays by {through}, the date the outcomes are drawn on, and no "
+                                  f"proposition is linked as the one it asks, so what it pays there has no probability")
             expiring.append((held["to"], asks[0]["from"]))
             seeds.append(asks[0]["from"])
     model, points = model_inputs(ctx, seeds)
     for mid, pid in expiring:
         if not _identified(model, points, pid):
-            raise Unavailable(f"{mid} pays by the horizon but {pid}'s probability is not identified")
+            raise Unavailable(f"{mid} pays by {through}, the date the outcomes are drawn on, and {pid}'s "
+                              f"probability is left open by its statements")
     keep = set(seeds) | _contract_propositions(ctx, set(model["props"]))
     atoms, p, assumed = probabilities(model, points, keep=keep)
     if receipt is not None:
@@ -579,23 +592,6 @@ def _parse(key: str) -> tuple[list[str], dict | None]:
     return head.split(","), considering
 
 
-def _joint_world(ctx, pid: str, seen: frozenset = frozenset()) -> bool:
-    """A proposition that is worlds of several events at once: a composite (`and`, `then`) of two parts, each a world
-    of an event that names its baseline, or itself such a composite. What the analyst states of it is stated against the
-    joint world in which every event is at its baseline (1.9)."""
-    if pid in seen:
-        return False
-    parts = [link["to"] for link in ctx.links(pid, ("and", "then"))]
-    if len(parts) != 2:
-        return False
-    links = lambda oid: ctx.links(oid, "way", "both")  # noqa: E731
-    for part in parts:
-        root = outcomes.root_of(links, part)
-        if ctx.object(root)["stated"].get("baseline") is None and not _joint_world(ctx, root, seen | {pid}):
-            return False
-    return True
-
-
 def _wid(events: list[str], cell: tuple) -> str:
     return "joint:" + "|".join(f"{e}={w}" for e, w in zip(events, cell))
 
@@ -632,17 +628,23 @@ def _together_inputs(ctx, key: str) -> dict:
     model, points = model_inputs(ctx, related)
     props = set(model["props"])
     kinds = ctx.payload(manifests[0]["lookthrough"]).get("kinds") or {}
-    in_rows = {n for tree in trees for n in tree["nodes"]} | set(events)
     stated = []
-    for pid in model["props"]:
-        if pid in in_rows or not _joint_world(ctx, pid):
-            continue
+    for j in ctx.objects("JointWorld"):  # each joint world a statement names, of events all in this view
+        named = outcomes.named_by(j["id"])
+        if not set(named) <= set(events) or \
+                any(o not in trees[events.index(e)]["nodes"] for e, o in named.items()):
+            continue  # of other events, or naming an outcome its event no longer has, which check() lists
         cons = [{"link": link["id"], "target": link["to"], **impact.stated_move(link)}
-                for link in ctx.links(pid, "consequence")]
-        worth = ([i for i in valuation.worth_inputs(ctx, pid, [], kinds) if i.get("world") in (None, "yes")]
-                 if ctx.links(pid, "worth") else [])
-        if cons or worth:
-            stated.append({"id": pid, "consequences": cons, "worth": worth})
+                for link in ctx.links(j["id"], "consequence")]
+        worth = valuation.worth_inputs(ctx, j["id"], [], kinds) if ctx.links(j["id"], "worth") else []
+        window = (j["stated"].get("episode") or {}).get("value")
+        held = None
+        if window:
+            got = ctx.value("episode_covariance", episode.subject(window["start"], window["end"]))
+            held = {"on": j["id"], "basis": got["basis"], **got["output"]}
+        if cons or worth or held:
+            stated.append({"id": j["id"], "named": named, "consequences": cons, "worth": worth,
+                           **({"episode": held} if held else {})})
     proxies = {c["id"]: c["stated"]["proxy"] for c in ctx.objects("Factor")}
     targets = (set(manifests[0]["channels"]) | {i["target"] for mf in manifests for i in mf["worth"]}
                | {i["target"] for st in stated for i in st["worth"]} | {c["target"] for st in stated for c in st["consequences"]})
@@ -650,19 +652,55 @@ def _together_inputs(ctx, key: str) -> dict:
     cells = list(itertools.product(*(tree["worlds"] for tree in trees)))
     cases = {_wid(events, cell): {k: v for i, (e, w) in enumerate(zip(events, cell))
                                   for k, v in _world_case(e, w, trees[i]["nodes"][w]).items()} for cell in cells}
-    drawn = distribution._inputs(ctx, events[0])
+    # one date for the view, the latest of its events' dates, when every joint world is known (1.8, 1.9): its draws and
+    # the contracts that pay by then read it
+    drawn = distribution._inputs(ctx, events[0], on=distribution.event_date(ctx, *events))
     receipt: dict = {}
-    horizon = contract_states_for_cases(ctx, cases, through=drawn["horizon_end"], receipt=receipt)
-    contracts, states = valuation.contract_inputs(ctx, events[0], {}, states=horizon)
+    paying = contract_states_for_cases(ctx, cases, through=drawn["drawn_on"], receipt=receipt)
+    contracts, states = valuation.contract_inputs(ctx, events[0], {}, states=paying)
+    # the contracts each fund still holds on that date, each fund valued by its terms as one event's are on its own date:
+    # a contract expiring before it is replaced by then, and a fund none of whose contracts outlive it moves by its
+    # response (1.6); a holding valued by what it is worth in a world is valued by that
+    worth_named = {i["target"] for mf in manifests for i in mf.get("worth") or []} | \
+        {i["target"] for st in stated for i in st["worth"]}
+    books = option_funds.inputs(ctx, ctx.payload(manifests[0]["lookthrough"]),
+                                ctx.payload(manifests[0]["fund_rows"])["rows"], drawn["drawn_on"],
+                                exclude=worth_named)
     return {"events": events, "rows": rows, "manifests": manifests, "trees": trees, "model": model, "points": points,
             "stated": stated, "held": _held(ctx, props), "prices": prices, "considering": considered,
-            "distribution": drawn, "horizon": {"contracts": contracts, "states": states, "receipt": receipt}}
+            "books": {"option_funds": books, "option_remainders": valuation.remainder_inputs(ctx, books)},
+            "distribution": drawn, "paying": {"contracts": contracts, "states": states, "receipt": receipt}}
+
+
+def _replaced_ratios(n: str, out: dict, row: dict) -> tuple[dict[str, float], dict[str, float]]:
+    """A fund an event's row values by its contracts, read with events whose latest date none of them outlives: by then
+    they are replaced, and it moves by its response (1.6). In each world of the row, its move against the row's
+    baseline: its response there; where the row states its whole move, that move; where it states its residual, that
+    residual on its response (1.9). With its response's move beside it."""
+    resp, own, unstated = out["responding_ratios"][n], out["name_ratios"][n], (out.get("unstated") or {}).get(n)
+    base = row["baseline"]
+    if resp[base] <= 0:
+        raise ValueError(f"{n} is worth zero in an event's baseline, so its joint move has none")
+    moved = {w: resp[w] / resp[base] for w in row["worlds"]}
+    rel = dict(moved)
+    for w in row["worlds"]:
+        a = ((out.get("setting") or {}).get(w) or {}).get(n)
+        if a is None or unstated is None:
+            continue
+        if a[schema.AGAINST] == schema.BASELINE:
+            if own[base] <= 0:
+                raise ValueError(f"{n} is worth zero in an event's baseline, so its joint move has none")
+            rel[w] = own[w] / own[base]
+        else:
+            rel[w] = moved[w] * (own[w] / unstated[w] if unstated[w] > TOL else 0.0)
+    return rel, moved
 
 
 def _together_compute(inputs: dict, load) -> dict:
     """Several events read as one set of worlds (MATH.md 1.9): each joint world's probability from the one structure, the
     weight today's prices carry on it, what it does, as the analyst states it or as the rows put it, and the portfolio's
-    P&L there; beside each event's row, its average over the joint worlds; the distribution at the horizon's end; and a
+    P&L there; beside each event's row, its average over the joint worlds; the distribution on the latest of the events'
+    dates, when every joint world is known; and a
     contract considered, valued in the same worlds."""
     events, trees, manifests = inputs["events"], inputs["trees"], inputs["manifests"]
     outputs = [load(ref) for ref in inputs["rows"]]
@@ -671,7 +709,7 @@ def _together_compute(inputs: dict, load) -> dict:
             raise Unavailable(out.get("why") or f"{pid} has no valued worlds")
     model, points, held = inputs["model"], inputs["points"], inputs["held"]
     keep = set(events) | {w for tree in trees for w in tree["worlds"] if w not in ("yes", "no")}
-    keep |= {st["id"] for st in inputs["stated"]} | {h["on"] for h in held}
+    keep |= {h["on"] for h in held}
     if inputs["considering"]:
         keep |= {a["from"] for a in inputs["considering"]["asks"]}
     try:
@@ -696,40 +734,74 @@ def _together_compute(inputs: dict, load) -> dict:
     ids = [_wid(events, c) for c in cells]
     base = ids[cells.index(baseline)]
 
-    # what the analyst states of joint worlds, each over the joint worlds its proposition is true in; in each, the
-    # statement on the fewest joint worlds stands
-    scopes = []
-    for st in inputs["stated"]:
-        truth = np.array([a[st["id"]] for a in atoms])
-        hits = [i for i, mask in enumerate(matching) if np.any(mask & truth)]
-        if not hits:
-            continue
-        if any(not np.all(truth[matching[i]]) for i in hits):
-            raise Unavailable(f"the events read together leave {st['id']} true in part of a joint world; read with them "
-                              f"the events it is stated on")
-        if cells.index(baseline) in hits and st["consequences"]:
-            raise Unavailable(f"{st['id']} holds the joint world in which every event is at its baseline, which its "
+    # what the analyst states of joint worlds (MATH.md 1.9): a joint world kept by its outcomes holds every joint world of
+    # this view beneath them, an outcome holding the worlds under it and the events it does not name turning out as
+    # they may; in each, for each price, the statement nearest above it stands, the one lying within every other that
+    # states that price there (1.3), and its shock is against the joint world in which the events it names are at
+    # their baselines and the others as they are there
+    nodes_of = lambda e: trees[events.index(e)]["nodes"]  # noqa: E731
+    held_by = {st["id"]: [j for j, cell in enumerate(cells)
+                          if all(outcomes.holds(nodes_of(e), o, cell[events.index(e)]) for e, o in st["named"].items())]
+               for st in inputs["stated"]}
+
+    def standing(sts: list[dict], j: int, what: str) -> dict:
+        """Of the statements that each state `what` of joint world j, the one nearest above it; where two lie within
+        neither each other nor the rest, its figures wait, naming the joint world where both apply to state it on."""
+        got, apart = outcomes.nearest(nodes_of, [(st["id"], st["named"]) for st in sts])
+        if got:
+            return next(st for st in sts if st["id"] == got)
+        a, b = (next(st for st in sts if st["id"] == x) for x in apart)
+        both = outcomes.joint_id(outcomes.meet(nodes_of, a["named"], b["named"]))
+        if what is EPISODE:
+            raise Unavailable(f"{a['id']} and {b['id']} name different episodes in {ids[j]}, and neither is within the "
+                              f"other. State the episode on {both}, where both apply.")
+        raise Unavailable(f"{a['id']} and {b['id']} both set {what} in {ids[j]}, and neither is within the other. "
+                          f"State {what} on {both}, where both apply.")
+
+    def against(st: dict, j: int) -> int:
+        named = {events.index(e) for e in st["named"]}
+        cell = tuple(rows[i]["baseline"] if i in named else c for i, c in enumerate(cells[j]))
+        if cell not in cells:
+            raise Unavailable(f"{st['id']}'s shocks are stated against {_wid(events, cell)}, which cannot happen with "
+                              f"what is stated between its events")
+        if cell == cells[j]:
+            raise Unavailable(f"{st['id']} holds {ids[j]}, in which each event it names is at its baseline, which its "
                               f"shocks are stated against")
-        scopes.append((set(hits), st))
-    joint_consequences: dict[int, dict] = {}
+        return cells.index(cell)
+    setting: dict[int, dict[str, tuple[dict, dict]]] = {}
     joint_worth: dict[int, dict] = {}
-    for scope, st in sorted(scopes, key=lambda entry: len(entry[0])):
-        for i in scope:
-            for c in st["consequences"]:
-                joint_consequences.setdefault(i, {}).setdefault(c["target"], c)
-            for item in st["worth"]:
-                joint_worth.setdefault(i, {}).setdefault(item["target"], item)
-    stated_by = {ids[i]: sorted({x["link"] for x in (*joint_consequences.get(i, {}).values(),
-                                                    *joint_worth.get(i, {}).values())})
-                 for i in set(joint_consequences) | set(joint_worth)}
+    worth_on: dict[int, dict[str, str]] = {}  # the joint world whose statement each value is
+    episode_of: dict[int, tuple[dict, str]] = {}
+    for j in range(len(cells)):
+        here = [st for st in inputs["stated"] if j in held_by[st["id"]]]
+        for t in sorted({c["target"] for st in here for c in st["consequences"]}):
+            st = standing([s for s in here if any(c["target"] == t for c in s["consequences"])], j, t)
+            setting.setdefault(j, {})[t] = (next(c for c in st["consequences"] if c["target"] == t), st)
+        for t in sorted({i["target"] for st in here for i in st["worth"]}):
+            st = standing([s for s in here if any(i["target"] == t for i in s["worth"])], j, f"{t}'s value")
+            joint_worth.setdefault(j, {})[t] = next(i for i in st["worth"] if i["target"] == t)
+            worth_on.setdefault(j, {})[t] = st["id"]
+        named_episode = [s for s in here if s.get("episode")]
+        if named_episode:
+            if len({tuple(s["episode"]["window"]) for s in named_episode}) == 1:
+                st = named_episode[0]  # one window, whichever names it
+            else:
+                st = standing(named_episode, j, EPISODE)
+            episode_of[j] = (st["episode"], st["id"])
+    stated_js = [j for j in setting if setting[j]]
+    for j in stated_js:
+        for c, st in setting[j].values():
+            against(st, j)
 
     try:
         q = price_weights(cells, p, rows, outputs)
         m0 = manifests[0]
         factors = list(m0["channels"])
         looked, fitted = load(m0["lookthrough"]), load(m0["betas"])
-        special = {"name:" + t for t in looked.get("multiples") or {}}
-        special |= {n for mf in manifests for n in mf.get("option_funds") or {}}
+        books = inputs["books"]
+        special = {"name:" + t for t in looked.get("multiples") or {}} | set(books["option_funds"])
+        # a fund a row values by its contracts, none of which outlive the view's date: replaced by then (1.6)
+        replaced = {n for mf in manifests for n in mf.get("option_funds") or {}} - special
         stated_names = {n for out in outputs for n in out["names_set"]}
         response_names = {"name:" + ticker for ticker, fund in (looked.get("funds") or {}).items()
                           if fund.get("expanded")} - stated_names - special
@@ -746,7 +818,11 @@ def _together_compute(inputs: dict, load) -> dict:
         for target in factors + names:
             per_row, per_row_response = [], []
             for i, out in enumerate(outputs):
-                if target in out["against_baseline"].get(rows[i]["baseline"], {}):
+                if target in replaced and target in (manifests[i].get("option_funds") or {}):
+                    rel, resp_rel = _replaced_ratios(target, out, rows[i])
+                    per_row.append(rel)
+                    per_row_response.append(resp_rel)
+                elif target in out["against_baseline"].get(rows[i]["baseline"], {}):
                     per_row.append({w: 1 + out["against_baseline"][w][target] for w in rows[i]["worlds"]})
                 elif target in (out.get("name_ratios") or {}) or target in (out.get("reference_ratios") or {}):
                     own = (out.get("name_ratios") or {}).get(target) or out["reference_ratios"][target]
@@ -772,31 +848,115 @@ def _together_compute(inputs: dict, load) -> dict:
     except ValueError as e:
         raise Unavailable(str(e)) from None
 
-    # the joint worlds as one event's, valued once (1.6): a joint world the analyst states stands as stated, as a way
-    # does, its other factors moving with what it sets and its names by their responses or their stated shocks; every
-    # other joint world stands where the rows put it
+    # the joint worlds as one event's, valued once (1.6): every joint world stands where the rows put it, and one the
+    # analyst states stands there except for what it states (d): a price it states takes its statement; a price a row
+    # states in its event's world here keeps what that statement gives it, a whole move as a whole move and a residual
+    # as a residual, as a way keeps what is stated above it (1.3); every other factor moves from where the rows put it
+    # as it ordinarily would with what the statement changes, with the co-movement of the episode its worlds name; and
+    # each name moves with the factors at its betas from where the rows put it
     prices = inputs["prices"]
-    rows_set = [j for j in range(len(ids)) if j not in joint_consequences and ids[j] != base]
+    rows_set = [j for j in range(len(ids)) if j not in stated_js and ids[j] != base]
+    ids_f, coef_f = m0["channels"], m0["coefficients"]
+    ordinary = worlds.covariance(ids_f, coef_f, m0["variances"])
+    yields_f = m0.get("yields") or {}
+    resp = impact.Responses(ids_f, coef_f, fitted)  # how each name moves with the factors, its currency's rate with it
+
+    def as_log(t_: str, shock: float) -> float:  # a shock as its proxy's compounded move (1.3)
+        if t_ in yields_f:
+            return -yields_f[t_]["duration"] * shock / 100.0
+        return math.log1p(shock) if shock > -1.0 else -math.inf
+
+    def ln(x: float) -> float:
+        return math.log(x) if x > 0 else -math.inf
+
+    def residuals(logs_: dict[str, float]) -> dict[str, float] | None:
+        return worlds.orthogonal(ids_f, coef_f, logs_) if all(math.isfinite(v) for v in logs_.values()) else None
+    factor_logs: dict[int, dict[str, float]] = {}  # each stated joint world's factors, worked out as (d) gives them
+
+    def factors_at(j: int) -> dict[str, float]:
+        return factor_logs[j] if j in factor_logs else {c: ln(levels[c][j]) for c in factors}
+
+    def kept_by(j: int) -> dict[str, list[tuple[int, str]]]:
+        """What each event's row states in its world in joint world j: each price, with each event and what it is
+        stated against there."""
+        out: dict[str, list[tuple[int, str]]] = {}
+        for i, o in enumerate(outputs):
+            for target, a in ((o.get("setting") or {}).get(cells[j][i]) or {}).items():
+                out.setdefault(target, []).append((i, a[schema.AGAINST]))
+        return out
+    for j in sorted(stated_js, key=lambda k: -sum(c == rows[i]["baseline"] for i, c in enumerate(cells[k]))):
+        here, kept, ref = setting[j], kept_by(j), {c: ln(levels[c][j]) for c in factors}
+        ref_z = residuals(ref)
+        whole, owned = {}, {}
+        for c in factors:
+            if c in here:
+                cons, st = here[c]
+                r = against(st, j)
+                if cons[schema.AGAINST] == schema.FOLLOWS:
+                    owned[c] = as_log(c, cons["shock"]) + (residuals(factors_at(r)) or {}).get(c, 0.0)
+                else:
+                    whole[c] = as_log(c, cons["shock"]) + factors_at(r)[c]
+            elif c in kept:  # a whole move a row states fixes the price; residuals alone, its residual
+                if all(a == schema.FOLLOWS for _, a in kept[c]) and ref_z is not None:
+                    owned[c] = ref_z[c]
+                else:
+                    whole[c] = ref[c]
+        # what the statement changes: each factor it states, against where the rows put it here, a whole move against
+        # the rows' move and a residual against the rows' residual. A statement that changes no factor leaves them
+        # where the rows put them, with no fill and no episode to ask for (1.9)
+        moving = any(_changes(whole[c], ref[c]) if c in whole else ref_z is None or _changes(owned[c], ref_z[c])
+                     for c in factors if c in here)
+        if moving and ref_z is None:
+            raise Unavailable(f"the rows put a factor at zero in {ids[j]}, so nothing moves with what a statement changes "
+                              f"there: {', '.join(c for c in factors if not math.isfinite(ref[c]))}")
+        if moving:
+            chosen = episode_of.get(j, (None, None))[0]  # the episode a joint world holding it names, or its worlds'
+            if chosen is None:
+                named = {}
+                for i, mf in enumerate(manifests):
+                    got = (mf.get("episodes") or {}).get(cells[j][i])
+                    if got:
+                        named.setdefault(tuple(got["window"]), (got, events[i], cells[j][i]))
+                if len(named) > 1:
+                    said = ", and ".join(f"{w} of {e} names the episode {got['window'][0]} to {got['window'][1]}"
+                                         for got, e, w in named.values())
+                    sts = {st["id"]: st["named"] for _, st in here.values()}  # the nearest joint world holding it
+                    holder, apart = outcomes.nearest(nodes_of, list(sts.items()))
+                    holder = holder or outcomes.joint_id(outcomes.meet(nodes_of, *(sts[x] for x in apart)))
+                    raise Unavailable(f"{ids[j]} lies in worlds that name different episodes: {said}. Its factors move "
+                                      f"with the co-movement of one: state it as {holder}'s episode")
+                chosen = next(iter(named.values()))[0] if named else None
+            cov = np.array(chosen["covariance"]) if chosen else ordinary
+            dep = worlds.fill(ids_f, cov, {c: v - ref[c] if math.isfinite(v) else v for c, v in whole.items()},
+                              {c: v - ref_z[c] for c, v in owned.items()}, coef_f)
+            factor_logs[j] = {c: (whole[c] if c in whole and not math.isfinite(whole[c]) else ref[c] + dep[c])
+                              for c in factors}
+        else:
+            factor_logs[j] = ref
     joint = copy.deepcopy(m0)
+    joint.update(option_funds=books["option_funds"], option_remainders=books["option_remainders"])
     joint.update(event="together:" + ",".join(events), baseline=base, p=points[events[0]], tree={}, priced_in={},
                  worlds=[{"id": wid, "side": trees[0]["nodes"][c[0]]["side"], "p": float(prob)}
                          for wid, c, prob in zip(ids, cells, p)], consequences=[], episodes={})
     yields = joint.get("yields") or {}
     for target in factors:
-        for j in rows_set:
-            y, lv = yields.get(target), levels[target][j]
-            joint["consequences"].append({"link": "rows:" + target, "on": ids[j], "target": target,
+        for j in rows_set + stated_js:
+            y = yields.get(target)
+            lv = levels[target][j] if j in rows_set else math.exp(factor_logs[j][target])
+            stated_c = setting.get(j, {}).get(target)
+            joint["consequences"].append({"link": stated_c[0]["link"] if stated_c else "rows:" + target, "on": ids[j],
+                                          "target": target,
                                           "shock": worlds.points(lv - 1, y["duration"]) if y else lv - 1,
                                           "c": prices[target]["c"], "basis": prices[target]["basis"]})
-    # a fund valued by its terms that a row states a shock on: in each joint world the rows set, what its terms give
-    # there, times what each row's statement does to it in that row's world, its value there over where it stands
-    # unstated (1.6), carried as a residual on it, as the rows compound every other price
+    # a fund valued by its terms that a row states a shock on: in each joint world, what its terms give there, times
+    # what each row's statement does to it in that row's world, its value there over where it stands unstated (1.6),
+    # carried as a residual on it, as the rows compound every other price; a joint world that states it, as stated
     for n in sorted(special):
         factors_ = [(i, out["name_ratios"][n], out["unstated"][n]) for i, out in enumerate(outputs)
                     if n in (out.get("unstated") or {}) and n in (out.get("name_ratios") or {})]
-        if not factors_:
-            continue
-        for j in rows_set:
+        for j in rows_set + stated_js:
+            if n in setting.get(j, {}) or not factors_:
+                continue
             f = 1.0
             for i, stated_r, unstated_r in factors_:
                 w = cells[j][i]
@@ -805,12 +965,36 @@ def _together_compute(inputs: dict, load) -> dict:
                                           schema.AGAINST: schema.FOLLOWS,
                                           **({"c": prices[n]["c"], "basis": prices[n]["basis"]}
                                              if n in prices else {"c": None, "basis": None})})
-    for j, items in joint_consequences.items():
-        for target, c in items.items():
-            joint["consequences"].append({"link": c["link"], "on": ids[j], "target": target,
-                                          "shock": c["shock"], schema.AGAINST: c[schema.AGAINST],
-                                          **({"c": prices[target]["c"], "basis": prices[target]["basis"]}
-                                             if target in prices else {"c": None, "basis": None})})
+    # each name in each stated joint world: where the rows put it, moving with what the statement changes at its
+    # betas unless a statement fixes its whole move there; one the joint world states, as stated there
+    name_levels: dict[str, dict[str, float]] = {}
+    joint_moving: dict[str, list[str]] = {}
+    for j in stated_js:
+        here, kept, wid = setting[j], kept_by(j), ids[j]
+        for n in sorted({t for t in here if t.startswith("name:") and t not in special} | set(names)):
+            cons, st = here.get(n, (None, None))
+            rows_level = float(levels[n][j]) if n in levels else None
+            if cons is not None:  # measured against its reference, the joint world in which the events it names are
+                r = against(st, j)  # at their baselines (1.9), a whole move as a residual is: where the name stands there
+                if n in levels and r not in factor_logs:
+                    at_r = float(levels[n][r])
+                elif n in levels:  # a stated joint world: where it stands there, its departure with it
+                    at_r = name_levels.get(n, {}).get(ids[r], float(levels[n][r]))
+                    if n in joint_moving.get(ids[r], ()):
+                        at_r *= resp.departure(n, factor_logs[r], {c: ln(levels[c][r]) for c in factors})
+                else:  # a name no row states stands at its response there
+                    at_r = resp.level(n, factors_at(r))
+                if cons[schema.AGAINST] == schema.BASELINE:
+                    # the shock moves its price in its own currency (1.4), and the rate stands where this joint
+                    # world's factors put it (1.6)
+                    moved = resp.rate(n, factors_at(j)) / resp.rate(n, factors_at(r)) if n in resp.abroad else 1.0
+                else:  # its residual: its further move from where it would otherwise stand here, moving with the
+                    moved = resp.departure(n, factors_at(j), factors_at(r))  # factors at its betas from there (1.4)
+                name_levels.setdefault(n, {})[wid] = (1.0 + cons["shock"]) * at_r * moved
+            elif rows_level is not None:
+                name_levels.setdefault(n, {})[wid] = rows_level
+                if not any(a == schema.BASELINE for _, a in kept.get(n, ())):
+                    joint_moving.setdefault(wid, []).append(n)
     resolved = [valuation._worth_worlds(mf) for mf in manifests]
     worth_targets = {t for per in resolved for t in per} | {t for items in joint_worth.values() for t in items}
     joint["worth"] = []
@@ -831,15 +1015,27 @@ def _together_compute(inputs: dict, load) -> dict:
                 denominator = float(q @ levels[target])
                 if denominator <= 0 or prices[target]["c"] is None:
                     raise Unavailable(f"{target}'s value cannot be placed against today's price")
+                level = float(levels[target][j])
+                if j in factor_logs:  # where a statement moves the factors, at its betas from where the rows put it
+                    ref = {c: ln(levels[c][j]) for c in factors}
+                    if all(math.isfinite(v) for v in (*ref.values(), *factor_logs[j].values())):
+                        level *= resp.departure(target, factor_logs[j], ref)
                 entries[target] = {"target": target, "link": "rows:" + target, "asof": m0["asof"],
-                                   "value": {"amount": float(prices[target]["c"] * levels[target][j] / denominator)},
+                                   "value": {"amount": float(prices[target]["c"] * level / denominator)},
                                    "c": prices[target]["c"], "price_basis": prices[target]["basis"]}
         joint["worth"] += [{**item, "on": wid, "world": None} for item in entries.values()]
-    joint["joint_prices"] = {n: {ids[j]: float(levels[n][j]) for j in rows_set + [cells.index(baseline)]}
-                             for n in names if n not in worth_targets and n not in response_names}
-    joint["joint_responses"] = {n: {ids[j]: float((levels if n in response_names else responses)[n][j])
-                                    for j in rows_set + [cells.index(baseline)]}
+    every = rows_set + [cells.index(baseline)]
+    joint["joint_prices"] = {n: {**{ids[j]: float(levels[n][j]) if n in levels else resp.level(n, factors_at(j))
+                                    for j in every}, **name_levels.get(n, {})}
+                             for n in sorted(set(names) | set(name_levels))
+                             if n not in worth_targets and n not in response_names}
+    joint["joint_responses"] = {n: {**{ids[j]: float((levels if n in response_names else responses)[n][j])
+                                       for j in every},
+                                    **{ids[j]: float((levels if n in response_names else responses)[n][j])
+                                       for j in stated_js}}
                                 for n in names if n not in worth_targets and (n in response_names or n in responses)}
+    joint["joint_moving"] = joint_moving
+    joint["joint_references"] = {ids[j]: {c: ln(levels[c][j]) for c in factors} for j in stated_js}
     joint["joint_cases"] = {wid: {k: v for i, (e, w) in enumerate(zip(events, cell))
                                   for k, v in _world_case(e, w, trees[i]["nodes"][w]).items()}
                             for wid, cell in zip(ids, cells)}
@@ -860,10 +1056,34 @@ def _together_compute(inputs: dict, load) -> dict:
         raise Unavailable(valued.get("why") or "the joint worlds' prices cannot be placed")
     view = {"events": events, "baseline": base, "worlds": [], "assumptions": assumed,
             **{k: valued[k] for k in ("expected", "volatility", "worst_outcome")}, "events_read": []}
+    # in each joint world, the prices a statement fixes: those the joint world's own statements set, each with its link
+    # and the joint world it is stated on, and those a row states in its event's world there, with the events and what
+    # their shock is against, the baseline (its whole move held) or what it follows (its residual held); every
+    # other price moves with them (1.9). Each joint world's P&L against the one in which every event is at its
+    # baseline, in three parts (impact.baseline_parts), counts the factors named here as set.
+    def fixed(j: int) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for target, by in kept_by(j).items():  # held as a residual only where every row states one (above)
+            out[target] = {"rows": [events[i] for i, _ in by],
+                           schema.AGAINST: schema.FOLLOWS if all(a == schema.FOLLOWS for _, a in by) else schema.BASELINE}
+        for i, per in enumerate(resolved):
+            for target, by_world in per.items():
+                if cells[j][i] in by_world:
+                    out.setdefault(target, {"rows": []})["rows"].append(events[i])
+        for target, (cons, st) in setting.get(j, {}).items():
+            out[target] = {"link": cons["link"], "on": st["id"]}
+        for target, item in joint_worth.get(j, {}).items():
+            out[target] = {"link": item["link"], "on": worth_on[j][target]}
+        return dict(sorted(out.items()))
+    named = [fixed(j) for j in range(len(ids))]
+    split = impact.baseline_parts(valued["parts"], base, {wid: {c for c in factors if c in named[j]}
+                                                          for j, wid in enumerate(ids)})
     for wid, cell in zip(ids, cells):
+        j = ids.index(wid)
         view["worlds"].append({"id": wid, "outcomes": dict(zip(events, cell)), **valued["worlds"][wid],
                                "factors": valued["against_baseline"][wid],
-                               "by": {"stated": stated_by[wid]} if wid in stated_by else "rows"})
+                               **({"against_baseline_parts": split[wid]} if wid in split else {}),
+                               "set": named[j] or "nothing"})
     for i, (pid, out) in enumerate(zip(events, outputs)):
         av = {}
         for side in ("yes", "no"):
@@ -879,14 +1099,14 @@ def _together_compute(inputs: dict, load) -> dict:
                                              load)
         except Unavailable as e:
             view["considering"] = {k: inputs["considering"][k] for k in ("market", "side", "quantity")} | {"why": str(e)}
-    drawn = {**inputs["distribution"], "centre": valued, "contract_receipt": inputs["horizon"]["receipt"],
-             "valuation": {**joint, "contracts": inputs["horizon"]["contracts"],
-                           "contract_states": inputs["horizon"]["states"]}}
+    drawn = {**inputs["distribution"], "centre": valued, "contract_receipt": inputs["paying"]["receipt"],
+             "valuation": {**joint, "contracts": inputs["paying"]["contracts"],
+                           "contract_states": inputs["paying"]["states"]}}
     view["distribution"] = distribution._compute(drawn, load)
     return view
 
 
-TOGETHER = Derivation("together", 6, "Proposition", _together_inputs, _together_compute,
+TOGETHER = Derivation("together", 12, "Proposition", _together_inputs, _together_compute,
                       applies=lambda store, key: False)
 DERIVATIONS = (TOGETHER,)
 
@@ -920,9 +1140,19 @@ def read(store, selected: list[str], considering: dict | None = None) -> dict:
     out["factors"] = [{"factor": c["id"], "name": c["stated"]["name"],
                        **({"yield": c["stated"]["yield"]} if c["stated"].get("duration") is not None else {})}
                       for c in factors]
-    out["worlds"] = [{**w, "factors": {c: worlds.in_its_terms(stated.get(c) or {}, x) for c, x in w["factors"].items()}}
+    out["worlds"] = [{**w, "factors": {c: worlds.in_its_terms(stated.get(c) or {}, x) for c, x in w["factors"].items()},
+                      **({"against_baseline_parts": _named(w["against_baseline_parts"], stated)}
+                         if w.get("against_baseline_parts") else {})}
                      for w in out["worlds"]]
     return {**out, "basis": found.basis}
+
+
+def _named(parts: dict, factors: dict[str, dict]) -> dict:
+    """A joint world's three parts against the baseline, the largest moving factor with its name."""
+    top = parts.get("largest_moving")
+    if not top:
+        return parts
+    return {**parts, "largest_moving": {**top, "name": (factors.get(top["factor"]) or {}).get("name", top["factor"])}}
 
 
 def _check_contract(contract):

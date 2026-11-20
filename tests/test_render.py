@@ -113,8 +113,34 @@ class Read:
 
 
 def said(row, reader=None):
-    from harness.render import figures_text, sentences
+    """A row's figures as one line of text, as the page shows them: each label with its figure, separated by
+    semicolons, what reads beside a figure after a comma or the separator its aside names."""
+    from harness.render import sentences
     return figures_text(sentences(reader or Read(), row))
+
+
+def sentences_text(parts: list) -> str:
+    """Parts as text: a label and its figure, with what reads beside the figure after a comma, or after the separator
+    its aside names."""
+    from harness.render import WAITING
+    out = []
+    for part in parts:
+        if isinstance(part, str):
+            out.append(part)
+        elif part == WAITING:
+            continue
+        elif part[0] == "b":
+            out.append(part[1] + " ")
+        elif part[0] == "aside":
+            out.append((part[2] if len(part) > 2 else ", ") + sentences_text(part[1]))
+        else:
+            out.append(part[1])
+    return "".join(out)
+
+
+def figures_text(rows: list[list]) -> str:
+    """A row's figures as one line of text: each label with its figure, separated by semicolons."""
+    return "; ".join(sentences_text(row) for row in rows) + "." if rows else ""
 
 
 SECTION_10 = {"id": "prop:1", "probability": 0.1891, "range": [0.10, 0.33], "coverage": 0.77, "yes": -2829.33,
@@ -128,7 +154,7 @@ def test_a_rows_sentences_read_each_kind_in_its_form_and_the_full_impact_as_yes_
     """A forecast to one decimal; what the event does in whole dollars, the full impact as Yes less No as they
     are shown (−$2,829 less +$660), its exact figure one click away; each largest contributor with its amount."""
     assert said(SECTION_10) == (
-        f"Forecast 18.9%, market-implied range 10.0%–33.0%; Yes {MINUS}$2,829; No +$660; Full impact "
+        f"Forecast 18.9%, market range 10.0%–33.0%; Yes {MINUS}$2,829; No +$660; Full impact "
         f"{MINUS}$3,489; Largest contributors NVDA {MINUS}$1,250, AAPL {MINUS}$801, MSFT {MINUS}$499, through QQQ.")
 
 
@@ -148,18 +174,18 @@ def test_a_probability_its_statements_leave_open_reads_as_the_range_they_leave_a
     """MATH.md 1.2; ONTOLOGY.md 2.1; TOOLS.md 9: a proposition's forecast, or the range its statements leave it, in
     its place, in the form of the market-implied range, a floor or a ceiling alone where it has one; the market-implied
     range beside it only where the two differ as shown; nothing in its place where it is anywhere from 0 to 1; and
-    where the statements cannot all hold, the market-implied range under its own label (the page shows nothing whose
+    where the statements cannot all hold, the market range under its own label (the page shows nothing whose
     purpose is a fault)."""
     waiting = {"yes": None, "no": None, "full_impact": None, "contributors": None, "probability": None}
     same = {**SECTION_10, **waiting, "range": [0.0, 0.02], "coverage": 0.98,
             "left_open": {"lo": 0.0, "hi": 0.02, "settled_by": [], "with": []}}
-    assert said(same) == "Forecast ≤ 2.0%."  # not "market-implied range ≤ 2.0%" as well
+    assert said(same) == "Forecast ≤ 2.0%."  # not "market range ≤ 2.0%" as well
     wider = {**same, "left_open": {"lo": 0.05, "hi": 0.3, "settled_by": []}, "range": [0.0, 0.33], "coverage": 0.67}
-    assert said(wider) == "Forecast 5.0%–30.0%, market-implied range ≤ 33.0%."
+    assert said(wider) == "Forecast 5.0%–30.0%, market range ≤ 33.0%."
     nothing = {**same, "left_open": {"lo": 0.0, "hi": 1.0, "settled_by": []}, "range": [0.0, 1.0], "coverage": 0.0}
     assert said(nothing) == ""  # not "our estimate": no chance gives it
     held = {**same, "left_open": None, "cannot_hold": [{"statements": ["link:1", "prop:1.chances[0]"]}]}
-    assert said(held) == "Market-implied range ≤ 2.0%."
+    assert said(held) == "Market range ≤ 2.0%."
     for row in (same, wider, nothing, held):
         assert not any(w in said(row) for w in ("open", "cannot", "restated", "finished"))
 
@@ -167,9 +193,9 @@ def test_a_probability_its_statements_leave_open_reads_as_the_range_they_leave_a
 def test_a_range_markets_bound_on_one_side_reads_as_at_least_or_at_most():
     """A floor and no ceiling, or a ceiling and no floor, each in its words."""
     floor = {**SECTION_10, "range": [0.10, 1.0], "coverage": 0.10}
-    assert said(floor).startswith("Forecast 18.9%, market-implied range ≥ 10.0%; Yes")
+    assert said(floor).startswith("Forecast 18.9%, market range ≥ 10.0%; Yes")
     ceiling = {**SECTION_10, "range": [0.0, 0.33], "coverage": 0.67}
-    assert said(ceiling).startswith("Forecast 18.9%, market-implied range ≤ 33.0%; Yes")
+    assert said(ceiling).startswith("Forecast 18.9%, market range ≤ 33.0%; Yes")
     from harness.render import sentences, sentences_html
     html = sentences_html(sentences(Read(), ceiling)[0])
     assert html.count('data-go="x:interval:prop:1"') == 1  # the one bound opens the range
@@ -178,14 +204,14 @@ def test_a_range_markets_bound_on_one_side_reads_as_at_least_or_at_most():
 def test_a_row_with_no_consequence_shows_the_first_sentence_only():
     row = {**SECTION_10, "probability": 0.345, "range": [0.33, 0.36], "coverage": 0.97, "yes": None, "no": None, "full_impact": None,
            "contributors": None}
-    assert said(row) == "Forecast 34.5%, market-implied range 33.0%–36.0%."
+    assert said(row) == "Forecast 34.5%, market range 33.0%–36.0%."
 
 
 def test_names_held_directly_name_no_fund():
     row = {**SECTION_10, "probability": 0.0995, "range": [0.099, 0.1], "coverage": 0.999, "yes": 2850.0, "no": -315.0,
            "full_impact": 3165.0, "contributors": [{"name": "name:AAPL", "through": [], "full_impact": 3165.0}]}
     assert said(row) == (
-        f"Forecast 10.0%, market-implied range 9.9%–10.0%; Yes +$2,850; No {MINUS}$315; Full impact "
+        f"Forecast 10.0%, market range 9.9%–10.0%; Yes +$2,850; No {MINUS}$315; Full impact "
         f"+$3,165; "
         f"Largest contributors AAPL +$3,165.")
 
@@ -195,7 +221,7 @@ def test_a_value_being_worked_out_has_its_place_and_one_not_there_has_none():
     waiting = {**SECTION_10, "probability": None, "yes": None, "no": None, "full_impact": None, "contributors": None}
     first = sentences(Read({"structure"}), waiting)[0]
     assert WAITING in first  # being read: a placeholder where it sits
-    assert said(waiting) == "Market-implied range 10.0%–33.0%."  # no forecast there: the range under its own label
+    assert said(waiting) == "Market range 10.0%–33.0%."  # no forecast there: the range under its own label
     assert said({**waiting, "range": [0.0, 1.0], "coverage": 0.0}) == ""  # nothing to say of it: no sentence
     dollars = sentences(Read({"impact"}), {**SECTION_10, "yes": None, "no": None, "full_impact": None, "contributors": None})
     assert len(dollars) == 5 and all(row.count(WAITING) == 1 for row in dollars[1:])
@@ -233,8 +259,8 @@ def test_a_markets_chip_shows_its_price(tmp_path):
         w.link(w.prop(mid), "asks", mid)
     got = chips(w.store, [near, wide, "market:polymarket:9"])
     # its book as observed, whatever its width
-    assert (got[near]["label"], got[near]["value"]) == ("Will the US raise tariffs?", "YES bid 28\u00a2 \u00b7 ask 33\u00a2")
-    assert got[wide]["value"] == "YES bid 4\u00a2 \u00b7 ask 19\u00a2"
+    assert (got[near]["label"], got[near]["value"]) == ("Will the US raise tariffs?", "Yes bid 28\u00a2 \u00b7 Ask 33\u00a2")
+    assert got[wide]["value"] == "Yes bid 4\u00a2 \u00b7 Ask 19\u00a2"
     assert got["market:polymarket:9"] == {"label": "market:polymarket:9", "value": "", "exists": False}
     w.store.close()
 
@@ -253,7 +279,7 @@ def test_a_forecast_its_statements_leave_open_shows_the_conditional_probabilitie
     with w.store.lock:
         opened = event_view(Reader(w.store), e)["html"]
     inputs = re.sub(r"<[^>]+>", "|", opened.split('data-k="inputs"', 1)[1])
-    assert inputs.count("Conditional probability") == 2 and inputs.count("Analyst input") == 2
+    assert inputs.count("Chances") == 1 and "Conditional probability" not in inputs and "Analyst input" not in inputs
     assert "|30.0%|" in inputs and "|60.0%|" in inputs
     w.store.close()
 
@@ -273,11 +299,11 @@ def test_a_markets_price_opens_to_its_book_as_observed_and_the_midpoint_of_its_b
         w.link(w.prop(mid), "asks", mid)
     text = lambda html: re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", unescape(html)))  # noqa: E731
     shown = text(view(w.store, f"x:price:{wide}")["html"])
-    assert "YES bid 4\u00a2" in shown and "YES ask 19\u00a2" in shown and "Midpoint 11.5\u00a2" in shown
-    assert "(4\u00a2 + 19\u00a2) / 2 = 11.5\u00a2" in shown
+    assert "Bid 4\u00a2" in shown and "Ask 19\u00a2" in shown and "Midpoint 11.5\u00a2" in shown
+    assert "/ 2" not in shown  # the midpoint between them, by where it sits: no arithmetic
     assert "10.0%" not in shown and "last trade:" not in shown.lower() and "apart" not in shown
     lone = text(view(w.store, f"x:price:{one}")["html"])
-    assert "YES bid 30\u00a2" in lone and "YES ask none" in lone and "Midpoint" not in lone
+    assert "Bid 30\u00a2" in lone and "Ask none" in lone and "Midpoint" not in lone
     w.store.close()
 
 
@@ -424,7 +450,7 @@ def test_the_receipts_read_an_event_with_ways_from_its_outcomes(tmp_path):
     from test_impact import channel, event, world
     from test_ways import way
     from breakdown import stated
-    from harness.render import Reader, figures_text, sentences, view
+    from harness.render import Reader, sentences, view
     from harness.ledger import row
     w = world(tmp_path, g={"SPY": 100_000.0}, coefficients={"SPY": {}}, levels={"SPY": 600.0})
     e = event(w, p=0.30)
@@ -435,24 +461,75 @@ def test_the_receipts_read_an_event_with_ways_from_its_outcomes(tmp_path):
     import re
     text = lambda html: re.sub(r"<[^>]+>", "", html)  # noqa: E731  the page's text, as a reader reads it
     vol = text(view(w.store, f"x:volatility:{e}")["html"])
-    for title, p_, A in (("the first way", "21.0000%", f"{MINUS}$2,213.07"), ("the second way", "9.0000%",
-                                                                              f"{MINUS}$17,653.11"),
-                         ("No", "70.0000%", "+$2,933.61")):
-        assert f"{title}probability {p_}{A}" in vol
-    assert "21.0000% × (−$2,213.07)²" in vol and "9.0000% × (−$17,653.11)²" in vol and "70.0000% × $2,933.61²" in vol
-    assert "±$5,924.50" in vol and "Within Yes" in vol and "Within No" not in vol and "√(p × (1 − p))" not in vol
+    # each outcome's P&L on one scale with its probability; the volatility their spread; no formula
+    for title, p_, A in (("the first way", "21.0%", f"{MINUS}$2,213"), ("the second way", "9.0%", f"{MINUS}$17,653"),
+                         ("No", "70.0%", "+$2,934")):
+        assert f"{title}Probability {p_}{A}" in vol
+    assert "±$5,924" in vol and "Within Yes" in vol and "Within No" not in vol and "√" not in vol
     swing = text(view(w.store, f"x:swing:{e}")["html"])
-    assert "(21.0000% × (−$2,213.07) + 9.0000% × (−$17,653.11)) / 30.0000%" in swing and f"{MINUS}$6,845.08" in swing
-    assert "(1 − p) × full impact" not in swing
+    assert f"Yes{MINUS}$6,845" in swing and "0000%" not in swing  # Yes, its ways at their probabilities
+    assert "(1 − p) × full impact" not in swing and "Priced in" not in swing
     said = figures_text(sentences(Reader(w.store), row(w.store, e)))
     assert f"Worst outcome {MINUS}$17,653 · the second way, 9.0%" in said and "Expected value" not in said
-    w.store.edit(second, "priced_in", stated(0.15))
+    w.store.edit(second, "priced_in", stated(0.15, "the second way's own reason"))
     r = row(w.store, e)
     said = figures_text(sentences(Reader(w.store), r))
     assert f"Expected value {amount(r['expected'])}" in said
     swing = text(view(w.store, f"x:swing:{e}")["html"])
-    assert "Expected value" in swing and money(r["yes"], sign=True) in swing  # Yes, its outcomes at their probabilities
-    assert "(21.0000% × (" in swing and "(1 − p) × full impact" not in swing
+    assert "Expected value" in swing and amount(r["yes"]) in swing  # Yes, its outcomes at their probabilities
+    assert "(1 − p) × full impact" not in swing
+    # the expected value's working names the weight the outcomes are placed at (MATH.md 1.5), beside its probability
+    from html import unescape
+    assert "Priced inthe second way15.0%Probability 9.0%the second way's own reason" in unescape(swing)
+    w.store.close()
+
+
+def test_a_stated_weight_shows_with_the_assumptions_as_the_store_reads_it_beside_its_probability_and_basis(tmp_path):
+    """What today's prices are taken to carry, where the analyst states it (MATH.md 1.5), shows under the
+    event's assumptions: the outcome it is stated on, the weight the store reads for it beside that outcome's
+    probability, and its basis. A figure on a way shows as stated; a market's probability on the event is read live
+    from its book through the side it asks, with the time of that reading, so a new reading moves it. Where nothing is
+    stated nothing shows; weights that cannot hold together (1.10) stand as stated, which the analyst reads in check()."""
+    import re
+    from html import unescape
+    from test_impact import channel, event, world
+    from test_ways import way
+    from breakdown import stated
+    from harness.render import moment, view
+    from harness.ledger import row
+    w = world(tmp_path, g={"SPY": 100_000.0}, coefficients={"SPY": {}}, levels={"SPY": 600.0})
+    e = event(w, p=0.30)
+    first = way(w, e, "the first way", side="yes", weight=0.7)
+    second = way(w, e, "the second way", side="yes")
+    w.link(first, "consequence", channel(w, "SPY"), shock=-0.05)
+    w.link(second, "consequence", channel(w, "SPY"), shock=-0.2)
+
+    def priced() -> str:  # the Priced in section as a reader reads it, or nothing
+        html = view(w.store, e)["html"]
+        at = html.find('data-k="priced"')
+        return "" if at < 0 else unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html[at:html.index("</section>", at)])))
+
+    assert priced() == ""
+    w.store.edit(second, "priced_in", stated(0.15, "the second way's own reason"))
+    said = priced()
+    assert "the second way 15.0% Probability 9.0%" in said and "the second way's own reason" in said
+    assert "Read from" not in said and "Yes" not in said
+    m = w.market("e", "Will E happen?", 0.30, 0.40)
+    w.link(e, "asks", m)
+    w.store.edit(e, "priced_in", stated({"value": {"market": m}}))
+    got = row(w.store, e)["priced_in"]["yes"]
+    said = priced()
+    assert "Yes 35.0% Probability" in said and "the second way 15.0%" in said
+    assert f"Read from Will E happen? · Yes bid 30¢ · Ask 40¢ · {moment(got['at'])}" in said
+    w.set_book(m, 0.50, 0.60)
+    w.store.put_data("book", m, w.books[m], {"endpoint": "/books"}, retrieved_at="2026-11-04T18:00:00+00:00")
+    said = priced()
+    assert "Yes 55.0% Probability" in said and f"Ask 60¢ · {moment('2026-11-04T18:00:00+00:00')}" in said
+    assert "cannot hold together" not in said
+    w.store.edit(first, "priced_in", stated(0.30))  # each way of Yes now states one, and they come to 45%, not 55%
+    said = priced()
+    assert "the first way 30.0%" in said and "the second way 15.0%" in said and "cannot hold" not in said
+    assert "Yes 55.0% Probability" in said  # the market's weight, read as it stands, where the weights cannot hold
     w.store.close()
 
 
@@ -460,11 +537,13 @@ def test_where_the_weight_is_reads_three_ways_each_adding_to_the_portfolio_as_sh
     """MATH.md 3.1: the portfolio's weight by company, by industry and by country, each list shown whole adding to the
     portfolio's value as the panel shows it and to 100.0%, what is not a company under its kind; a company held both
     directly and through a fund with its two parts, adding to it; an industry or a country opening to its companies,
-    which add to it. NVDA is $5,000 held and $2,400 through FUND, XOM $1,400 through FUND, cash $1,000."""
+    which add to it, each by the id the store gives it, which a company's page and a chip open too. NVDA is $5,000 held
+    and $2,400 through FUND, XOM $1,400 through FUND, cash $1,000."""
     import copy
     import re
     from test_impact import holding_world
-    from harness.render import Reader, portfolio_panel, view
+    from harness.derive.owned import country_id, industry_id
+    from harness.render import Reader, chips, portfolio_panel, view
     w = holding_world(tmp_path)
 
     class Placed(Reader):  # the store's own weights, each company given an industry and a country
@@ -477,13 +556,14 @@ def test_where_the_weight_is_reads_three_ways_each_adding_to_the_portfolio_as_sh
             for c in got["by_company"]:
                 if c.get("name") in place:
                     c["industry"], c["country"] = place[c["name"]]
+                    c["industry_id"], c["country_id"] = industry_id(c["industry"]), country_id(c["country"])
             kinds = [g for g in got["by_industry"] if g.get("kind")]
-            got["by_industry"] = [{"industry": "Semiconductors", "sector": "Technology", "dollars": 7400.0,
-                                   "companies": 1, "names": ["name:NVDA"]},
-                                  {"industry": "Oil & Gas Integrated", "sector": "Energy", "dollars": 1400.0,
-                                   "companies": 1, "names": ["name:XOM"]}] + kinds
-            got["by_country"] = [{"country": "US", "country_name": "United States", "dollars": 8800.0, "companies": 2,
-                                  "names": ["name:NVDA", "name:XOM"]}] + kinds
+            got["by_industry"] = [{"id": industry_id(i), "industry": i, "sector": sector, "dollars": dollars,
+                                   "companies": 1, "names": [n]} for i, sector, dollars, n in (
+                ("Semiconductors", "Technology", 7400.0, "name:NVDA"),
+                ("Oil & Gas Integrated", "Energy", 1400.0, "name:XOM"))] + kinds
+            got["by_country"] = [{"id": "country:US", "country": "US", "country_name": "United States", "dollars": 8800.0,
+                                  "companies": 2, "names": ["name:NVDA", "name:XOM"]}] + kinds
             return got
 
     import harness.render as render
@@ -508,8 +588,16 @@ def test_where_the_weight_is_reads_three_ways_each_adding_to_the_portfolio_as_sh
         rows = re.findall(r'<tr class="(?:|more)">(.*?)</tr>', country)
         assert sum(float(plain(cells(r)[-2]).strip("$").replace(",", "")) for r in rows) == 8_800
         assert "$8,800" in country and "88.0%" in country
-        semis = view(w.store, "industry:Semiconductors")["html"]
+        semis = view(w.store, "industry:semiconductors")["html"]
         assert "$7,400" in semis and "Technology" in semis and "through FUND" in semis
+        assert 'data-go="industry:oil-gas-integrated"' in view(w.store, "weights:industry")["html"]
+        about = view(w.store, "name:NVDA")["html"]
+        assert 'data-go="industry:semiconductors"' in about and 'data-go="country:US"' in about
+        named = chips(w.store, ["industry:semiconductors", "country:US", "industry:gold"])
+        assert (named["industry:semiconductors"]["label"], named["industry:semiconductors"]["value"]) == \
+            ("Semiconductors", "74.0%")
+        assert named["country:US"]["label"] == "United States" and named["industry:gold"]["exists"] is False
+        assert view(w.store, "industry:gold")["title"] == "Not found"  # as any id that names nothing the store holds
         from test_impact import event
         from harness.ledger import moves
         from harness.render import amount
@@ -601,63 +689,63 @@ def test_an_event_reads_as_its_outcomes_in_the_ledger_the_tree_the_prices_and_ea
     head = grid.split("</thead>", 1)[0]
     assert re.findall(r'<th class="side" colspan="(\d)">(Yes|No)', head) == [("2", "Yes"), ("1", "No")]
     assert re.findall(r'<th data-outcome="([^"]+)"', head) == [first, second, "no"]  # a way under its side
-    assert re.search(r'data-outcome="no"[^>]*><span class="otag">baseline', head)
+    assert re.search(r'data-outcome="no"[^>]*><span class="otag">Baseline', head)
     assumed = html.split('data-k="assumptions"', 1)[1].split("</table>", 1)[0]  # the prices, beside the outcomes
     levels = assumed.split('class="v-levels"', 1)[1].split("</tbody>", 1)[0]
-    assert ">$586.72<" in levels and ">$494.08<" in levels and ">$617.60<" in levels and "today $600.00" in levels
+    assert ">$586.72<" in levels and ">$494.08<" in levels and ">$617.60<" in levels and "Today $600.00" in levels
     moves = assumed.split('class="v-moves"', 1)[1].split("</tbody>", 1)[0]
     assert ">−5.00%<" in moves and ">−20.00%<" in moves  # each way's stated shock, opening its basis
     # each move in the colour of its direction: these fall
     assert re.search(r' loss">−5\.00%<', moves) and re.search(r' loss">−20\.00%<', moves)
     assert 'class="n base"></td>' in moves and "\u2014" not in moves  # the baseline moves against itself: blank
     shown = re.sub(r"<[^>]+>", "", view(w.store, f"x:outcome:{e}:{second}")["html"])
-    assert "Each holding" in shown and shown.count("−$17,653.11") >= 2  # the outcome's P&L, and its holdings' sum
-    assert "the whole move on" not in shown and "its own whole move" in shown
-    receipt_ = shown.split("Dollar beta × move", 1)[1].split("Each holding", 1)[0]  # the engine's parts (1.6)
-    assert "$100,000.00 × −17.6531%" in receipt_ and receipt_.count("−$17,653.11") == 2  # 494.08 / 600 − 1
+    held = shown.split("Holdings", 1)[1].split("Prices", 1)[0]
+    assert shown.count("−$17,653") >= 2 and "−$17,653" in held  # the outcome's P&L, and where it lands
+    prices = shown.split("Prices", 1)[1]
+    assert "−20.00%" in prices and "$494.08" in prices and "its own" not in shown  # its shock, the level it places
+    parts = re.sub(r"<[^>]+>", "|", view(w.store, f"x:parts:{e}:{second}")["html"])  # the engine's parts (1.6)
+    # the one factor: its dollar beta, its placed move 494.08 / 600 − 1, and what they give, which is the P&L
+    assert "|$100,000|" in parts and "|−17.65%|" in parts and parts.count("|−$17,653|") == 3
     w.store.close()
 
 
 def test_a_probability_its_chances_fix_opens_to_total_probability_over_what_they_are_given(tmp_path):
-    """E given D at 0.8 and given not D at 0.1, with D's market at 0.30: the probability opens to each case of D with
-    its probability and the share of it in which E is true, and their sum, 0.3 x 0.8 + 0.7 x 0.1 = 0.31, with the basis
-    of each chance."""
+    """E given D at 0.8 and given not D at 0.1, with D's market at 0.30: the probability opens to a contribution
+    breakdown naming D and Not D directly in 1-decimal percentages (30.0% x 80.0% = 24.0% and 70.0% x 10.0% = +7.0%,
+    summing to 31.0%), with the rationale for each conditional share."""
+    import re
     from breakdown import World
-    from harness.render import operand, view
+    from harness.render import view
     w = World(tmp_path / "scratch-receipt")
     e, d = w.prop("E"), w.prop("D")
     w.link(d, "asks", w.market("D", "D?", 0.28, 0.32))
     w.chances(e, {"given": [d], "value": 0.8}, {"given_not": [d], "value": 0.1})
     w.link("portfolio", "watches", e)
     html = view(w.store, f"x:p:{e}")["html"]
-    assert f"{operand(0.3)} × {operand(0.8)} + {operand(0.7)} × {operand(0.1)} = {operand(0.31)}" in html
-    import re
-    text = re.sub(r"<[^>]+>", "", html)
-    assert "P(E | A)" in text and "P(E | not A)" in text and text.count("Basis for P(E") == 2
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
+    assert "Analyst input 30.0% 80.0% 24.0%" in text  # each case's probability, share and contribution, each labelled
+    assert "70.0% 10.0% +7.0%" in text and "31.0%" in text and "×" not in text
+    assert "Not D" in text and text.count("Rationale ·") == 2 and "0000%" not in text
     w.store.close()
 
 
 def test_a_case_its_statements_leave_open_shows_its_range_and_its_symbol_in_the_sum(tmp_path):
     """E given A at 0.3 and given not A at 0.3 fixes E at 0.3 whatever A's probability, which nothing settles (MATH.md 1.2):
-    each case shows the range its statements leave it, 0 to 1, with its share by its chance, and the sum keeps the
-    case's symbol where its probability is open, so every figure shown is one the store gives. Opened, each case's
-    lane says what its share is, the event's share of a part whose range is 0 to 1, and draws no share whose ends
-    nothing fixes; a proposition whose own probability is open shows none."""
+    each case shows the range its statements leave it, 0.0%–100.0%, with its 30.0% conditional share, summing to 30.0%."""
     import re
 
     from breakdown import World
-    from harness.render import Reader, event_view, operand, view
+    from harness.render import Reader, event_view, view
     w = World(tmp_path / "scratch-open-case")
     e, a = w.prop("E"), w.prop("A")
     w.chances(e, {"given": [a], "value": 0.3}, {"given_not": [a], "value": 0.3})
     w.link("portfolio", "watches", e)
-    text = re.sub(r"<[^>]+>", "", view(w.store, f"x:p:{e}")["html"])
-    assert f"{operand(0.0)}–{operand(1.0)}" in text  # each case's range, in place of a probability
-    assert f"= P(A) × {operand(0.3)} + P(not A) × {operand(0.3)} = {operand(0.3)}" in text
-    assert text.count("Analyst input") == 2
+    text = re.sub(r"<[^>]+>", " ", view(w.store, f"x:p:{e}")["html"])
+    assert "0.0%–100.0%" in text and "30.0%" in text and "×" not in text
+    assert text.count("Analyst input") == 2 and "0000%" not in text
     opened = event_view(Reader(w.store), e)["html"]
     inputs = re.sub(r"<[^>]+>", "|", opened.split('data-k="inputs"', 1)[1].split('data-k="none"', 1)[0])
-    assert inputs.count("Conditional probability") == 2 and inputs.count("Analyst input") == 2
+    assert inputs.count("Chances") == 1 and "Conditional probability" not in inputs and "Analyst input" not in inputs
     assert inputs.count("|30.0%|") == 2 and "ours" not in inputs
     w.store.close()
 
@@ -693,7 +781,7 @@ def test_an_event_its_statements_leave_open_shows_what_it_has_and_nothing_that_n
     assert re.search(r"−\$[\d,]+", cells[0][1]) and "P&amp;L" not in grid  # against the baseline, never as P&L
     assert "Each holding against the baseline" in grid and not any(f in text(opened) for f in faults[:5])
     working = text(view(w.store, f"x:p:{e}")["html"])
-    assert "Forecast range" in working and "What sets the ceiling" in working
+    assert "Lower bound" in working and "What sets the upper bound" in working
     assert "The chance of" in working and not any(f in working for f in faults[:5])
     w.store.close()
 
@@ -717,10 +805,10 @@ def test_a_stretched_book_is_a_step_of_its_probabilitys_working_and_its_market_r
     w.link(e, "way", b, side="yes")
     text = lambda html: re.sub(r"<[^>]+>", "", html)  # noqa: E731
     shown = view(w.store, f"x:p:{b}")["html"]
-    assert f"Stretched below its bid{operand(0.07)}" in text(shown) and "within its book as stretched" in text(shown)
+    assert "Stretched 7.0% below its bid" in text(shown) and "Read with related markets" in text(shown)
     assert "held" not in shown  # a step of the working, in ordinary ink
     drawing = event_view(Reader(w.store), e)["html"].split('data-k="mv"', 1)[1].split('data-k="history"', 1)[0]
-    assert "tretched" not in drawing and 'title="YES bid 10¢ · ask 14¢"' in drawing  # the book as its venue quotes it
+    assert "tretched" not in drawing and 'title="Yes bid 10¢ · Ask 14¢"' in drawing  # the book as its venue quotes it
     assert f'data-go="{b}"' in drawing
 
     f = w.prop("F")
@@ -728,7 +816,7 @@ def test_a_stretched_book_is_a_step_of_its_probabilitys_working_and_its_market_r
     w.link("portfolio", "watches", f)
     w.chances(f, {"value": 0.40})
     shown = text(view(w.store, f"x:p:{f}")["html"])
-    assert f"stretched {operand(0.06)} above its ask" in shown and "Markets that ask it" in shown
+    assert "Stretched 6.0% above its ask" in shown and "Markets that ask it" in shown
     w.store.close()
 
 
@@ -826,7 +914,7 @@ def test_the_portfolios_volatility_keeps_its_place_while_a_reply_works_it_out_ag
 
 
 def test_dollar_cash_has_no_move_and_cash_in_another_currency_moves_with_its_rate():
-    """Cash in dollars responds to nothing, so the portfolio panel and the download show it no move; cash in another
+    """Cash in dollars responds to nothing, so the portfolio panel shows it no move; cash in another
     currency moves with its rate, and a share or a fund moves with its price (MATH.md 3.1)."""
     from harness.render import _has_move
     assert not _has_move({"to": "cash:USD"})
@@ -834,14 +922,14 @@ def test_dollar_cash_has_no_move_and_cash_in_another_currency_moves_with_its_rat
 
 
 def test_cash_opens_as_the_holding_it_is_and_only_cash_in_another_currency_shows_a_move(tmp_path):
-    """MATH.md 3.1: dollar cash and cash in a currency are holdings, cash:{CURRENCY}. The portfolio panel and the
-    download give dollar cash no move, since it responds to nothing; cash in another currency moves with its rate. Each
+    """MATH.md 3.1: dollar cash and cash in a currency are holdings, cash:{CURRENCY}. The portfolio panel gives
+    dollar cash no move, since it responds to nothing; cash in another currency moves with its rate. Each
     opens as the holding it is, never as a listing that shares its code (USD is also a fund's ticker); a chip names it
     as the page does, with its value."""
     from massive_data import SESSIONS, put_rate
     from test_portfolio import flat_prices, hold, names
     from harness.derive import default_registry
-    from harness.render import Reader, chips, ledger_markdown, portfolio_panel, view
+    from harness.render import Reader, chips, portfolio_panel, view
     from harness.store import Store
 
     store = Store.create(tmp_path / "scratch-cash", registry=default_registry())
@@ -858,11 +946,9 @@ def test_cash_opens_as_the_holding_it_is_and_only_cash_in_another_currency_shows
             chip = chips(store, ["cash:USD"])["cash:USD"]
         row = lambda hid: panel.split(f'data-k="{hid}"', 1)[1].split("</li>", 1)[0]  # noqa: E731
         assert 'class="mv' not in row(holds["cash:USD"]) and 'class="mv' in row(holds["cash:EUR"])
-        assert dollars_["title"] == "Cash" and "$500.00" in dollars_["html"] and "Day change" not in dollars_["html"]
-        assert euros["title"] == "Cash in EUR" and "$220.00" in euros["html"] and "Day change" in euros["html"]
+        assert dollars_["title"] == "Cash" and "$500.00" in dollars_["html"] and 'class="lab">Today<' not in dollars_["html"]
+        assert euros["title"] == "Cash in EUR" and "$220.00" in euros["html"] and 'class="lab">Today<' in euros["html"]
         assert (chip["label"], chip["value"]) == ("cash", "$500.00")
-        lines = {ln.split(" | ")[0]: ln for ln in ledger_markdown(store).splitlines() if ln.startswith("| Cash")}
-        assert lines["| Cash"].endswith("|  |") and lines["| Cash in EUR"].endswith("| $0.00 (0.00%) |")
     finally:
         store.close()
 
@@ -917,7 +1003,7 @@ def test_the_markets_show_nothing_of_the_judge(tmp_path):
             judged = [r["id"] for r in store.db.execute("SELECT id FROM judgment")]
             opened = [view(store, j) for j in judged]
         drawing = opened_event.split('data-k="mv"', 1)[1]
-        assert 'title="YES bid 20¢ · ask 42¢"' in drawing and 'title="YES bid 40¢ · ask 45¢"' in drawing
+        assert 'title="Yes bid 20¢ · Ask 42¢"' in drawing and 'title="Yes bid 40¢ · Ask 45¢"' in drawing
         assert "x:check" not in opened_event and "judge" not in opened_event.lower() and ">same<" not in opened_event
         assert "can resolve" not in opened_event and "can be true where" not in opened_event
         assert judged and all(o["title"] == "Not found" for o in opened)
@@ -946,14 +1032,18 @@ def test_a_shock_stated_as_a_factors_residual_opens_to_its_working(tmp_path):
     store = w.store
     with store.lock:
         opened = view(store, own)
+        worked = view(store, f"x:shock:{own}")  # the shock's own figure opens its whole move and residual
         chip, other = (chips(store, [own, shock])[x]["value"] for x in (own, shock))
-    html = unescape(opened["html"])
-    assert opened["title"].startswith("Shock to") and "the residual" in html
-    assert "Residual" in html and "From the factors above" in html and "Whole move" in html
-    assert "Factor shock" not in html and "own part" not in html.lower() and "what it follows" not in html
-    # the compounded moves as what they are, adding, then the move they come to as the grid shows it: one figure each
-    assert "\u22120.105361" in html and "\u22120.071811" in html and "\u22120.177171" in html
-    assert "\u221216.24%" in html and "\u221210.5361%" not in html
+    face = unescape(opened["html"])
+    assert opened["title"].startswith("Shock to") and '<h3 class="sub">Residual</h3>' in face  # the form, named once
+    assert f'data-go="x:shock:{own}"' in face and "\u221210.00%" in face
+    html = unescape(worked["html"])
+    assert "Residual" in html and "Whole move" in html and ">Response<" in html  # what the market gives it, between
+    for shown in (face, html):
+        assert "Factor shock" not in shown and "own part" not in shown.lower() and "what it follows" not in shown
+    # each outcome's whole move and residual in the shock's terms, the residual as stated in bold; no logarithms
+    assert '<td class="n st"><span class="n v">\u221210.00%</span></td>' in html and "\u221216.24%" in html
+    assert "\u22120.105361" not in html and "ln(" not in html and "\u221210.5361%" not in html
     assert chip == "residual \u221210.00%" and other == "whole move \u22125.00%"
     assert _how_set_there(store, {"by": "own", "stated": {"value": -0.1, "against": schema.FOLLOWS}}) == \
         "its own residual"
@@ -982,16 +1072,16 @@ def test_a_market_standing_as_the_proposition_it_asks_reads_by_its_question_and_
     shown = text(opened)
     assert m not in shown and "No market bears" not in shown and "Will it happen?" in text(drawing) and "**" not in shown
     inputs = text(opened.split('data-k="inputs"', 1)[1])
-    assert "Will it happen?Conditional probability80.0%Analyst input" in inputs
-    assert "NotWill it happen?Conditional probability5.0%Analyst input" in inputs
-    assert 'title="YES bid 29¢ · ask 31¢"' in drawing
+    assert "Will it happen?80.0%" in inputs
+    assert "NotWill it happen?5.0%" in inputs
+    assert 'title="Yes bid 29¢ · Ask 31¢"' in drawing
     assert m not in text(view(w.store, f"x:p:{e}")["html"])
     w.store.close()
 
 
 def test_the_probability_draws_the_markets_its_forecast_rests_on_and_no_other(tmp_path):
     """MATH.md 1.2: an event's probability tab draws each market its forecast rests on: its own book, the books of
-    the propositions its conditional probabilities are given, and those its market-implied range rests on. A
+    the propositions its conditional probabilities are given, and those its market range rests on. A
     proposition tied to the event only by a conditional probability of its own, given the event, is another event's
     breakdown: its market is read with the event's, and the event's forecast does not rest on it, so it is not drawn."""
     from breakdown import World, stated
@@ -1007,7 +1097,417 @@ def test_the_probability_draws_the_markets_its_forecast_rests_on_and_no_other(tm
     with w.store.lock:
         of_e = event_view(Reader(w.store), e)["html"].split('data-k="mv"', 1)[1].split('data-k="history"', 1)[0]
         of_f = event_view(Reader(w.store), f)["html"].split('data-k="mv"', 1)[1].split('data-k="history"', 1)[0]
-    assert 'title="YES bid 59¢ · ask 60¢"' in of_e and "Will F happen?" not in of_e and "bid 78.0%" not in of_e
+    assert 'title="Yes bid 59¢ · Ask 60¢"' in of_e and "Will F happen?" not in of_e and "bid 78.0%" not in of_e
     # F rests on E: E's book is drawn, and each of F's conditional probabilities names E's market once, by its question
-    assert 'title="YES bid 59¢ · ask 60¢"' in of_f and 'title="YES bid 78¢ · ask 84¢"' in of_f
+    assert 'title="Yes bid 59¢ · Ask 60¢"' in of_f and 'title="Yes bid 78¢ · Ask 84¢"' in of_f
+    w.store.close()
+
+
+def test_workbench_surfaces_distinguish_events_matrix_and_inspector_and_pair_payoff_with_stated_shocks(tmp_path):
+    """Watched events open in the master-detail stage (`surface == "event"`), the cross-holding view in the matrix
+    stage (`surface == "matrix"`), and calculations or objects in the inspector drawer (`surface == "inspector"`).
+    On an opened event, the Outcomes tab leads with immediate repricing payoff bars and stated scenario shocks."""
+    from test_impact import channel, event, holding_world
+    from harness.render import Reader, portfolio_panel, view
+    w = holding_world(tmp_path)
+    spy = channel(w, "SPY")
+    e = event(w, p=0.25)
+    lid = w.link(e, "consequence", spy, shock=-0.12)
+    with w.store.lock:
+        ev = view(w.store, e)
+        mat = view(w.store, "byholding")
+        calc = view(w.store, f"x:swing:{e}")
+        hold = view(w.store, "name:NVDA")
+        port = portfolio_panel(Reader(w.store))
+    assert ev["surface"] == "event" and mat["surface"] == "matrix"
+    assert calc["surface"] == "inspector" and hold["surface"] == "inspector"
+    assert 'data-k="payoff"' in ev["html"] and 'data-payoff="now"' in ev["html"]
+    assert 'data-k="drivers"' in ev["html"] and f'data-go="x:consequence:{lid}"' in ev["html"]
+    assert 'data-total="$10,000.00"' in port
+    w.store.close()
+
+
+def test_forecast_view_renders_ladder_interpolation_and_sum_of_ways_without_symbolic_algebra(tmp_path):
+    """A date between two markets' dates: the forecast on its scale with the bounds those markets set, each window's
+    probability, share and contribution under their labels at one decimal, the contributions adding to the forecast,
+    with no arithmetic written out, and the two markets as its bounds in percent; an event whose Yes side splits into
+    exclusive ways shows their probabilities summing to its forecast."""
+    import re
+    from breakdown import World, stated
+    from harness.render import view
+    w = World(tmp_path / "scratch-forecast-bridge")
+    m1 = w.market("m1", "Reopens before March 1?", 0.22, 0.25)
+    m2 = w.market("m2", "Reopens before April 1?", 0.33, 0.35)
+    e = w.prop("Reopens by March 12", end="2027-03-12")
+    w.store.edit(e, "chances", [stated({
+        "given": [m2], "given_not": [m1], "reading": "even",
+        "through": {m1: "2027-02-28", m2: "2027-03-31"},
+    })])
+    w.link("portfolio", "watches", e)
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", view(w.store, f"x:p:{e}")["html"]))
+    assert "Lower bound 22.0%" in text and "Upper bound 35.0%" in text and "12 of 31 days" in text  # on its scale
+    assert "Window Probability Chance Contribution By Feb 28, 2027 From its market 23.5% 100.0% 23.5%" in text
+    # each bounding market: its midpoint the probability it is read as, its book as the venue quotes it
+    assert "Bounds" in text and "34.0%" in text and "Yes bid 33¢ · Ask 35¢" in text and "Market rungs" not in text
+    assert "10.5% 38.7% +4.1% Forecast (by Mar 12, 2027) 27.6%" in text
+    assert "×" not in text and "0000%" not in text and "P(E" not in text
+
+    parent = w.prop("Parent event", end="2027-03-12")
+    w1 = w.prop("First branch", chance=0.03)
+    w2 = w.prop("Second branch")
+    w.chances(w2, {"given_not": [w1], "value": 0.012})
+    w.link(parent, "way", w1, side="yes")
+    w.link(parent, "way", w2, side="yes")
+    w.link("portfolio", "watches", parent)
+    p_text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", view(w.store, f"x:p:{parent}")["html"]))
+    assert "First branch 3.0% Second branch +1.2% Forecast 4.2%" in p_text
+    w.store.close()
+
+
+
+
+from test_name_window import funds  # noqa: E402,F401  (a fixture: a fund on one reference, a fund of two, a company)
+from test_shock_windows import four  # noqa: E402,F401  (a fixture: four factors, one quoted as a yield)
+
+
+def _saturday_before(iso: str) -> tuple[str, str]:
+    """The Saturday before a weekday, which has no close, and the Friday whose close a window from it runs from."""
+    from datetime import date, timedelta
+    d = date.fromisoformat(iso)
+    sat = d - timedelta(days=(d.weekday() + 2) % 7 or 7)
+    return sat.isoformat(), (sat - timedelta(days=1)).isoformat()
+
+
+def _section(html: str, start: str, end: str = '<h3 class="sub">') -> str:
+    """The part of a view from `start` to the next section's heading."""
+    part = html[html.index(start) + len(start):]
+    return part[:part.index(end)] if end in part else part
+
+
+def test_a_shock_opens_beside_what_its_price_did_over_each_past_window_it_is_sized_from(four):
+    """MATH.md 1.3, 1.5, ONTOLOGY.md 2, MATH.md 3.2: a shock's drawer answers how large it is and why. Under its form, the whole move or
+    the residual, the shock as stated and then what its price did over each past window it is sized from stand on one
+    scale, each the store's figure (shock_windows) in the shock's terms, each opening its working; the two closes a
+    window ran between show where they are not its dates. Then the price in each outcome in the shock's unit, a yield
+    in percent, the baseline marked, each level opening how it is placed: each outcome's weight and its move against
+    the baseline, from today's level. A move's direction is its sign and its side of zero: nothing here is coloured as
+    a gain or a loss. A residual that is not measured says so, its working still giving the whole move. The window's
+    working sets each factor's whole move over it, as the analyst reads it with window_returns, beside its move in each
+    world the shock applies in."""
+    from html import unescape
+    from test_impact import channel, event
+    from test_shock_windows import W1, W2, returns, shock, windows_of
+    from harness import schema
+    from harness.derive.impact import FOLLOWED, MOVE
+    from harness.ledger import MOVES_WITH
+    from harness.render import _dates, day, level, move, points, view
+    from massive_data import SESSIONS, put_bars
+    from test_name_window import closes
+    w = four
+    spy, tlt, gld, uso = (channel(w, t) for t in ("SPY", "TLT", "GLD", "USO"))
+    e = event(w, p=0.3)
+    saturday, friday = _saturday_before(W2["end"])
+    late = {"start": saturday, "end": W2["end"]}
+    market = w.store.link(e, "consequence", spy, shock(-0.12, [W1, late]))["id"]
+    bonds = w.store.link(e, "consequence", tlt, shock(-0.4, [W2]))["id"]
+    store = w.store
+    with store.lock:
+        face, working = (unescape(view(store, x)["html"]) for x in (market, f"x:window:{market}:0"))
+        bonds_face, placed = (unescape(view(store, x)["html"]) for x in (bonds, f"x:level:{bonds}"))
+    measured = windows_of(store, market)
+    assert [x["sessions"] for x in measured] == [[W1["start"], W1["end"]], [friday, W2["end"]]]
+    sizes = _section(face, '<h3 class="sub">Whole move</h3>')
+    assert sizes.index(f">{move(-0.12)}<") < sizes.index(f">{move(measured[0][MOVE])}<")  # the shock first, as stated
+    for i, x in enumerate(measured):  # each window's whole move as the store measures it, opening its working
+        assert f'data-go="x:window:{market}:{i}"' in sizes and f">{move(x[MOVE])}<" in sizes
+    assert sizes.count('class="sz-seg') == 3 and "Residual" not in sizes
+    # the market is the first factor: its whole move is its residual in every outcome, so its shock opens no step
+    # that would say one figure twice; the long bond's differ, by what the market gives it, and its shock opens them
+    assert f'data-go="x:shock:{market}"' not in face and f'data-go="x:shock:{bonds}"' in bonds_face
+    assert f"Closes {day(friday)}" not in sizes  # a window's closes are its dates: said once
+    assert f"Closes {day(friday, year=False)} and {day(W2['end'])}" in sizes  # from a Saturday: the Friday's close
+    for shown in (face, working, bonds_face):  # a move is neither a gain nor a loss
+        assert 'class="n gain' not in shown and 'class="n loss' not in shown
+    # a yield's shock and windows in points, and its levels as the yield in each outcome, the baseline marked
+    assert f">{points(windows_of(store, bonds)[0][MOVE])}<" in _section(bonds_face, '<h3 class="sub">Whole move</h3>')
+    levels = _section(bonds_face, '<h3 class="sub">Levels</h3>')
+    assert ">Yield<" in levels and "%<" in levels and "$" not in levels and ">Baseline<" in levels
+    assert f'data-go="x:level:{bonds}"' in levels
+    # how a level is placed: each outcome's weight, its move against the baseline and its level, and today's level
+    # under them at the whole weight: no formula
+    # the weights by the word the outcome gives them: its probability, where no weight is stated
+    assert ">Probability<" in placed and ">vs baseline<" in placed and "\u03a3" not in placed and "Baseline =" not in placed
+    assert ">30.0%<" in placed and ">70.0%<" in placed and ">100.0%<" in placed  # at p = 0.3, and today
+    assert '<tr class="tot"><th>Today</th>' in placed and ">Yield<" in placed
+    # the working: the window's dates, both figures, and every factor over the window beside its move in the world
+    assert _dates(W1["start"], W1["end"]) in working and "From the close on" not in working and "0000%" not in working
+    read = returns(w, W1)
+    wf = working[working.index('<table class="cmp wf">'):]
+    for c, x in read.items():
+        over = points(x[MOVE]) if c == tlt else move(x[MOVE])
+        assert f">{over}<" in wf, (c, over)
+    assert ">Window<" in wf and ">Yes<" in wf and "Shock" in working and MOVES_WITH.capitalize() in working
+    assert '<h3 class="sub">Factors</h3>' in working
+    # a residual on gold sized from a window over which oil's proxy has no first close: its residual is not measured
+    put_bars(store, "USO", {d: c for d, c in closes(store, "USO").items() if d >= SESSIONS[-50]})
+    gold = store.link(e, "consequence", gld, shock(0.04, [W1], schema.FOLLOWS))["id"]
+    with store.lock:
+        face, working = (unescape(view(store, x)["html"]) for x in (gold, f"x:window:{gold}:0"))
+    (x,) = windows_of(store, gold)
+    sizes = _section(face, '<h3 class="sub">Residual</h3>')
+    assert x[FOLLOWED] is None and "Not measured" in sizes
+    assert move(x[MOVE]) not in sizes  # the whole move does not stand in for the residual
+    assert f">{move(x[MOVE])}<" in working and "Not measured" in working
+
+
+def test_a_shock_sized_from_no_window_shows_its_figure_without_a_scale(four):
+    """A shock that names no past window has nothing to set beside it: its row gives its figure and draws no bar."""
+    from html import unescape
+    from test_impact import channel, event
+    from harness.render import move, view
+    w = four
+    e = event(w, p=0.3)
+    lid = w.store.link(e, "consequence", channel(w, "SPY"), {"shock": {"value": -0.05, "note": "Judged."}})["id"]
+    with w.store.lock:
+        face = unescape(view(w.store, lid)["html"])
+    sizes = _section(face, '<h3 class="sub">Whole move</h3>')
+    assert f">{move(-0.05)}<" in sizes and "sz-seg" not in sizes and "po-track" not in sizes
+
+
+def test_a_shock_on_a_name_opens_its_window_to_its_response_and_residual(funds):
+    """MATH.md 1.4, 3.2: a residual on a company sized from a past window: the window's working gives the name's whole
+    move, its response and its residual, each as window_returns gives it the analyst."""
+    from html import unescape
+    from harness import schema
+    from harness.derive.impact import FOLLOWED
+    import re
+    from harness.render import move, view
+    from harness.tools import Tools
+    from harness.world import World
+    from test_name_window import END, START
+    from test_shock_windows import shock
+    e = funds.add("Proposition", {"title": "E", "text": "E happens", "comparison": "occurs", "kind": "hitting",
+                                  "window_end": "2027-03-31", "baseline": "no"})["id"]
+    window = {"start": START, "end": END}
+    a = funds.link(e, "consequence", "name:A", shock(-0.1, [window], schema.FOLLOWS))["id"]
+    ok, read = Tools(World(funds, None)).call("window_returns", {**window, "names": ["name:A"]})
+    assert ok, read
+    (name,) = read["names"]
+    with funds.lock:
+        face, working = (unescape(view(funds, x)["html"]) for x in (a, f"x:window:{a}:0"))
+    assert ">Residual<" in face and f">{move(name[FOLLOWED])}<" in face
+    # the name's whole move, its response and its residual as rows of one column, at two decimals: no formula, no fit
+    assert "Response" in working and f">{move(name['response'])}<" in working and f">{move(name[FOLLOWED])}<" in working
+    assert "(1 +" not in working and "fitted" not in working and "0000%" not in working
+    # one place for the exact values, and inside it the factors' window it was measured with, one step further
+    (target,) = re.findall(r'data-go="([^"]+)">Full details<', working)
+    assert "Factors, full details" not in working
+    with funds.lock:
+        record = unescape(view(funds, target)["html"])
+    assert re.search(r'"<a class="go rec" data-go="raw:[^"]+">cmp:\d+</a>"', record)
+
+
+def _rows_shown(html: str) -> list[tuple[bool, str, int]]:
+    """An outcome's rows of dollars as shown, in order: whether each is set in under the row above, its label, and
+    its figure in whole dollars."""
+    import re
+    from html import unescape
+    out = []
+    for under, label, figure in re.findall(r'<div class="hb-row( under)?"><div class="sz-lab"><span class="sz-t">(.*?)'
+                                           r'</span>.*?<div class="sz-v">(.*?)</div></div>', html):
+        shown = unescape(re.sub(r"<[^>]+>", "", figure)).strip()
+        dollars = 0 if shown == "\u2013" else int(shown.replace("\u2212", "-").replace("+", "").replace("$", "")
+                                                       .replace(",", ""))
+        out.append((bool(under), unescape(re.sub(r"<[^>]+>", "", label)), dollars))
+    return out
+
+
+def test_an_outcome_leads_with_where_its_pnl_lands_each_fund_with_its_companies_and_what_is_left_of_its_move(
+        tmp_path, monkeypatch):
+    """MATH.md 1.6, 1.7: an outcome's drawer leads with where its P&L lands. Each holding's P&L there, in whole dollars
+    that add to the outcome's as shown; under a fund, each company it carries and what is left of each fund's move, a
+    fund held inside it named by its fund, adding to the holding's figure as shown, the companies past the largest
+    folded under a line that carries what they come to. The store's own parts add to each holding in every world and
+    on each side, which is what lets the page round them to add as shown. Today's prices carry each outcome at its
+    probability, so the head gives the probability alone; with a weight stated, the weight stands beside it."""
+    import re
+    from harness import render
+    from harness.render import amount, chance, view
+    from rows_fixture import cash, holding, on_index
+    from test_value_and_exposure import impact_of, store_with
+    rows = {"F": [holding("A", 0.5), holding("G", 0.2), cash(0.3), on_index(1.0, [("A", 0.3), ("C", 0.7)])],
+            "G": [holding("A", 0.4), holding("C", 0.6)]}
+    store = store_with(tmp_path, rows, [{"ticker": "F", "dollars": 1000.0}, {"ticker": "A", "dollars": 500.0},
+                                        {"cash": 200.0}], {"F": "ETF", "G": "ETF", "A": "CS", "C": "CS"}, seed=3)
+    out = impact_of(store, 0.3, names={"A": -0.10}, market=-0.05)
+    e = next(p["id"] for p in store.query("Proposition"))
+    for h in out["by_holding"]:  # the store's parts of each fund add to it, in each world and on each side
+        if h["remainders"]:
+            for key in ("yes", "no"):
+                parts = sum(n[key] for n in h["names"]) + sum(r[key] for r in h["remainders"])
+                assert parts == pytest.approx(h[key], abs=1e-9)
+                assert sum(n["worlds"][key] for n in h["names"]) + sum(r["worlds"][key] for r in h["remainders"]) == \
+                    pytest.approx(h["worlds"][key], abs=1e-9)
+    monkeypatch.setattr(render, "NAMES_SHOWN", 1)  # a fold, on a fund of two companies
+    html = view(store, f"x:outcome:{e}:yes")["html"]
+    a_yes = out["worlds"]["yes"]["A"]
+    hero = re.search(r'<div class="fig">(.*?)</div>', html).group(1)
+    assert amount(a_yes) in hero and f"x:parts:{e}:yes" in hero  # its P&L, opening what moved it
+    head = html.split('class="ofacts"', 1)[1].split("</div>", 1)[0]
+    assert "Probability" in head and chance(out["worlds"]["yes"]["p"]) in head and "Priced in" not in head
+    held = html.split('<h3 class="sub">Holdings</h3>', 1)[1].split("<h3", 1)[0]
+    shown = re.sub(r'</summary>.*?</details>', "</summary></details>", held, flags=re.S)  # as it opens
+    rows_ = _rows_shown(shown)
+    top = [(label, x) for under, label, x in rows_ if not under]
+    assert sum(x for _, x in top) == int(amount(a_yes).replace("\u2212", "-").replace("+", "").replace("$", "")
+                                         .replace(",", ""))
+    assert [label for label, _ in top][0] == "F"  # the largest first
+    fund = []
+    for under, label, x in rows_[1:]:
+        if not under:
+            break
+        fund.append((label, x))
+    assert sum(x for _, x in fund) == top[0][1]  # F's companies, its fold and what is left of each fund add to F
+    labels = [label for label, _ in fund]
+    assert "Rest of F" in labels and "Rest of G" in labels and "1 more" in labels
+    folded = re.search(r'<details class="hb-more"><summary>(.*?)</summary>(.*?)</details>', held, flags=re.S)
+    assert sum(x for _, _, x in _rows_shown(folded.group(2))) == _rows_shown(folded.group(1))[0][2]
+    store.edit(e, "priced_in", {"value": 0.1, "note": "Today's prices carry E at a tenth."})
+    head = view(store, f"x:outcome:{e}:yes")["html"].split('class="ofacts"', 1)[1].split("</div>", 1)[0]
+    assert "Priced in" in head and "10.0%" in head
+    store.close()
+
+
+def test_an_outcome_marks_each_price_by_how_it_is_set_there_against_the_baseline(tmp_path):
+    """MATH.md 1.3, 1.5: an outcome's prices, each moved against the baseline: a shock the outcome states, one it
+    takes from the outcome above it, named, each opening its shock and its level opening how it is placed; and a
+    factor moving with the stated ones, quieter, with the key. The baseline moves nothing against itself, so it shows
+    no prices; nothing says a move is the outcome's own."""
+    import re
+    from html import unescape
+    from harness.render import level, view
+    from test_impact import channel, event, world
+    from test_ways import way
+    w = world(tmp_path, g={"SPY": 10_000.0, "USO": 5_000.0}, coefficients={"USO": {"SPY": 0.6}},
+              levels={"SPY": 600.0, "USO": 80.0})
+    e = event(w, p=0.4)
+    first = way(w, e, "the first way", side="yes", weight=0.6)
+    second = way(w, e, "the second way", side="yes")
+    spy, oil = channel(w, "SPY"), channel(w, "USO")
+    on_event = w.link(e, "consequence", oil, shock=0.2)
+    on_way = w.link(first, "consequence", spy, shock=-0.1)
+    one, two, base = (unescape(view(w.store, f"x:outcome:{e}:{x}")["html"]) for x in (first, second, "no"))
+    prices = one.split('<h3 class="sub">Prices</h3>', 1)[1]
+    market, crude = (re.search(rf'<tr><th>[^<]*<a[^>]*data-go="{c}"[^>]*>.*?</tr>', prices, re.S).group(0)
+                     for c in (spy, oil))
+    assert f'x:consequence:{on_way}' in market and "−10.00%" in market and "From" not in market
+    assert f'x:consequence:{on_event}' in crude and "+20.00%" in crude and "From the event" in crude
+    assert f'x:level:{on_event}' in crude and "USO" in crude  # a factor's level is its proxy's price
+    assert "Moves with the stated ones" not in prices  # every price set there is a shock
+    filled = two.split('<h3 class="sub">Prices</h3>', 1)[1]
+    market = re.search(rf'<tr><th>[^<]*<a[^>]*data-go="{spy}"[^>]*>.*?</tr>', filled, re.S).group(0)
+    assert 'class="n im"' in market and "x:consequence" not in market and "x:level" not in market
+    assert "Shock" in filled and "Moves with the stated ones" in filled  # the key, where both kinds stand
+    assert '<h3 class="sub">Prices</h3>' not in base and "its own" not in one + two
+    assert ">vs baseline<" in prices  # what each move is measured from, as its column's label
+    w.store.close()
+
+
+def test_a_page_opens_to_what_rests_on_it_and_its_text_marks_each_passage_where_the_store_finds_it(tmp_path):
+    """ONTOLOGY.md 2: a page, opened from the question it answers. Its title as its fetch records it, its site and when it
+    was read; each statement that rests on it as the page names it, with its figure, and the passages it quotes in the
+    page's words; then its text, after its front matter, each passage marked where the store finds it, across the
+    page's links, emphasis, escapes and line breaks, as the store checks each is quoted word for word; opened at one
+    passage, that one marked as such."""
+    import hashlib
+    import re
+    from html import unescape
+    from harness.render import QUOTED, HERE, _words_at, view
+    from harness.store import words
+    from test_impact import channel, event, world
+    w = world(tmp_path, g={"SPY": 10_000.0})
+    text = ("---\ntitle: What the last episode did\nmeta-description: An episode, read again.\n---\n\n# The episode\n\n"
+            "The price of X **fell** by a [tenth](/x/tenth) in the last episode.\nThe book was one trader's, and \\$5"
+            " a contract.\n\n![a chart](https://example.org/chart.png)\n\n| Year | Move |\n|---|---|\n| 2020 | -10% |\n")
+    sid = w.store.put_page("https://example.org/episode", text, retrieved_at="2026-11-02T12:00:00+00:00")
+    cited = {"shock": "X fell by a tenth in the last episode. The book", "chance": "and \\$5 a contract",
+             "evidence": "The price of X"}
+    e = event(w, p=0.3)
+    w.store.link(e, "consequence", channel(w, "SPY"),
+                 {"shock": {"value": -0.1, "source_id": sid, "passages": [cited["shock"]]}})
+    a = w.prop("A")
+    w.store.edit(a, "chances", [{"given": [e], "value": 0.5, "source_id": sid, "passages": [cited["chance"]]}])
+    w.store.link(a, "evidence", sid, {"passages": [cited["evidence"]]})
+    page = unescape(view(w.store, sid)["html"])
+    assert "What the last episode did" in page and "example.org" in page and "read Nov 2, 2026" in page
+    rests = re.findall(r'<p class="rs-k">(.*?)</p>.*?<span class="rs-t">(.*?)</span>(?:<span class="rs-v">(.*?)</span>)?'
+                       r'</div>((?:<blockquote.*?</blockquote>)*)', page, re.S)
+    by = {k: (re.sub(r"<[^>]+>", "", t), re.sub(r"<[^>]+>", "", v), re.findall(r'data-go="([^"]+)"[^>]*>(.*?)</a>', q))
+          for k, t, v, q in rests}
+    assert set(by) == {"Shock", "Chance", "Evidence"}
+    assert by["Shock"][1] == "whole move −10.00%" and by["Chance"][1] == "50.0%" and by["Evidence"][1] == ""
+    assert "given “E”" in by["Chance"][0] and by["Evidence"][0] == "A"
+    hashed = {k: f"x:passage:{sid}:{hashlib.sha256(p.encode()).hexdigest()[:12]}" for k, p in cited.items()}
+    # each passage in the page's words, opening the page's text there
+    assert by["Shock"][2] == [(hashed["shock"], "X fell by a tenth in the last episode. The book")]
+    assert by["Chance"][2] == [(hashed["chance"], "and $5 a contract")]
+    assert f'data-go="x:passage:{sid}:"' in page  # the page's text, whole, one step further
+    for opened in (None, "shock"):
+        shown = unescape(view(w.store, hashed[opened] if opened else f"x:passage:{sid}:")["html"])
+        md = re.search(r'data-md="([^"]*)"', shown).group(1)
+        assert "meta-description" not in md and md.startswith("# The episode")  # the page, after its front matter
+        plain, marks, depth = [], [], {QUOTED: 0, HERE: 0}  # each character, and how it is marked, as the page marks it
+        for c in md:
+            pair = next((x for x in depth if c in x), None)
+            if pair:
+                depth[pair] += 1 if c == pair[0] else -1
+            else:
+                plain.append(c)
+                marks.append("here" if depth[HERE] else "quoted" if depth[QUOTED] else "")
+        said, at = _words_at("".join(plain))
+        spans = {}
+        for k, p in cited.items():
+            i = said.find(words(p))
+            spans[k] = range(at[i], at[i + len(words(p)) - 1] + 1)
+        for k, span in spans.items():  # each passage marked whole, the one opened as such
+            assert all(marks[j] for j in span) and (k != opened or all(marks[j] == "here" for j in span)), k
+        assert all(any(j in span for span in spans.values()) for j, m in enumerate(marks) if m)  # and nothing else
+        assert "[tenth](/x/tenth)" in md and 'data-base="https://example.org/episode"' in shown  # set by the page
+    for sample in (text, "a  [b](u)c **d**\n\n![i](p) e", "  lead [x](y \"t\")  and __z__  "):
+        assert _words_at(sample)[0] == words(sample)  # the marks are found as the store finds a passage
+    w.store.close()
+
+
+def test_an_outcome_with_ways_of_its_own_shows_where_its_pnl_lands(tmp_path):
+    """MATH.md 1.1, 1.7: a way with ways of its own has its worlds' P&L averaged at their probabilities, and so has each
+    holding, each company a fund carries and each fund's remainder (impact `outcomes`): its drawer shows its ways,
+    then its holdings, adding to its P&L as shown, and in each fund the companies and the rest adding to the fund."""
+    from harness.render import amount, view
+    from test_impact import channel, event
+    from test_ways import holding_world, way
+    w = holding_world(tmp_path)
+    e = event(w, p=0.4)
+    first = way(w, e, "first", side="yes", weight=0.6)
+    way(w, e, "second", side="yes")
+    a = way(w, first, "a", weight=0.3)
+    way(w, first, "b")
+    w.link(e, "consequence", channel(w, "SPY"), shock=-0.1)
+    w.link(a, "consequence", "name:NVDA", shock=-0.2)
+    html = view(w.store, f"x:outcome:{e}:{first}")["html"]
+    whole = next(o for o in w.store.engine.value("impact", e).output["outcomes"] if o["id"] == first)["A"]
+    assert '<h3 class="sub">Ways</h3>' in html and '<h3 class="sub">Holdings</h3>' in html
+    import re
+    held = html.split('<h3 class="sub">Holdings</h3>', 1)[1]
+    rows_ = _rows_shown(re.sub(r'</summary>.*?</details>', "</summary></details>", held, flags=re.S))  # as it opens
+    top = [x for under, _, x in rows_ if not under]
+    assert top and sum(top) == int(amount(whole).replace("\u2212", "-").replace("+", "").replace("$", "")
+                                   .replace(",", ""))
+    i = 0
+    while i < len(rows_):  # each holding with parts under it: the parts add to it as shown
+        j = i + 1
+        while j < len(rows_) and rows_[j][0]:
+            j += 1
+        if j > i + 1:
+            assert sum(x for _, _, x in rows_[i + 1:j]) == rows_[i][2], rows_[i][1]
+        i = j
     w.store.close()

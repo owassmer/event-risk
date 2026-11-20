@@ -188,3 +188,47 @@ def test_a_contract_read_from_its_terms_is_a_derivative_wherever_its_kind_is_rea
     assert row["payoff"]["option"]["symbol"] == symbol == "O:4ABC261218C05000000"
     assert Kinds().of(row) == "derivative"
     assert Kinds().of({k: v for k, v in row.items() if k not in ("payoff", "kind")}) == "other"  # its labels alone
+
+
+def test_a_saved_store_whose_fund_holds_a_listed_option_reads_every_number_the_same_on_a_later_day(tmp_path,
+                                                                                                    monkeypatch):
+    """MATH.md 3.1: a listed option counts at the delta its market quotes on the as-of, which its market gives only
+    on the day. A store saved on its as-of and opened with no keys a week later reads the quote it took that day, so
+    the option, the fund's parts and the portfolio's first return read as they did then; the property fails where the
+    contract would be valued from its terms at the as-of's close, which the store never read."""
+    import json
+
+    from harness import touches
+    from harness.derive import default_registry
+    from harness.ledger import holdings
+    from harness.store import Store
+    from massive_data import ASOF, FETCHED, flat_prices
+    from test_one_name import fund, looked, ref
+
+    monkeypatch.setattr(touches, "today", lambda: ASOF)
+    store = Store.create(tmp_path / "scratch-option", registry=default_registry())
+    flat_prices(store)
+    ref(store, "F", "ETF")
+    ref(store, "AAA", "CS")
+    store.put_data("figi_ticker", "AAA", {"status": "OK", "ticker": "AAA", "share_classes": ["FIGIAAA"], "parse": 2},
+                   {"method": "POST", "url": "openfigi"}, retrieved_at=FETCHED, range=(ASOF, ASOF))
+    fund(store, "F", [{"constituent_ticker": "AAA", "figi": "FIGIAAA", "weight": 1.0, "market_value": 1_000_000.0},
+                      {"constituent_ticker": "AAA   261218C00100000", "asset_class": "Option", "weight": -0.01,
+                       "market_value": -10_000.0, "shares_held": -10.0}])  # ten calls written, a delta of 0.5 each
+    store.fetchers["option"] = lambda subject, covering: {
+        "payload": {"status": "OK", "details": {"shares_per_contract": 100, "exercise_style": "american"},
+                    "greeks": {"delta": 0.5}, "underlying_asset": {"ticker": "AAA", "price": 100.0},
+                    "last_quote": {"bid": 9.9, "ask": 10.1, "last_updated": 1762300800000000000}},
+        "request": {"method": "GET", "url": "option"}, "retrieved_at": FETCHED, "range": (ASOF, ASOF)}
+    store.add("Portfolio", {"asof": ASOF, "holdings": [{"ticker": "F", "dollars": 10000.0}]})
+    then = looked(store)
+    assert then["e"] == {"name:AAA": pytest.approx(9500.0)}  # the calls take -0.05 of the fund's exposure to AAA
+    read_then = json.dumps([then, holdings(store)], sort_keys=True, default=str)
+    store.close()
+
+    monkeypatch.setattr(touches, "today", lambda: "2026-11-11")
+    later = Store.open(tmp_path / "scratch-option", registry=default_registry())  # no clients: no key
+    try:
+        assert json.dumps([looked(later), holdings(later)], sort_keys=True, default=str) == read_then
+    finally:
+        later.close()

@@ -89,6 +89,32 @@ def test_a_listing_abroad_has_its_reports_each_quarter_once_and_its_earlier_repo
                             "low_price_target": 2500, "high_price_target": 5000, "currency": "TWD"}
 
 
+def test_a_report_the_calendar_states_as_given_stands_by_its_date_where_no_figures_hold_it():
+    """A company that reports twice a year has no quarter's figures in Yahoo's module, and its calendar reads a report
+    with no EPS figure as a meeting: a report `calendarEvents` states as given, not as an estimate, by the day read,
+    stands by its date alone; one it states as an estimate, or after the day, does not."""
+    def half_yearly(path):
+        if path.startswith("/v10/finance/quoteSummary/1299.HK"):
+            return 200, {"quoteSummary": {"result": [{
+                "earnings": {"financialCurrency": "USD", "earningsChart": {"quarterly": []}},
+                "calendarEvents": {"earnings": {"earningsDate": [{"raw": 1, "fmt": "2026-08-19"}],
+                                                "isEarningsDateEstimate": False}}}]}}
+        if path.startswith("/v10/finance/quoteSummary/0005.HK"):
+            return 200, {"quoteSummary": {"result": [{
+                "earnings": {"earningsChart": {"quarterly": []}},
+                "calendarEvents": {"earnings": {"earningsDate": [{"raw": 1, "fmt": "2026-10-28"}],
+                                                "isEarningsDateEstimate": True}}}]}}
+        if path.startswith("/ws/fundamentals-timeseries"):
+            return 200, {"timeseries": {"result": []}}
+        if path == "/v1/finance/visualization":
+            return 200, {"finance": {"result": [{"documents": [{"columns": [], "rows": []}]}]}}
+        return 404, {}
+    y = yahoo(half_yearly)
+    assert y.record("1299.HK", TODAY)["payload"]["results"] == [{"date": "2026-08-19"}]
+    assert y.record("1299.HK", "2026-08-18")["payload"]["results"] == []  # read before it was given
+    assert y.record("0005.HK", TODAY)["payload"]["results"] == []  # an estimate is no report
+
+
 def test_a_symbol_no_listing_answers_is_its_answer_that_there_is_none():
     assert yahoo(site).record("ZZZZ.T", TODAY)["payload"] == {"status": "NOT_FOUND", "symbol": "ZZZZ.T"}
 
@@ -322,3 +348,29 @@ def test_earnings_come_nearest_the_as_of_first_and_a_limit_keeps_the_nearest(fil
     assert dates(filer.search_company("TSM", "earnings", {"limit": 5})) == [
         "2027-01-22", "2027-04-20", "2027-07-20", "2027-10-20", "2026-10-16"]
     assert dates(filer.search_company("TSM", "earnings", {"sort": "date.desc", "limit": 2})) == ["2027-10-20", "2027-07-20"]
+
+
+def test_a_news_row_is_what_an_article_is_opened_and_judged_by(world):
+    """A news row: when it was published, who wrote it, its headline and teaser, the companies it names, and its page,
+    which holds the article whole at its address; its address where it has no page. The publisher's channels and tags
+    are the search's filters, and not repeated on each row."""
+    rows = world._record_rows("news", {"results": [
+        {"published": "2026-11-17T13:51:20Z", "author": "a writer", "title": "A headline", "teaser": "A teaser.",
+         "channels": ["markets"], "tags": ["top stories"], "tickers": ["AAA", "BBB"], "url": "https://news.example/1",
+         "body": "<p>The article.</p>"},
+        {"published": "2026-11-16T10:00:00Z", "author": "a desk", "title": "Another", "teaser": "Short.",
+         "channels": [], "tags": [], "tickers": ["AAA"], "url": "https://news.example/2"}]}, "2026-11-18T00:00:00+00:00",
+        None)
+    assert set(rows[0]) == {"published", "author", "title", "teaser", "tickers", "page"}
+    assert world.store.source_row(rows[0]["page"]["id"])["url"] == "https://news.example/1"
+    assert set(rows[1]) == {"published", "author", "title", "teaser", "tickers", "url"}
+
+
+def test_a_web_search_gives_each_query_once_with_the_pages_it_found():
+    """A web search's pages under the query each was found by, in the order searched, a query that found none with
+    none, and last each page the answer cited that no query listed."""
+    from harness.world import _by_query
+    got = _by_query(["q1", "q2", "q3"], [{"url": "a", "query": "q1"}, {"url": "b", "query": "q3"},
+                                         {"url": "c", "query": "q1"}, {"url": "d", "query": ""}])
+    assert got == [{"query": "q1", "results": [{"url": "a"}, {"url": "c"}]}, {"query": "q2", "results": []},
+                   {"query": "q3", "results": [{"url": "b"}]}, {"results": [{"url": "d"}]}]

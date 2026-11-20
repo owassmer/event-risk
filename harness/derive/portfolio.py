@@ -37,22 +37,30 @@ from harness.derive.rows import (OCC, close_moment, coins, companies_of, establi
                                  flex_underlying, implied_net_assets, index_identifiers, listed_by_ticker,
                                  option_price, price_subject, report_option_key, reproduced, states_shares,
                                  strike_text, subject_day, index_key, index_symbol, indexes_exposed, notional_codes,
-                                 option_symbol, option_underlying, reached,
+                                 option_symbol, option_underlying, reached, us_listed_terms,
                                  security_tickers, slope_reference, ticker_reference, with_exposure)
 from harness.derive.engine import Derivation, Inputs, Unavailable, Waiting, canonical
-from harness.derive.identity import (COMPANY_TYPES, FUND_TYPES, MAPPINGS, RECEIPTS, Lookup, abroad,
-                                     company_id, held_identifiers, own_ticker, resolve, row_key, unresolved, us_ticker)
+from harness.derive.identity import (COMPANY_TYPES, FUND_TYPES, MAPPINGS, RECEIPTS, Lookup, abroad, class_id,
+                                     company_id, entities, held_identifiers, issuers, own_ticker, resolve, row_key,
+                                     unresolved, us_ticker)
+from harness.venues.gleif import valid_lei
 from harness.venues.yahoo import region_of
 from harness.observations import read_today
 from harness.venues.massive import answered
 
 log = logging.getLogger("harness.derive")  # a read that failed past its retries, for us: the analyst never sees it
 
-# A row's exposure to a company under a quarter of a percent of its fund's net assets, in absolute value and at the
-# product of the weights on the path to it, reaches no name: it is a negligible part of the fund, while resolving it to
-# its company takes reads of several sources, and the fund's own response carries it. One whose ISIN or FIGI is a
-# company's the portfolio already names reaches it whatever its size, with no read.
-FLOOR = 0.0025
+# How much a company matters to the portfolio is one measure, its share of the portfolio after look-through (MATH.md 3.1).
+# A security becomes its company's name where the portfolio's exposure to it, held directly and through every fund at
+# the product of the weights on the path, long and short netted, is at least this share of the portfolio's value at the
+# closes its day's move is measured from (floor_base). Below it, a security is part of its fund's own move: resolving it
+# takes reads of several sources, and the portfolio's weight by industry and by country counts it all the same. One
+# whose identifiers are a company's the portfolio names reaches it whatever its size, with no read.
+FLOOR = 0.0005
+# A holding under this share of its fund is a negligible part of it, which says nothing of the portfolio: what the fund
+# holds lists it with the rest, summed (what_it_holds), and shares of other companies that come to less than it leave a
+# fund on one reference measured on its slope (harness.derive.rows.slope_reference).
+FUND_NEGLIGIBLE = 0.0025
 NAME_TYPES = COMPANY_TYPES  # a share of a company is a name: harness.derive.identity
 CLOSED_END = "FUND"  # Massive's type of a closed-end fund, expanded from its Form N-PORT report (MATH.md 3.1)
 # the funds ETF Global, which gives exchange-traded funds' holdings, gives none of: a closed-end fund and a mutual fund,
@@ -754,6 +762,32 @@ def _valid_rows(payload: Any) -> tuple[dict, ...]:
     return kept
 
 
+def floor_base(holdings: dict) -> dict[str, float]:
+    """Each holding's share of the portfolio by which the floor reads a security's (FLOOR), by the security held: its
+    shares at the close its day's move is measured from, against the whole portfolio's value there; a holding
+    with no such close, as cash or a contract held, at its value now. So the companies the floor names change
+    with what the funds hold and with the sessions' closes, and never with a minute's mark."""
+    worth: dict[str, float] = defaultdict(float)
+    for row in holdings["holds"].values():
+        close, quantity = row.get("previous_close"), row.get("quantity")
+        worth[row["security"]] += quantity * close if close is not None and quantity is not None else row["dollars"]
+    total = sum(worth.values())
+    return {s: x / total for s, x in worth.items()} if total else {}
+
+
+def floor_key(row: dict) -> str | None:
+    """The security a fund's row, or a derivative's company, is summed under across funds and held directly before
+    anything is read of it (FLOOR): its ISIN, or the one its US CUSIP makes; else its FIGI; else its ticker where it
+    trades."""
+    isin = isin_of(row)
+    if isin:
+        return f"isin:{isin}"
+    if row.get("figi"):
+        return f"figi:{row['figi']}"
+    ticker = row.get("constituent_ticker") or row.get("ticker")
+    return f"ticker:{ticker}@{row.get('country_of_exchange') or ''}" if ticker else None
+
+
 def _targets(row: dict) -> list[tuple[dict, float]]:
     """The companies a fund's row is exposed to, by the rows' contract (harness.derive.rows: `exposure`, signed, per
     dollar of the net assets it is stated against; `payoff`; `to`), each as resolution reads it, with its exposure per
@@ -903,7 +937,7 @@ def what_it_holds(fund: str, payload: Any, references: dict, dollars: float, pri
                   us: frozenset[str] = frozenset(), resolved: Callable[[dict], dict] | None = None,
                   kinds: Kinds | None = None, funds: dict[str, list[dict]] | None = None) -> dict | None:
     """What a fund holds, from its holdings, every row with a weight counted whether or not the look-through prices
-    it: each holding of at least the floor by name, with its ticker as the fund gives it, where it is listed, its kind
+    it: each holding of at least FUND_NEGLIGIBLE of the fund by name, with its ticker as the fund gives it, where it is listed, its kind
     of asset, its industry where its company is confirmed, its weight, and its dollars of the portfolio's, and the name
     the store prices it as; the rest summed, with how many and how they divide; and the whole fund divided by where its
     holdings are listed and by kind of asset, in the one set of kinds every source's words are put in
@@ -922,7 +956,7 @@ def what_it_holds(fund: str, payload: Any, references: dict, dollars: float, pri
         return None
     named, rest = [], []
     for r, w in sorted(rows, key=lambda x: -abs(x[1])):
-        if abs(w) < FLOOR:
+        if abs(w) < FUND_NEGLIGIBLE:
             rest.append((r, w))
             continue
         found = resolved(r) if resolved is not None and _resolvable(r) else {}
@@ -1039,13 +1073,14 @@ def _series_ahead(ctx: Inputs, tickers, asof: str) -> None:
 
 
 def _listings_ahead(ctx: Inputs, rows: Iterable[dict], asof: str) -> None:
-    """Start the reads of each listing a fund's shares trade under, by which the portfolio's weights class each company
-    by industry and home first (harness.derive.owned): which listings follows from the rows alone, by the rule the
-    weights read them by, so they are read while the look-through is, and the weights find them read. They wait behind
-    none of the look-through's own reads."""
+    """Start the reads of FinanceDatabase's rows of each listing a fund's shares trade under and of each ISIN they
+    carry, by which the portfolio's weights class each company by industry and home (harness.derive.owned): which
+    follows from the rows alone, by the rule the weights read them by, so they are read while the look-through is, and
+    the weights find them read. They wait behind none of the look-through's own reads."""
     from harness.derive.owned import symbols_of  # it reads this module's as-of
-    ctx.prefetch("listing_sector", [f"{s}@{asof[:7]}" for s in symbols_of(r for r in rows if _is_listed(r))],
-                 (asof, asof), wait=False, later=True)
+    listed = [r for r in rows if _is_listed(r)]
+    ctx.prefetch("equity", [f"symbol:{s}" for s in symbols_of(listed)] +
+                 sorted({f"isin:{i}" for i in (isin_of(r) for r in listed) if i}), (asof, asof), wait=False, later=True)
 
 
 def _rates_ahead(ctx: Inputs, rows: Iterable[dict], asof: str) -> None:
@@ -1128,7 +1163,9 @@ def _rows_reads(ctx: Inputs, subject: str, through: dict[str, float]) -> dict:
     ctx.prefetch("ticker_ref", held, (asof, asof), stage="funds")
     # a holding's reference is required: without it the portfolio is not read
     reads.refs["ticker_ref"].update(ctx.data_many("ticker_ref", held, covering=(asof, asof)))
-    level = [(t, 1, 1.0, reference_type(reads.read("ticker_ref", t))) for t in held
+    # each holding's share of the portfolio, the top of every path a fund's rows are weighed on against the floor
+    base = floor_base(ctx.value("holdings", "portfolio")["output"])
+    level = [(t, 1, base.get(t, 0.0), reference_type(reads.read("ticker_ref", t))) for t in held
              if kind_of(reads.read("ticker_ref", t)) == "fund"]
     held_funds_directly = [t for t, _, _, _ in level]  # each read for whether it is a money market fund, as a row's is
     if level:  # each held fund's holdings, started beside whether it is a money market fund, which they do not wait on
@@ -1155,7 +1192,9 @@ def _rows_reads(ctx: Inputs, subject: str, through: dict[str, float]) -> dict:
     feed = ctx.data("holdings_processed", "ETF Global", covering=(asof, asof), required=False) if level else None
     latest = (ctx.payload(feed) or {}).get("processed_date") if feed and feed.get("data") else None
     line = _session_before(latest) if latest else None
-    weights: dict[str, float] = {}  # each fund's largest weight in the portfolio's holdings it is reached through
+    floor: list[dict] = []  # each row read at or above the floor, whose company its identifiers resolve
+    every: list[tuple[dict, float]] = []  # each fund's resolvable rows, each with the weight of the path to its fund
+    weights: dict[str, float] = {}  # each fund's largest share of the portfolio, by every path to it
     depths: dict[str, int] = {}  # how deep each fund read is: held directly, or held inside a fund
     while level:
         level = [x for x in level if x[0] not in constituents]
@@ -1191,8 +1230,10 @@ def _rows_reads(ctx: Inputs, subject: str, through: dict[str, float]) -> dict:
             depths[fund] = depth
             if not found[fund].get("data"):
                 continue
-            rows += [(r, depth, path_weight) for r in _valid_rows(ctx.payload(found[fund]))
-                     if _resolvable(r) and abs(path_weight * r["weight"]) >= FLOOR]
+            mine = [r for r in _valid_rows(ctx.payload(found[fund])) if _resolvable(r)]
+            every += [(r, path_weight) for r in mine]
+            # a row at the floor on its own, read now: one that is a fund is expanded at the next level
+            rows += [(r, depth, path_weight) for r in mine if abs(path_weight * r["weight"]) >= FLOOR]
         _listings_ahead(ctx, [r for fund, _, _, _ in level if found[fund].get("data")
                              for r in _valid_rows(ctx.payload(found[fund]))], asof)  # every row is classified
         # what each row's kind reads beyond its fund's words, and the indexes its fund's derivatives reference: started
@@ -1205,6 +1246,7 @@ def _rows_reads(ctx: Inputs, subject: str, through: dict[str, float]) -> dict:
         reads.fetch_all({"ticker_ref": [own_ticker(r) for r, _, _ in rows], "figi": [r.get("isin") for r, _, _ in rows],
                          "figi_cusip": [r.get("cusip") for r, _, _ in rows if not r.get("isin")]})
         resolved.update(reads.settle(lambda look: {row_key(r): resolve(r, look) for r, _, _ in rows}))
+        floor += [r for r, _, _ in rows]
         _series_ahead(ctx, [x.get("ticker") for x in resolved.values()], asof)
         # a fund held inside a fund, one level deep; one whose holdings were read already was read at a larger weight
         level = [(resolved[row_key(r)]["ticker"], 2, path_weight * r["weight"], resolved[row_key(r)].get("type"))
@@ -1260,34 +1302,36 @@ def _rows_reads(ctx: Inputs, subject: str, through: dict[str, float]) -> dict:
     ctx.prefetch("pair", candidates, (asof, asof), stage="funds")
     pairs = ctx.data_many("pair", candidates, covering=(asof, asof), required=False)
     listed_pairs = _pairs({"pairs": pairs}, ctx.payload)
-    # each listed option a fund's holdings name, at the delta its market quotes on the as-of, which Massive's snapshot
-    # gives only now; and, for one on a US listing, OpenFIGI's share classes of its ticker; a FLEX contract, which no
-    # market lists, is not asked (harness.derive.rows.option_symbol, flex_underlying)
+    # each listed option a fund's holdings name, at the delta its market quotes on the as-of (MATH.md 3.1), which
+    # Massive's snapshot gives only on the day: read while the as-of is today, and at a past as-of the quote the store
+    # took on that day, where it holds one (_quoted_on); and, for one on a US listing, OpenFIGI's share classes of its
+    # ticker; a FLEX contract, which no market lists, is not asked (harness.derive.rows.option_symbol, flex_underlying)
     named_options = sorted({option_symbol(r) for r in loaded} - {None})
     listed_options = [s for s in named_options if not flex_underlying(s)]
+    live = is_today(asof)
     quotes: dict[str, dict] = {}
-    if listed_options and is_today(asof):
+    if listed_options and live:
         ctx.prefetch("option", listed_options, (asof, asof), stage="funds")
         quotes = ctx.data_many("option", listed_options, covering=(asof, asof), required=False)
+    elif listed_options:
+        quotes = _quoted_on(ctx, "option", listed_options, asof)
     # each listed contract's price standing at its holdings' close, by which its row is read as counting contracts or
     # its underlying's shares (harness.derive.rows.held_contracts); and at a past as-of, each one's terms then and its
     # price standing at the as-of's close, which its market's snapshot, being now's, does not give (MATH.md 3.1)
     held_at = _dated(ctx, "option_at", sorted({f"{option_symbol(r)}@{close_moment(r['effective_date'])}"
                                                for r in loaded if r.get("effective_date")
                                                and option_symbol(r) in listed_options}))
-    # the day each contract its market does not quote now is valued on, as its rows' date is (MATH.md 3.1): at a past
-    # as-of, every one, on the as-of; today, one the snapshot does not know (a contract since expired, or one no market
-    # lists), on the latest date a fund's rows hold it, when its market's record still has it if it ever had
-    valued_on: dict[str, str] = {}
-    if not is_today(asof):
-        valued_on = {s: asof for s in listed_options}
-    else:
-        unknown = {s for s, ref in quotes.items() if ref.get("data")
-                   and (ctx.payload(ref) or {}).get("error") == "NOT_FOUND"}
-        for r in loaded:
-            if option_symbol(r) in unknown and r.get("effective_date"):
-                s, day = option_symbol(r), str(r["effective_date"])[:10]
-                valued_on[s] = max(valued_on.get(s, day), day)
+    # the day each contract its market did not quote on the as-of is valued on, as its rows' date is (MATH.md 3.1): one
+    # the as-of's quotes do not know (a contract since expired, or one no market lists), on the latest date a fund's
+    # rows hold it, when its market's record still has it if it ever had; and at a past as-of whose quotes the store did
+    # not take, every one, on the as-of
+    valued_on: dict[str, str] = {s: asof for s in listed_options if not live and s not in quotes}
+    unknown = {s for s, ref in quotes.items() if ref.get("data")
+               and (ctx.payload(ref) or {}).get("error") == "NOT_FOUND"}
+    for r in loaded:
+        if option_symbol(r) in unknown and r.get("effective_date"):
+            s, day = option_symbol(r), str(r["effective_date"])[:10]
+            valued_on[s] = max(valued_on.get(s, day), day)
     # each one's terms in its market's record on that day, and its price standing at that day's close
     contract_terms = _dated(ctx, "option_contract", [f"{s}@{d}" for s, d in sorted(valued_on.items())])
     at_close = _dated(ctx, "option_at", [f"{s}@{close_moment(d)}" for s, d in sorted(valued_on.items())])
@@ -1320,12 +1364,15 @@ def _rows_reads(ctx: Inputs, subject: str, through: dict[str, float]) -> dict:
     underlying = {s: u for s, (root, kind) in named_by.items()
                   if (u := option_underlying(root, kind, *_refs_of(options["underlying_refs"], root, ctx.payload)))}
     # a listing whose reference gives no share class FIGI: today, OpenFIGI's share classes of its ticker, as a listed
-    # contract's underlying is confirmed; at a past as-of, none, since OpenFIGI maps a ticker as it stands now
+    # contract's underlying is confirmed; at a past as-of, those the store read while it was today, and none it did not,
+    # since OpenFIGI maps a ticker as it stands now
     unconfirmed = sorted({u["ticker"] for u in underlying.values() if not u["ticker"].startswith("I:")
                           and not u.get("company")} - set(options["classes"]))
-    if unconfirmed and is_today(asof):
+    if unconfirmed and live:
         ctx.prefetch("figi_ticker", unconfirmed, (asof, asof), stage="funds")
         options["classes"].update(ctx.data_many("figi_ticker", unconfirmed, covering=(asof, asof), required=False))
+    elif unconfirmed:
+        options["classes"].update(_quoted_on(ctx, "figi_ticker", unconfirmed, asof))
     # what each index a fund's derivatives reference is, as OpenFIGI reads its identifier (harness.derive.rows)
     # and the ticker a report gives a security an option of its refers to, read as a FLEX root is (an index's, or a
     # share class's), where the report is its fund's rows (_report_options)
@@ -1419,28 +1466,48 @@ def _rows_reads(ctx: Inputs, subject: str, through: dict[str, float]) -> dict:
             reference = return_series(ctx, listing["ticker"], asof)
         measured[fund] = {"fund": return_series(ctx, fund, asof), "reference": reference,
                           "census": ctx.data("ncen", fund, covering=(asof, asof), required=False)}
-    reach: list[dict] = []
+    # Each fund's rows as the look-through books them (fund_rows), from what is read so far, and the securities the
+    # line names on them (floor_named): the one reading of what the look-through names, which decides whose identities
+    # are read here and which the look-through books by (booked).
+    exposed = fund_rows({"asof": asof, "constituents": constituents, "derivatives": derivatives, "kinds": kinds,
+                         "indexes": indexed, "options": options, "measured": measured, "pairs": pairs,
+                         "priced": priced, "notional": notional,
+                         "placements": {s.rsplit("@", 1)[0]: ref for s, ref in (placements or {}).items() if ref},
+                         "identity": {kind: dict(refs) for kind, refs in reads.refs.items() if kind != "ticker_ref"}},
+                        ctx.payload, assets)
+    reaching: list[tuple[dict, float | None, bool]] = []  # each company a derivative reaches, its size, held directly
+    targets: list[dict] = []  # every company each fund's rows are exposed to, for the CUSIPs below
+    for fund, payload in exposed.items():
+        rows = _valid_rows(payload)
+        for row in rows:
+            reaching += [(target, size, depths.get(fund) == 1)
+                         for target, size in reached([row], weights.get(fund, 0.0))]
+        targets += [t for r in rows for t, _ in _targets(r)]
+    # what each row of a fund held directly reaches at the line resolves to, by which floor_named walks into a fund
+    # held inside it, as the look-through expands it
+    walked = [t for fund, payload in exposed.items() if depths.get(fund) == 1 for r in _valid_rows(payload)
+              for t, x in _targets(r) if abs(base.get(fund, 0.0) * x) >= FLOOR]
+    at_line = reads.settle(lambda look: {row_key(t): resolve(t, look) for t in walked})
+    named_keys = floor_named({t: reads.read("ticker_ref", t) for t in held}, exposed,
+                             lambda t: at_line.get(row_key(t)) or {}, base, ctx.value("holdings", "portfolio")["output"])
     # what each reach of a fund held directly reaches of its holder, for the funds its derivatives reach (_rows_inputs):
     # its size, or, for an option whose delta its terms give later, none; False for a fund held inside a fund
-    sizes: list[float | None | bool] = []
-    cusips: set[str] = set()  # a row below the floor named by a US CUSIP and no FIGI: its listing's, by the CUSIP
-    for fund, ref in constituents.items():
-        if ref.get("data"):
-            rows = (with_exposure(ctx.payload(ref), assets, readings, established,
-                                  report=ctx.payload(derivatives[fund]) if fund in derivatives else None,
-                                  options=held_options, slope=_slope(measured.get(fund), ctx.payload, asof),
-                                  pairs=listed_pairs, rates=rates, priced=by_price.get(fund)) or {})
-            rows = rows.get("results") or [] if isinstance(rows, dict) else []
-            found_here = [(row, size) for row, size in reached(rows, weights.get(fund, 1.0))
-                          if size is None or size >= FLOOR]
-            reach += [row for row, _ in found_here]
-            sizes += [size if depths.get(fund) == 1 else False for _, size in found_here]
-            cusips |= {c for r in rows for t, x in _targets(r)
-                       if abs(weights.get(fund, 1.0) * x) < FLOOR and not t.get("figi") and (c := cusip_of(t))
-                       and (isin_of(t) or "").startswith("US")}
-    reads.fetch_all({"ticker_ref": [own_ticker(r) for r in reach], "figi": [r.get("isin") for r in reach],
-                     "figi_cusip": [r.get("cusip") for r in reach if not r.get("isin")]})
+    picked = [(row, size, top) for row, size, top in reaching if size is None or floor_key(row) in named_keys]
+    reach = [row for row, _, _ in picked]
+    sizes: list[float | None | bool] = [size if top else False for _, size, top in picked]
+    # each fund's row of a security at the floor, summed, that its own path's weight left unread
+    summed = [r for r, _ in every if floor_key(r) in named_keys and row_key(r) not in resolved]
+    # a row below the floor named by a US CUSIP and no FIGI: its listing's, by the CUSIP
+    # and one at the line that carries no identifier the resolution reads (a CUSIP its source gives as `us_code`): it
+    # is reached as a row below the floor is
+    cusips = {c for t in targets if (floor_key(t) not in named_keys or (class_id(t) is None and not own_ticker(t)))
+              and not t.get("figi") and (c := cusip_of(t)) and (isin_of(t) or "").startswith("US")}
+    reads.fetch_all({"ticker_ref": [own_ticker(r) for r in reach + summed],
+                     "figi": [r.get("isin") for r in reach + summed],
+                     "figi_cusip": [r.get("cusip") for r in reach + summed if not r.get("isin")]})
     found_rows = reads.settle(lambda look: [resolve(r, look) for r in reach])
+    resolved.update(reads.settle(lambda look: {row_key(r): resolve(r, look) for r in summed}))
+    floor += summed
     # each fund a derivative of a fund held directly reaches, not read as a fund held: read as one held inside a fund
     # at the largest weight a derivative reaches it at, and where an option's delta is not yet known, at every weight,
     # as an index's companies are (rows.reached)
@@ -1455,13 +1522,24 @@ def _rows_reads(ctx: Inputs, subject: str, through: dict[str, float]) -> dict:
     if not any(t not in at_floor for t in named):
         cusips = set()
     reads.fetch("cusip_listing", [f"{c}@{asof}" for c in sorted(cusips)])
+    if constituents:  # the legal entity behind each security whose company neither its CIK nor its share class
+        # reaches: a depositary receipt, a security of its own beside its company's shares, at the floor in a fund or
+        # held directly or named by a shock, and a listing abroad held or named; asked of GLEIF by its ISIN where no
+        # fund's report names its issuer (harness.derive.identity.entities)
+        issued = issuers(ctx.payload(ref) for ref in reports.values() if ref.get("data"))
+        at = [(r, resolved.get(row_key(r)) or {}) for r in floor] + list(zip(reach, found_rows))
+        asked = {isin_of(r) for r, got in at if got.get("type") in RECEIPTS}
+        named = [t for t in held + shocked if _isin_form(t) or kind_of(reads.read("ticker_ref", t)) == "name"]
+        asked |= set(reads.settle(lambda look: [look.isin_held(t) for t in named]))
+        asked = {i for i in asked if i and i not in issued}
+        reads.settle(lambda look: [look.issuer(i) for i in sorted(asked)])
     # each company's id, its first US ticker (harness.derive.identity.first_ticker), by the CIK its listings name
     given = {t: ((reads.read("ticker_ref", t) or {}).get("results") or {}).get("cik") for t in held}
     reads.settle(lambda look: [look.first_ticker(c) for c in sorted(({f.get("cik") for f in found_rows} |
                                                                       {look.company_cik(t, given[t]) for t in held})
                                                                      - {None})])
     return {"through": reaches_funds, "asof": asof, "references": dict(reads.refs["ticker_ref"]), "notional": notional,
-            "shocked": shocked if constituents else [], "cusips": sorted(cusips),
+            "shocked": shocked if constituents else [], "cusips": sorted(cusips), "named": sorted(named_keys),
             "constituents": constituents, "derivatives": derivatives, "listings": listings, "kinds": kinds,
             "indexes": indexed, "options": options, "measured": measured, "pairs": pairs, "priced": priced,
             "placements": {s.rsplit("@", 1)[0]: ref for s, ref in (placements or {}).items() if ref},
@@ -1532,6 +1610,23 @@ def _refs_of(refs: dict[str, dict], root: str, load) -> tuple[Any, Any]:
     return tuple(load(r) if r and r.get("data") else None for r in (found.get("listing"), found.get("index")))
 
 
+def _quoted_on(ctx: Inputs, kind: str, subjects: list[str], asof: str) -> dict[str, dict]:
+    """Each subject's newest reading of a kind the store holds from the as-of's own date, read from the store and never
+    asked of its source: at a past as-of, what the store read of the present while that date was today, which is that
+    as-of's reading whenever the store is read again, with keys or without. An option's quote is of its moment, so it
+    is one taken on that date; OpenFIGI's mapping of a ticker is as the ticker stood when it was taken, which a
+    machine's observations can serve from an earlier day (harness.observations), so it is one taken by then. None where
+    the store took none, as a store made at a past as-of did not."""
+    on_the_day = kind == "option"
+    out: dict[str, dict] = {}
+    for s in subjects:
+        held = [r for r in ctx.readings(kind, s) if r.get("data")
+                and (read_date(r["retrieved_at"]) == asof if on_the_day else read_date(r["retrieved_at"]) <= asof)]
+        if held:
+            out[s] = held[-1]
+    return out
+
+
 def _dated(ctx: Inputs, kind: str, subjects: list[str]) -> dict[str, dict]:
     """Each subject's data of a kind read as of the day its subject names (`{what}@{date}` or `{what}@{moment}`, the
     moment's day in New York), every day's reads side by side."""
@@ -1551,7 +1646,8 @@ def _report_options(ctx: Inputs, reads: _Reads, constituents: dict, reports: dic
     (Massive.option_listings), which state what the report does not: its exercise style and the shares each
     controls."""
     rows = [r for f, ref in constituents.items() if ref.get("data") and ref is reports.get(f)
-            for r in (ctx.payload(ref) or {}).get("results") or [] if isinstance(r, dict) and report_option_key(r)]
+            for r in (ctx.payload(ref) or {}).get("results") or [] if isinstance(r, dict) and report_option_key(r)
+            and us_listed_terms(r["derivative"])]  # a contract no US listing can be is asked for none
     isins = sorted({((r["derivative"].get("reference") or {}).get("security") or {}).get("isin") for r in rows}
                    - {None, ""})
     reads.fetch("figi", isins)
@@ -1804,12 +1900,13 @@ def _established(m: dict, load) -> dict:
 
 
 def _look(m: dict, references: dict, constituents: dict, resolved: Callable[[dict], dict],
-          known: dict[str, str], assets: Kinds) -> dict:
+          known: dict[str, str], assets: Kinds, named_keys: set[str], base: dict[str, float]) -> dict:
     """Book each holding to what it is exposed to (MATH.md 1.2, 3.1). A company held directly, or a fund booked whole, is
     a name at its value. A fund expanded books, row by row, the dollars of exposure each row states, signed: the
-    holding's dollars in the fund times the row's exposure per dollar of the fund, at each company the row reaches at
-    or above the floor, by the listing its identifiers resolve to (`resolved`), or below it, where its identifiers are
-    `known` as a company the portfolio names; a fund held inside a fund is expanded once more. Exposures need not sum
+    holding's dollars in the fund times the row's exposure per dollar of the fund, at each company the row reaches
+    whose security is at or above the floor, summed over every path to it (`named_keys`), by the listing its
+    identifiers resolve to (`resolved`), or below it, where its identifiers are `known` as a company the portfolio
+    names; a fund held inside a fund is expanded once more. Exposures need not sum
     to value: a fund's value is its holding's, which its own response moves (g), and its rows say which companies'
     own shocks reach it, and by how much. Money, a currency, an index whose companies are not established, and what
     resolves to no listing reach no name. Also each row resolved to a company at or above the floor, by its row; each
@@ -1904,21 +2001,18 @@ def _look(m: dict, references: dict, constituents: dict, resolved: Callable[[dic
             held_kinds.add(kind)
             own(f"kind:{kind}", value - dollars * sum(x for _, x in targets), kind=kind)
             for target, x in targets:
-                if abs(path_weight * x) < FLOOR:
-                    company = known.get(target.get("isin")) or known.get(target.get("figi")) or \
-                        known.get(cusip_of(target))
-                    if company:
-                        plan.append(("fund" if kind_of(references.get(company)) == "fund" else "name", company, x,
-                                     dated, target))
-                    else:
-                        unnamed["shares"] += x
-                        own(_row_key(target), dollars * x, row=_row_about(target))
-                    continue
-                found = resolved(target)
+                # a security at the floor, by what its identifiers resolve to; else, at any size, a company the
+                # portfolio names that its identifiers are known as
+                found = resolved(target) if floor_key(target) in named_keys else {}
                 if found.get("ticker"):
                     plan.append((found["kind"], found["ticker"], x, dated, target))
                     if found["kind"] == "name":
                         companies.append((target, found["ticker"]))
+                    continue
+                company = known.get(target.get("isin")) or known.get(target.get("figi")) or known.get(cusip_of(target))
+                if company:
+                    plan.append(("fund" if kind_of(references.get(company)) == "fund" else "name", company, x, dated,
+                                 target))
                 else:
                     unnamed["shares"] += x
                     own(_row_key(target), dollars * x, row=_row_about(target))
@@ -1984,7 +2078,7 @@ def _look(m: dict, references: dict, constituents: dict, resolved: Callable[[dic
             own("kind:cash", dollars, kind="cash")
             continue
         if kind == "fund":
-            if not expand(ticker, dollars, 1, 1.0):
+            if not expand(ticker, dollars, 1, base.get(ticker, 0.0)):
                 book(ticker, dollars, "fund", ticker)
                 own(f"whole:{ticker}", dollars, **_held_in(references.get(ticker)))
         else:
@@ -2001,8 +2095,8 @@ def _look(m: dict, references: dict, constituents: dict, resolved: Callable[[dic
 
 def _per_dollar(plans: list[tuple[float, dict[str, float]]]) -> dict[str, float]:
     """A fund's exposure per dollar of it, from each path that reached it: where every path's rows give the same
-    exposures, as a fund reached once does, those exposures exactly, which no price moves; otherwise their mix, each
-    path at its dollars, as the floor read them differently on paths of different weight."""
+    exposures, as the floor names one set of securities on every path, those exposures exactly, which no price moves;
+    otherwise their mix, each path at its dollars."""
     if not plans:
         return {}
     first = plans[0][1]
@@ -2205,20 +2299,60 @@ def _lookthrough_compute(m: dict, load) -> dict:
             memo[key] = resolve(row, look)
         return memo[key]
 
-    return {**booked(m, references, constituents, resolved, look, assets, us),
+    return {**booked(m, references, constituents, resolved, look, assets, us, issued=issuers(_reports(m, load))),
             "multiples": multiples(constituents, resolved)}
 
 
+def _reports(m: dict, load) -> list[Any]:
+    """Each fund's Form N-PORT report the look-through read: as a fund's rows, beside its holdings for its derivatives,
+    or for its codes; each once."""
+    refs = [*(m.get("constituents") or {}).values(), *(m.get("derivatives") or {}).values(),
+            *((m.get("kinds") or {}).get("reports") or {}).values()]
+    seen: dict[str, Any] = {}
+    for ref in refs:
+        if isinstance(ref, dict) and ref.get("kind") == "nport" and ref.get("data") and ref["data"] not in seen:
+            seen[ref["data"]] = load(ref)
+    return list(seen.values())
+
+
+def floor_named(references: dict, constituents: dict, resolved: Callable[[dict], dict], base: dict[str, float],
+                holdings: dict) -> set[str]:
+    """Each security at or above the floor (FLOOR), by its key (floor_key): the portfolio's exposure to it summed over
+    every path through its funds, each fund held at its share of the portfolio (`base`), a fund held inside a fund at
+    the product of the two, long and short netted; each fund's rows read as the booking reads them (_targets), so a
+    derivative's company and an index's companies count at their exposure. A fund inside a fund is walked where its
+    own row is at the floor, as the look-through expands it. Worked out once, where each fund's rows are read
+    (_rows_reads), which reads the identities of what it names; the look-through books by that set (booked)."""
+    shares: dict[str | None, float] = defaultdict(float)
+
+    def walk(fund: str, path: float, depth: int) -> None:
+        for r in _valid_rows(constituents.get(fund)):
+            for target, x in _targets(r):
+                shares[floor_key(target)] += path * x
+                if depth == 1 and abs(path * x) >= FLOOR:
+                    found = resolved(target)
+                    if found.get("kind") == "fund" and found.get("ticker") in constituents:
+                        walk(found["ticker"], path * x, 2)
+    for t in dict.fromkeys(_held(row) for row in holdings["holds"].values()):
+        if t in constituents and kind_of(references.get(t)) == "fund":
+            walk(t, base.get(t, 0.0), 1)
+    return {k for k, x in shares.items() if k and abs(x) >= FLOOR}
+
+
 def booked(m: dict, references: dict, constituents: dict, resolved: Callable[[dict], dict], look: Lookup,
-           assets: Kinds, us: frozenset[str] = frozenset()) -> dict:
-    """What the look-through books from each fund's rows, each row's company resolved by `resolved` (MATH.md 1.2, 3.1):
+           assets: Kinds, us: frozenset[str] = frozenset(), issued: dict[str, str] | None = None) -> dict:
+    """What the look-through books from each fund's rows, each row's company resolved by `resolved` (MATH.md 1.2, 3.1),
+    and the legal entity behind each share by the issuer's LEI its fund's report gives it (`issued`, by ISIN):
     every name's e, the dollars of exposure the portfolio has to it, held directly and through funds, signed; each
     holding's dollars at each name, by the funds they pass through, and each fund it expands, with its dollars there;
     each fund's parts, the exposure per dollar of the fund to each name and each fund it holds at the next level, which
     its response leans on where its history is short; and what each fund whose rows were read holds."""
     # The companies the portfolio names at the floor, held directly or above it in a fund: a row below the floor whose
-    # ISIN or FIGI is one of theirs reaches it whatever its size, so its own shock reaches every dollar of it.
-    at_floor = _look(m, references, constituents, resolved, {}, assets)
+    # ISIN or FIGI is one of theirs reaches it whatever its size, so its own shock reaches every dollar of it. The
+    # securities at the floor are those the reading of the rows named (_rows_reads, `named`), whose identities it read.
+    base = floor_base(m["holdings"]["output"])
+    named_keys = set(m["named"])
+    at_floor = _look(m, references, constituents, resolved, {}, assets, named_keys, base)
     known: dict[str, str] = {}
     for row, listing in at_floor["companies"]:  # a company resolved at the floor, by every listing of its share class
         known.update({x: listing for x in (row.get("isin"), row.get("figi"), cusip_of(row), *look.composites_of(row))
@@ -2238,6 +2372,13 @@ def booked(m: dict, references: dict, constituents: dict, resolved: Callable[[di
         elif kind_of(references.get(ticker)) in ("name", "fund"):
             for x in identifiers_of(ticker, references, look):
                 known.setdefault(x, ticker)
+    issued = issued or {}
+    for ticker, lei in _named_issuers(m, references, look, issued, at_floor["companies"]).items():
+        for isin, of in issued.items():  # each share its issuer's, its other classes and its home shares among them
+            if of == lei:
+                for x in (isin, isin[2:11] if isin.startswith("US") else None):
+                    if x:
+                        known.setdefault(x, ticker)
     for nid, info in at_floor["kinds"].items():
         found = (references.get(ticker_of(nid)) or {}).get("results") or {} if info["kind"] == "name" else {}
         known.update({x: ticker_of(nid) for x in (found.get("composite_figi"), found.get("share_class_figi")) if x})
@@ -2247,7 +2388,7 @@ def booked(m: dict, references: dict, constituents: dict, resolved: Callable[[di
                            for x in (r.get("composite_figi"), r.get("share_class_figi")) if x in known), None)
             if listed:
                 known[cusip] = listed
-    found = _look(m, references, constituents, resolved, known, assets)
+    found = _look(m, references, constituents, resolved, known, assets, named_keys, base)
     e, kinds, links, funds, paths = found["e"], found["kinds"], found["links"], found["funds"], found["paths"]
     for passed in (1, 2):  # each fund from its own rows; then each whose rows are funds, by those funds' own kinds
         divided = {f: (funds[f].get("holds") or {}).get("by_kind") for f in funds if passed == 2}
@@ -2256,7 +2397,7 @@ def booked(m: dict, references: dict, constituents: dict, resolved: Callable[[di
                 priced = {rec["to"] for rec in links.values() if rec["from"] == name_id(fund)}
                 funds[fund]["holds"] = what_it_holds(fund, payload, references, found["reached"][fund], priced, us,
                                                      resolved, assets, {f: d for f, d in divided.items() if d})
-    found, securities, holdings = as_companies(found, m, references, resolved, look)
+    found, securities, holdings = as_companies(found, m, references, resolved, look, issued)
     e, kinds, links, paths = found["e"], found["kinds"], found["links"], found["paths"]
     # An expanded fund is fitted on its own series, as every holding is; its parts are what its rows reach at the next
     # level, each name and each fund held inside it, per dollar of the fund, each name by its company's id; and its
@@ -2310,11 +2451,15 @@ def _abroad_row(listing: str) -> dict:
 
 
 def as_companies(found: dict, m: dict, references: dict, resolved: Callable[[dict], dict],
-                 look: Lookup) -> tuple[dict, dict, dict]:
+                 look: Lookup, issued: dict[str, str] | None = None) -> tuple[dict, dict, dict]:
     """The look-through's bookings by company (MATH.md 3.1): a company is one name, whatever securities the portfolio holds
-    it by, each booked by the security it rides on. A security's company is the CIK the SEC gives its US listing, else
-    the one Massive's record of it gives (Lookup.company_cik), where one does; else, for a listing abroad, its share
-    class (its ISIN); else the listing alone. The company's id is the one the
+    it by, each booked by the security it rides on. A company is the legal entity behind its securities, which its
+    identifiers make one where they agree (identity.entities): listings of one share class (a listing abroad's ISIN);
+    securities the SEC lists under one CIK (Lookup.company_cik; else the one Massive's record of a listing gives); and
+    securities whose issuer is one LEI, as its funds' reports give it a share (`issued`, by ISIN; identity.issuers) or
+    as GLEIF gives a depositary receipt or a listing abroad (Lookup.issuer). A CIK whose securities name two issuers,
+    or an LEI naming securities of two CIKs, joins nothing it names; a company two links name by two ids stays two.
+    The company's id is the one the
     store's links name it by, a holding's name or a name a consequence or a value names, where one does: chosen once and
     kept. Else it is its first US ticker, else its home listing: of a share class held on several markets, the one in
     the country its ISIN names, else the first. Its pricing security is the one the member holds; of several held, its home listing where that is one of
@@ -2324,10 +2469,12 @@ def as_companies(found: dict, m: dict, references: dict, resolved: Callable[[dic
     security (`securities`), and each holding's name and security (`holdings`)."""
     kinds = found["kinds"]
     records: dict[str, dict] = {}  # each listing a row resolved to, with the CIK that named its company
+    rows_of: dict[str, list[dict]] = defaultdict(list)  # and every row resolved to it
     for row, _ in found["companies"]:
         rec = resolved(row)
         if rec.get("ticker"):
             records.setdefault(rec["ticker"], rec)
+            rows_of[rec["ticker"]].append(row)
     held: dict[str, list[str]] = defaultdict(list)  # each security held directly, by holding, in the order given
     for hid, row in m["holdings"]["output"]["holds"].items():
         held[_held(row)].append(hid)
@@ -2353,26 +2500,35 @@ def as_companies(found: dict, m: dict, references: dict, resolved: Callable[[dic
             return sec.split(":")[0]
         return records.get(sec, {}).get("isin") or held_abroad(sec).get("isin") if series.symbol_abroad(sec) else None
 
-    def key_of(sec: str) -> str:
-        cik, isin = cik_of(sec), isin_of(sec)
-        return f"cik:{cik}" if cik else f"isin:{isin}" if isin else f"ticker:{sec}"
-
-    groups: dict[str, list[str]] = defaultdict(list)
-    for sec in secs:
-        groups[key_of(sec)].append(sec)
     # The ids the store's links name a company by: a holding's name, and a name a consequence or a value names. An id
     # is chosen once by the rule and kept (MATH.md 3.1), so where a link names the company, its id is the one the link
     # names, whatever the rule would choose now (a ticker the SEC now lists first, a form of id since replaced).
     # Only a company's id names a company: a fund's reference can carry its sponsor's CIK (Massive gives XLF State
     # Street's, 93751), and a fund is its own name, never the company its sponsor is.
-    linked: dict[str, set[str]] = defaultdict(set)
+    linked_by: dict[str, set[str]] = defaultdict(set)  # each security, by the ids links name it by
     for row in m["holdings"]["output"]["holds"].values():
         if not row.get("contract") and not row.get("cash") and row.get("name") and \
                 (kinds.get(row["name"]) or {}).get("kind") == "name":
-            linked[key_of(_held(row))].add(ticker_of(row["name"]))
-    for ticker in m.get("shocked") or []:
-        if (kinds.get(name_id(ticker)) or {}).get("kind") == "name" or kind_of(references.get(ticker)) == "name":
-            linked[key_of(ticker)].add(ticker)
+            linked_by[_held(row)].add(ticker_of(row["name"]))
+    named_by_shock = [t for t in m.get("shocked") or []
+                      if (kinds.get(name_id(t)) or {}).get("kind") == "name" or kind_of(references.get(t)) == "name"]
+    for ticker in named_by_shock:
+        linked_by[ticker].add(ticker)
+    issued = issued or {}
+    named_directly = set(held) | set(m.get("shocked") or [])
+    # each security, with a company a consequence names that the portfolio holds through none of its own securities
+    every = list(dict.fromkeys(secs + named_by_shock))
+    members = {sec: {"isin": isin_of(sec), "cik": cik_of(sec), "linked": linked_by.get(sec, set()),
+                     "lei": _lei_of([*(_row_isin(r) for r in rows_of.get(sec, [])), isin_of(sec),
+                                     look.isin_held(sec) if sec in named_directly else None],
+                                    [r.get("lei") for r in rows_of.get(sec, [])], look, issued)} for sec in every}
+    of = entities(members)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for sec in secs:
+        groups[of[sec]].append(sec)
+    linked: dict[str, set[str]] = defaultdict(set)  # the ids links name each company by
+    for sec in every:
+        linked[of[sec]] |= linked_by.get(sec, set())
 
     company: dict[str, tuple[str, str]] = {}  # each security: its company's id, and the security pricing it
     for key, members in groups.items():
@@ -2424,6 +2580,46 @@ def as_companies(found: dict, m: dict, references: dict, resolved: Callable[[dic
     out = {**found, "e": e, "kinds": remapped, "by_holding": by_holding, "paths": paths, "links": links,
            "owned": owned}
     return out, {nid: dict(by) for nid, by in securities.items()}, holdings
+
+
+def _row_isin(row: dict) -> str | None:
+    return isin_of(row)
+
+
+def _lei_of(isins: Iterable[str | None], given: Iterable[Any], look: Lookup, issued: dict[str, str]) -> str | None:
+    """A security's issuer, by its LEI: what every ISIN it is known by names, in its funds' reports (`issued`) and at
+    GLEIF (Lookup.issuer), and what a report's row of it gives; none where they name none, or more than one."""
+    leis = {x for i in isins if i for x in (issued.get(i), look.issuer(i)) if x}
+    leis |= {str(g).strip().upper() for g in given if valid_lei(g)}
+    return next(iter(leis)) if len(leis) == 1 else None
+
+
+def _named_issuers(m: dict, references: dict, look: Lookup, issued: dict[str, str],
+                   at_floor: list[tuple[dict, str]]) -> dict[str, str]:
+    """The issuer of each company the portfolio holds directly or a consequence names whose shares abroad its CIK and
+    its share class do not reach: a depositary receipt's and a listing abroad's (Lookup.isin_held), by its LEI; so
+    that a fund's row of any share of it, below the floor, reaches it (MATH.md 3.1, the floor's exception). An LEI that a
+    row at the floor gives a listing of another CIK names two registrants, and is not taken."""
+    named = [_held(row) for row in m["holdings"]["output"]["holds"].values() if not row.get("cash")
+             and not row.get("contract")] + list(m.get("shocked") or [])
+    cik_at: dict[str, set[int]] = defaultdict(set)  # each issuer's CIKs among the companies at the floor
+    for row, listing in at_floor:
+        lei = _lei_of([_row_isin(row)], [row.get("lei")], look, issued)
+        cik = look.company_cik(listing, ((references.get(listing) or {}).get("results") or {}).get("cik")) \
+            if us_ticker(listing) else None
+        if lei and cik:
+            cik_at[lei].add(cik)
+    out: dict[str, str] = {}
+    for ticker in dict.fromkeys(named):
+        lei = _lei_of([look.isin_held(ticker)], [], look, issued)
+        if not lei:
+            continue
+        cik = look.company_cik(ticker, ((references.get(ticker) or {}).get("results") or {}).get("cik")) \
+            if us_ticker(ticker) else None
+        if len(cik_at.get(lei, set()) | ({cik} if cik else set())) > 1:
+            continue
+        out[ticker] = lei
+    return out
 
 
 def identifiers_of(ticker: str, references: dict, look: Lookup) -> set[str]:
@@ -2494,12 +2690,12 @@ def _name_fields(output: dict, nid: str) -> dict:
 # never with today's prices, so they are a value of their own, which the look-through and what values a fund's
 # contracts read (harness.derive.option_funds, valuation) name by their Computation.
 FUND_ROWS = Derivation(
-    "fund_rows", 6, "Portfolio", _rows_inputs, _fund_rows_compute,
+    "fund_rows", 9, "Portfolio", _rows_inputs, _fund_rows_compute,
     subject_of=lambda store, entity: "portfolio", stage="funds",
 )
 
 LOOKTHROUGH = Derivation(
-    "lookthrough", 66, "Portfolio", _lookthrough_inputs, _lookthrough_compute,
+    "lookthrough", 69, "Portfolio", _lookthrough_inputs, _lookthrough_compute,
     subject_of=lambda store, entity: "portfolio", stage="funds",
     produces=("Name", "looks_through_to"),
     # Every Name has an e: what the look-through books to it, and 0 where it books nothing.

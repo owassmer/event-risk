@@ -59,10 +59,13 @@ VENUE = "polymarket_us"
 
 
 LIMITER = RateLimiter(15.0, burst=15)
-"""The venue documents 20 requests per second per IP for the public gateway,
-answering 429 with no Retry-After beyond that. Set below the ceiling because
-the limit is per IP and this budget is per process: two processes on one
-machine each at 20/s would be at 40/s. Shared process-wide, as the others are."""
+"""The venue documents 25 requests per second for its API, per source IP and
+Cloudflare location and shared across its endpoints, and answers 429 beyond
+that, asking a client to wait at least a second and back off
+(https://docs.polymarket.us/api-reference/rate-limits). Set below the ceiling
+because the limit is per IP and this budget is per process: another process
+on the machine reading the venue takes from the same 25. Shared process-wide,
+as the others are."""
 
 
 SEARCH_PAGE = 20

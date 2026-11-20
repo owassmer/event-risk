@@ -121,8 +121,8 @@ def bis_rates(text: str) -> tuple[str | None, dict[str, float]]:
 
 
 class Fixings:
-    """The three sources, read through one client each: the ECB's (harness.venues.ecb.ECB, which keeps what it reads
-    of a window), and the Federal Reserve's and the BIS's here, each window read once."""
+    """The three sources, read through one client each: the ECB's (harness.venues.ecb.ECB, which cuts every window
+    from its one history file), and the Federal Reserve's and the BIS's here, each window read once."""
 
     def __init__(self, ecb: Any, *, opener: Callable | None = None, timeout: float = 30.0, pause: float = PAUSE):
         self.ecb = ecb

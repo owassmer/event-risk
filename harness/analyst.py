@@ -123,14 +123,16 @@ def clients() -> dict:
     """This process's data clients, one set for every store it opens, each reading through this machine's shared
     observations (harness.observations), so what one store read about a closed range serves the next: Massive's where
     MASSIVE_API_KEY is set, with which fund's holdings are an index's companies (harness.venues.trackers), read only
-    where a held fund's derivative is exposed to an index; Coinbase Exchange's, Yahoo Finance's, the ECB's, OpenFIGI's,
-    the SEC's and TreasuryDirect's, which need no key, OpenFIGI's reading OPENFIGI_API_KEY where it is set. Returns
-    `{"fetchers"}`."""
+    where a held fund's derivative is exposed to an index; Coinbase Exchange's, Yahoo Finance's, FinanceDatabase's, the
+    ECB's, OpenFIGI's, the SEC's, GLEIF's and TreasuryDirect's, which need no key, OpenFIGI's reading OPENFIGI_API_KEY
+    where it is set and the SEC's naming the reader by SEC_CONTACT where it is set. Returns `{"fetchers"}`."""
     global _clients
     from harness.observations import shared
     from harness.venues.coinbase import Coinbase
     from harness.venues.ecb import ECB
+    from harness.venues.equities import Equities
     from harness.venues.fixings import Fixings, with_fixings
+    from harness.venues.gleif import GLEIF
     from harness.venues.massive import Massive
     from harness.venues.openfigi import OpenFIGI
     from harness.venues.sec import SEC
@@ -144,13 +146,14 @@ def clients() -> dict:
         if _clients is not None:
             return _clients
         observations = shared()
-        yahoo, sec, ecb = Yahoo(), SEC(archive=observations), ECB()
+        equities = Equities()
+        yahoo, sec, ecb = Yahoo(equities=equities), SEC(archive=observations), ECB()
         crypto, currency = Coinbase().fetchers(), yahoo.fetchers()
         # a currency's rates: Yahoo's hourly where they reach, and its daily fixings before them
         currency["hourly"] = with_fixings(currency["hourly"], Fixings(ecb))
-        base = {**currency, **crypto, **ecb.fetchers(),
+        base = {**currency, **crypto, **ecb.fetchers(), **equities.fetchers(),
                 **OpenFIGI(key=os.environ.get("OPENFIGI_API_KEY") or None).fetchers(),
-                **sec.fetchers(), **Treasury().fetchers(),
+                **sec.fetchers(), **Treasury().fetchers(), **GLEIF().fetchers(),
                 **{kind: by_pair(crypto[kind], currency[kind]) for kind in ("hourly", "last_trade")}}
         # each currency's government yield curve: the Treasury's for the dollar, its own government's for another
         base["yield_curve"] = with_curves(base["yield_curve"], Curves())
@@ -169,7 +172,8 @@ def open_store(name: str, *, root: str | Path = ROOT / "stores", knowledge: str 
     """stores/{name}: opened when it exists, otherwise created with the initial contents. The judge
     is mammoth-1 when BASETEN_API_KEY is set, Massive's fetchers are there when MASSIVE_API_KEY is, and Coinbase
     Exchange's, for a crypto pair's prices, Yahoo Finance's, for a currency pair's rates and a listing abroad's prices,
-    the ECB's, for the rates a dividend in another currency is added back at, and OpenFIGI's and the SEC's, for the
+    FinanceDatabase's, for each company's industry, home and what it does, the ECB's, for the rates a dividend in
+    another currency is added back at, and OpenFIGI's and the SEC's, for the
     identifiers that confirm a fund's companies and a closed-end fund's holdings and which mutual funds are money market
     funds, and TreasuryDirect's, for which holdings are Treasury bills, need no key; without them the store
     answers from its cache and its data. Every store a process opens reads through one set of clients (clients)."""
@@ -354,7 +358,8 @@ class Analyst:
         self.world = world
         self.store = world.store
         self.extra = dict(extra or {})
-        self.tools = Tools(world, {name: x.run for name, x in self.extra.items()})
+        self.knowledge, self.text = knowledge, text
+        self.tools = self._tools(world)
         self.mode = mode
         self.effort = effort
         self.directory = Path(directory) if directory is not None else self.store.dir
@@ -364,7 +369,7 @@ class Analyst:
         self.model = model
         self.max_tokens = max_tokens
         self.thinking = thinking if thinking is not None else THINKING
-        self.system = system_prompt(knowledge, text)
+        self.system, self.declared = self._declarations()
         self.messages: list[dict] = []
         self.starts: dict[int, tuple[int, int | None]] = {}  # where each turn's message starts in messages
         self._calls: list[dict] = []
@@ -374,7 +379,7 @@ class Analyst:
         self.turn = 0
         self.usage: dict[str, int] = {}
         self.on_event = on_event or (lambda event: None)
-        self.functions = [self._function(name) for name in (*SPECS, *self.extra)]
+        self.functions = [self._function(name) for name in (*self.declared, *self.extra)]
         if session is not None:  # the conversation continues: its history, from the trace
             self.session = self.tools.session = session
             self.messages, self.turn, self.starts = history(self.tools.trace.entries(), session, self.directory)
@@ -411,7 +416,23 @@ class Analyst:
         if name in self.extra:
             x = self.extra[name]
             return BetaFunctionTool(run, name=name, description=x.description, input_schema=x.input_schema)
-        return BetaFunctionTool(run, name=name, description=SPECS[name]["does"], input_schema=input_schema(name))
+        description, schema = self.declared[name]
+        return BetaFunctionTool(run, name=name, description=description, input_schema=schema)
+
+    def _tools(self, world: World) -> Tools:
+        """The tools the conversation's calls run on: the sixteen over the world's store, and its own beside them."""
+        return Tools(world, {name: x.run for name, x in self.extra.items()})
+
+    def _declarations(self) -> tuple[list[dict], dict[str, tuple[str, dict]]]:
+        """What the analyst reads (system_prompt) and the sixteen as declared, each tool's description and schema,
+        read when the conversation begins."""
+        return system_prompt(self.knowledge, self.text), {name: (SPECS[name]["does"], input_schema(name))
+                                                          for name in SPECS}
+
+    def _record(self, stopped: bool) -> None:
+        """The reply's end, recorded in the store (harness.record)."""
+        record.reply(self.store, session=self.session, turn=self.turn, stopped=stopped,
+                     analyst={"model": self.model, "effort": self.effort}, system=self.system)  # it never raises
 
     def today(self) -> list[str]:
         """Today's date in New York, said first in each message the person sends, so the system text is the same for
@@ -553,8 +574,7 @@ class Analyst:
                      **({"partial": "".join(partial)} if partial else {})}
             trace.append(entry)
             self.on_event(entry)
-        record.reply(self.store, session=self.session, turn=self.turn, stopped=stopped,
-                     analyst={"model": self.model, "effort": self.effort}, system=self.system)  # it never raises
+        self._record(stopped)
         out = {"text": answer, "calls": list(self._calls), "usage": spent, "requests": len(replies),
                "stopped": stopped}
         self.on_event({"type": "answer", "session": self.session, "turn": self.turn, **out})

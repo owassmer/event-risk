@@ -55,7 +55,7 @@ class Waiting(Exception):
     """The value waits: a read it needs has not landed, past the client's retries, or its inputs do not yet give it (a
     dividend whose rate is not yet read; a judge that did not answer). It is not stored, it is read again, and it
     carries no reason for the analyst; its cause is logged. A tool's call that needs it fails, with nothing written,
-    and can be made again (TOOLS.md 5)."""
+    and made again asks the source again (TOOLS.md 5)."""
 
 
 def canonical(obj: Any) -> str:
@@ -71,8 +71,14 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# What else a Computation's key holds: an identity of the code that made it, set by a process that runs code other than
+# the code that keeps the store so what one kept never answers a read by another, and None otherwise.
+CODE: str | None = None
+
+
 def computation_hash(name: str, version: int, subject: str, manifest: dict) -> str:
-    return digest({"derivation": name, "version": version, "subject": subject, "inputs": manifest})
+    return digest({"derivation": name, "version": version, "subject": subject, "inputs": manifest,
+                   **({"code": CODE} if CODE else {})})
 
 
 def judgment_hash(kind: str, statement: str, evidence: list[dict], version: int) -> str:
@@ -359,7 +365,7 @@ class Inputs:
         return self._store.given_at(lid)
 
 
-RETRY = 60.0  # seconds a value that waits is kept for the page before it is read again: the keyless sources' cooldown
+RETRY = 60.0  # seconds a value that waits is kept for the page before it is read again
 # Characters of fetched payload kept parsed for the inputs functions, which run again on every pass of a read (a read
 # that lands touches what read it) and read a fund's holdings and report each time: a broad fund's are a
 # megabyte or two of text, about 2.7 times that parsed, so this keeps a portfolio of a couple of dozen broad funds
